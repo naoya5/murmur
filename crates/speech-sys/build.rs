@@ -219,10 +219,32 @@ fn link(build_dir: &Path, target_os: &str) {
         }
         println!("cargo:rustc-link-lib=objc");
         println!("cargo:rustc-link-lib=c++");
+        link_clang_runtime();
     } else {
         println!("cargo:rustc-link-lib=stdc++");
         println!("cargo:rustc-link-lib=pthread");
         println!("cargo:rustc-link-lib=m");
+    }
+}
+
+/// ggml-metal's Objective-C code uses `@available(macOS ...)`, which compiles to calls to
+/// `__isPlatformVersionAtLeast` from clang's compiler runtime. rustc links with the system `cc` but
+/// not that runtime, so a release build (LTO, no dead code left to hide it) fails to link without
+/// it. The runtime directory comes from the same clang that compiled speech.cpp.
+fn link_clang_runtime() {
+    let output = Command::new("clang").arg("--print-runtime-dir").output();
+    let dir = match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+        _ => {
+            println!("cargo:warning=speech-sys: clang --print-runtime-dir failed; not linking clang_rt.osx");
+            return;
+        }
+    };
+    if Path::new(&dir).join("libclang_rt.osx.a").is_file() {
+        println!("cargo:rustc-link-search=native={dir}");
+        println!("cargo:rustc-link-lib=static=clang_rt.osx");
+    } else {
+        println!("cargo:warning=speech-sys: libclang_rt.osx.a not found in {dir}");
     }
 }
 

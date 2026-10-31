@@ -720,7 +720,7 @@ PY
   else
     fail "duration is '$duration' ms"
   fi
-  note "latency (stop -> clipboard): ${latency} ms, asr: ${asr} ms, audio: ${duration} ms, clipboard: ${#SENTINEL} (sentinel) -> $(pbpaste | wc -c | tr -d ' ') bytes"
+  note "latency (stop -> clipboard): ${latency} ms, asr: ${asr} ms, audio: ${duration} ms, clipboard: $(pbpaste | wc -c | tr -d ' ') bytes"
   stop_app
 }
 

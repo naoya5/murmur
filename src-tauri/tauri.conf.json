@@ -66,7 +66,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDBDNzU0RTUwRDZCQjhDNDIKUldSQ2pMdldVRTUxRENkM2kvZllKU05vcHFSWmdKemVvRmNQTWh4OWVBbndraktIQnBQQWlWaDQK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3NUZDRTVCMzBFMjVBRTYKUldUbVd1SXdXODVmUnplb3JZakhSdER4VmJxNG9sYitKWmIyRzRFS0g1dEpGd0g2a1VsZ0RKWm0K",
       "endpoints": [
         "https://github.com/naoya5/murmur/releases/latest/download/latest.json"
       ]

@@ -536,9 +536,12 @@ pub fn builder() -> Builder<Wry> {
 }
 
 /// Where the generated bindings live, relative to `src-tauri/`.
+#[cfg(any(debug_assertions, test))]
 const BINDINGS_PATH: &str = "../src/ipc/bindings.ts";
 
 /// Write `src/ipc/bindings.ts`. Output is deterministic: no timestamps, stable ordering.
+/// Debug builds and tests only; release builds never write into the source tree.
+#[cfg(any(debug_assertions, test))]
 pub fn export_bindings(builder: &Builder<Wry>) -> Result<(), Box<dyn std::error::Error>> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(BINDINGS_PATH);
     // The generated file has helpers we do not use; keep strict unused checks off for it only.
