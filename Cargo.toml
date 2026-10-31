@@ -1,0 +1,49 @@
+# Murmur workspace.
+# SOT: app-version - `[workspace.package].version` is the single source of the app version.
+# Tauri reads it through src-tauri/Cargo.toml (`version.workspace = true`).
+
+[workspace]
+resolver = "3"
+members = ["crates/murmur-core", "src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["naoya5"]
+repository = "https://github.com/naoya5/murmur"
+rust-version = "1.90"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+specta = { version = "=2.0.0-rc.22", features = ["derive"] }
+unicode-segmentation = "1.13"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+# G6: production code must not panic. Tests are allowed via clippy.toml.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+
+[profile.dev]
+# Speech inference is unusable without optimization; keep app code debuggable.
+opt-level = 0
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

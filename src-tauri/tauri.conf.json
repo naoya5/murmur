@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "murmur",
-  "version": "0.1.0",
+  "productName": "Murmur",
   "identifier": "io.github.naoya5.murmur",
   "build": {
     "beforeDevCommand": "pnpm dev",
