@@ -134,7 +134,10 @@ fn start(handle: &AppHandle) -> Result<Arc<App>, Box<dyn std::error::Error>> {
     }
     spawn_idle_unload(services.clone());
     #[cfg(debug_assertions)]
-    debug::install(controller);
+    {
+        debug::install(controller);
+        debug::show_initial_view(handle);
+    }
     Ok(services)
 }
 
