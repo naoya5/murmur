@@ -24,7 +24,7 @@ describe("durations", () => {
       { value: "5", unit: "s" },
     ]);
     expect(durationParts(35_000, en)).toEqual([{ value: "35", unit: "s" }]);
-    expect(durationParts(0, en)).toEqual([{ value: "0", unit: "s" }]);
+    expect(durationParts(0, en)).toEqual([{ value: "0", unit: "min" }]);
   });
 
   it("joins without a space in Japanese", () => {

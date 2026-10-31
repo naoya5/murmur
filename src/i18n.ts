@@ -255,7 +255,8 @@ const en = {
     welcomeText:
       "Speak, and the words appear where your cursor is. Four quick steps and you are set.",
     stepMic: "Microphone",
-    stepMicText: "Murmur listens only while the hotkey is active. Audio never leaves this Mac.",
+    stepMicText:
+      "Murmur listens only while you record, between the two presses of the hotkey. Audio never leaves this Mac.",
     allowMic: "Allow microphone",
     micGranted: "Microphone allowed",
     micDenied: "Microphone is off for Murmur. Turn it on in System Settings.",
@@ -562,7 +563,8 @@ const ja: Strings = {
     welcome: "Murmur へようこそ",
     welcomeText: "話すと、カーソルの位置に文字が入ります。4 つの手順で準備は完了です。",
     stepMic: "マイク",
-    stepMicText: "Murmur が聞くのはホットキーを押している間だけです。音声はこの Mac から出ません。",
+    stepMicText:
+      "Murmur が聞くのは録音中だけです。ホットキーを押してから、もう一度押すまでの間です。音声はこの Mac から出ません。",
     allowMic: "マイクを許可",
     micGranted: "マイクは許可済み",
     micDenied: "Murmur のマイクがオフです。システム設定でオンにしてください。",

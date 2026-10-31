@@ -23,7 +23,11 @@ export function durationParts(ms: number, t: Strings): DurationPart[] {
     }
     return parts;
   }
-  return [{ value: String(s), unit: t.units.seconds }];
+  if (s > 0) {
+    return [{ value: String(s), unit: t.units.seconds }];
+  }
+  // Nothing yet: "0 min" reads as a count that will grow, "0 s" reads as broken.
+  return [{ value: "0", unit: t.units.minutes }];
 }
 
 export function formatDuration(ms: number, t: Strings): string {
