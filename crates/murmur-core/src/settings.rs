@@ -325,6 +325,10 @@ impl Settings {
     pub fn migrate(json: &str) -> Result<Settings, SettingsError> {
         let value: serde_json::Value =
             serde_json::from_str(json).map_err(|e| SettingsError::Parse(e.to_string()))?;
+        if !value.is_object() {
+            // serde would also accept a positional array; a settings file is always an object.
+            return Err(SettingsError::Parse("not a JSON object".to_owned()));
+        }
         let version = value
             .get("schema_version")
             .and_then(serde_json::Value::as_u64)
@@ -337,5 +341,338 @@ impl Settings {
             serde_json::from_value(value).map_err(|e| SettingsError::Parse(e.to_string()))?;
         settings.schema_version = SCHEMA_VERSION;
         Ok(settings)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(written: &str) -> DictionaryEntry {
+        DictionaryEntry {
+            id: "11111111-2222-3333-4444-555555555555".to_owned(),
+            written: written.to_owned(),
+            readings: vec!["クロードコード".to_owned()],
+            scope: DictionaryScope::Both,
+        }
+    }
+
+    /// A change to apply to default settings, and the key it must be reported under.
+    type Case = (Box<dyn Fn(&mut Settings)>, SettingKey);
+
+    // --- defaults and validation ---
+
+    #[test]
+    fn defaults_validate() {
+        let s = Settings::default();
+        assert_eq!(s.validate(), Ok(()));
+        assert_eq!(s.schema_version, SCHEMA_VERSION);
+        assert_eq!(s.hotkey, "Alt+Space");
+        assert_eq!(s.record_mode, RecordMode::Toggle);
+        assert_eq!(s.language, Language::Ja);
+        assert_eq!(s.models.ja, crate::catalog::DEFAULT_JA_MODEL);
+        assert_eq!(s.models.en, crate::catalog::DEFAULT_EN_MODEL);
+        assert!(s.auto_paste);
+        assert!(!s.restore_clipboard);
+        assert!(s.remove_fillers);
+        assert!(s.add_final_punctuation);
+        assert_eq!(s.typing_wpm_en, 40);
+        assert_eq!(s.typing_cpm_ja, 80);
+        assert_eq!(s.history_retention, HistoryRetention::Forever);
+        assert!(!s.launch_at_login);
+        assert!(s.auto_check_updates);
+        assert_eq!(s.ui_language, UiLanguage::System);
+        assert!(!s.onboarding_completed);
+    }
+
+    #[test]
+    fn validate_rejects_bad_values() {
+        let cases: Vec<Case> = vec![
+            (
+                Box::new(|s| s.hotkey = "   ".to_owned()),
+                SettingKey::Hotkey,
+            ),
+            (Box::new(|s| s.typing_wpm_en = 4), SettingKey::TypingWpmEn),
+            (Box::new(|s| s.typing_wpm_en = 301), SettingKey::TypingWpmEn),
+            (Box::new(|s| s.typing_cpm_ja = 9), SettingKey::TypingCpmJa),
+            (Box::new(|s| s.typing_cpm_ja = 601), SettingKey::TypingCpmJa),
+            (
+                Box::new(|s| s.history_retention = HistoryRetention::Days { days: 0 }),
+                SettingKey::HistoryRetention,
+            ),
+            (
+                Box::new(|s| s.unload_model_after_min = Some(0)),
+                SettingKey::UnloadModelAfterMin,
+            ),
+            (
+                Box::new(|s| s.models.ja = "no-such-model".to_owned()),
+                SettingKey::Models,
+            ),
+            // A real model, but for the other language.
+            (
+                Box::new(|s| s.models.en = crate::catalog::DEFAULT_JA_MODEL.to_owned()),
+                SettingKey::Models,
+            ),
+            (
+                Box::new(|s| s.models.ja = crate::catalog::VAD_MODEL.to_owned()),
+                SettingKey::Models,
+            ),
+            (
+                Box::new(|s| s.dictionary = vec![entry("  ")]),
+                SettingKey::Dictionary,
+            ),
+        ];
+        for (i, (mutate, key)) in cases.iter().enumerate() {
+            let mut s = Settings::default();
+            mutate(&mut s);
+            match s.validate() {
+                Err(SettingsError::Invalid { key: k, .. }) => assert_eq!(k, *key, "case {i}"),
+                other => panic!("case {i}: expected Invalid {key:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validate_accepts_edge_values() {
+        let s = Settings {
+            typing_wpm_en: 5,
+            typing_cpm_ja: 600,
+            history_retention: HistoryRetention::Days { days: 1 },
+            unload_model_after_min: Some(1),
+            models: ModelChoice {
+                ja: "qwen3-asr-0.6b-q8_0".to_owned(),
+                en: "qwen3-asr-0.6b-q8_0".to_owned(),
+            },
+            dictionary: vec![entry("Claude Code")],
+            ..Settings::default()
+        };
+        assert_eq!(s.validate(), Ok(()));
+    }
+
+    // --- diff ---
+
+    #[test]
+    fn diff_of_equal_settings_is_empty() {
+        let s = Settings::default();
+        assert!(s.diff(&s.clone()).is_empty());
+        let mut other = s.clone();
+        other.schema_version = 99; // not a user setting
+        assert!(s.diff(&other).is_empty());
+    }
+
+    #[test]
+    fn diff_reports_each_changed_key() {
+        let cases: Vec<Case> = vec![
+            (
+                Box::new(|s| s.hotkey = "Cmd+Shift+Space".to_owned()),
+                SettingKey::Hotkey,
+            ),
+            (
+                Box::new(|s| s.record_mode = RecordMode::PushToTalk),
+                SettingKey::RecordMode,
+            ),
+            (
+                Box::new(|s| s.microphone = Some("USB Mic".to_owned())),
+                SettingKey::Microphone,
+            ),
+            (
+                Box::new(|s| s.language = Language::En),
+                SettingKey::Language,
+            ),
+            (
+                Box::new(|s| s.models.ja = "haas-ja-v1.0-q5_k".to_owned()),
+                SettingKey::Models,
+            ),
+            (Box::new(|s| s.auto_paste = false), SettingKey::AutoPaste),
+            (
+                Box::new(|s| s.restore_clipboard = true),
+                SettingKey::RestoreClipboard,
+            ),
+            (
+                Box::new(|s| s.remove_fillers = false),
+                SettingKey::RemoveFillers,
+            ),
+            (
+                Box::new(|s| s.add_final_punctuation = false),
+                SettingKey::AddFinalPunctuation,
+            ),
+            (
+                Box::new(|s| s.dictionary = vec![entry("Claude Code")]),
+                SettingKey::Dictionary,
+            ),
+            (Box::new(|s| s.typing_wpm_en = 60), SettingKey::TypingWpmEn),
+            (Box::new(|s| s.typing_cpm_ja = 100), SettingKey::TypingCpmJa),
+            (
+                Box::new(|s| s.history_retention = HistoryRetention::Days { days: 30 }),
+                SettingKey::HistoryRetention,
+            ),
+            (
+                Box::new(|s| s.launch_at_login = true),
+                SettingKey::LaunchAtLogin,
+            ),
+            (
+                Box::new(|s| s.auto_check_updates = false),
+                SettingKey::AutoCheckUpdates,
+            ),
+            (
+                Box::new(|s| s.ui_language = UiLanguage::Ja),
+                SettingKey::UiLanguage,
+            ),
+            (Box::new(|s| s.sounds = true), SettingKey::Sounds),
+            (
+                Box::new(|s| s.unload_model_after_min = Some(10)),
+                SettingKey::UnloadModelAfterMin,
+            ),
+            (
+                Box::new(|s| s.alternate_language_hotkey = Some("Alt+Shift+Space".to_owned())),
+                SettingKey::AlternateLanguageHotkey,
+            ),
+            (
+                Box::new(|s| s.onboarding_completed = true),
+                SettingKey::OnboardingCompleted,
+            ),
+        ];
+        let old = Settings::default();
+        let mut seen = Vec::new();
+        for (mutate, key) in &cases {
+            let mut new = old.clone();
+            mutate(&mut new);
+            assert_eq!(old.diff(&new), vec![*key], "{key:?}");
+            assert_eq!(new.diff(&old), vec![*key], "{key:?} reversed");
+            seen.push(*key);
+        }
+        // Every key is exercised exactly once (keep this list in step with `SettingKey`).
+        seen.sort_by_key(|k| format!("{k:?}"));
+        seen.dedup();
+        assert_eq!(seen.len(), 20);
+    }
+
+    #[test]
+    fn diff_reports_several_keys_in_field_order() {
+        let old = Settings::default();
+        let mut new = old.clone();
+        new.sounds = true;
+        new.hotkey = "F5".to_owned();
+        new.language = Language::En;
+        assert_eq!(
+            old.diff(&new),
+            vec![SettingKey::Hotkey, SettingKey::Language, SettingKey::Sounds]
+        );
+    }
+
+    // --- migrate ---
+
+    #[test]
+    fn migrate_from_empty_object_gives_defaults() {
+        let s = Settings::migrate("{}").unwrap();
+        assert_eq!(s, Settings::default());
+        assert_eq!(s.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrate_keeps_known_fields_and_ignores_unknown_ones() {
+        let json = r#"{
+            "schema_version": 1,
+            "hotkey": "Cmd+Shift+D",
+            "record_mode": "push_to_talk",
+            "language": "en",
+            "typing_wpm_en": 70,
+            "history_retention": { "kind": "days", "days": 14 },
+            "dictionary": [
+                { "id": "a", "written": "Claude Code", "readings": ["cloud code"], "scope": "en" }
+            ],
+            "some_future_field": true,
+            "another": { "nested": [1, 2, 3] }
+        }"#;
+        let s = Settings::migrate(json).unwrap();
+        assert_eq!(s.hotkey, "Cmd+Shift+D");
+        assert_eq!(s.record_mode, RecordMode::PushToTalk);
+        assert_eq!(s.language, Language::En);
+        assert_eq!(s.typing_wpm_en, 70);
+        assert_eq!(s.history_retention, HistoryRetention::Days { days: 14 });
+        assert_eq!(s.dictionary.len(), 1);
+        assert_eq!(s.dictionary[0].scope, DictionaryScope::En);
+        // Everything else is the default.
+        assert_eq!(s.typing_cpm_ja, 80);
+        assert_eq!(s.models, Settings::default().models);
+        assert_eq!(s.validate(), Ok(()));
+    }
+
+    #[test]
+    fn migrate_version_zero_file() {
+        // A file without `schema_version` is version 0 and gets the current version.
+        let s = Settings::migrate(r#"{ "auto_paste": false }"#).unwrap();
+        assert!(!s.auto_paste);
+        assert_eq!(s.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrate_refuses_a_future_version() {
+        let future = SCHEMA_VERSION + 1;
+        let json = format!(r#"{{ "schema_version": {future} }}"#);
+        assert_eq!(
+            Settings::migrate(&json),
+            Err(SettingsError::FutureVersion(future))
+        );
+    }
+
+    #[test]
+    fn migrate_reports_broken_json() {
+        for bad in [
+            "",
+            "not json",
+            "{ \"hotkey\": ",
+            "[]",
+            "{ \"typing_wpm_en\": \"fast\" }",
+        ] {
+            match Settings::migrate(bad) {
+                Err(SettingsError::Parse(_)) => {}
+                other => panic!("{bad:?}: expected Parse, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn json_round_trip() {
+        let s = Settings {
+            hotkey: "Ctrl+Alt+M".to_owned(),
+            record_mode: RecordMode::PushToTalk,
+            microphone: Some("Built-in".to_owned()),
+            language: Language::En,
+            dictionary: vec![entry("Claude Code")],
+            history_retention: HistoryRetention::Days { days: 7 },
+            ui_language: UiLanguage::En,
+            unload_model_after_min: Some(15),
+            alternate_language_hotkey: Some("Alt+Shift+Space".to_owned()),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string_pretty(&s).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(Settings::migrate(&json).unwrap(), s);
+        // Enum spellings are snake_case on disk.
+        assert!(json.contains("\"record_mode\": \"push_to_talk\""));
+        assert!(json.contains("\"kind\": \"days\""));
+        assert!(json.contains("\"language\": \"en\""));
+    }
+
+    #[test]
+    fn dictionary_scope_includes() {
+        assert!(DictionaryScope::Both.includes(Language::Ja));
+        assert!(DictionaryScope::Both.includes(Language::En));
+        assert!(DictionaryScope::Ja.includes(Language::Ja));
+        assert!(!DictionaryScope::Ja.includes(Language::En));
+        assert!(DictionaryScope::En.includes(Language::En));
+        assert!(!DictionaryScope::En.includes(Language::Ja));
+    }
+
+    #[test]
+    fn model_choice_for_language() {
+        let m = ModelChoice {
+            ja: "a".to_owned(),
+            en: "b".to_owned(),
+        };
+        assert_eq!(m.for_language(Language::Ja), "a");
+        assert_eq!(m.for_language(Language::En), "b");
     }
 }

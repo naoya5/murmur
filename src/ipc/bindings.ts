@@ -5,9 +5,157 @@
 
 
 export const commands = {
-async appInfo() : Promise<Result<AppInfo, IpcError>> {
+async appInfo() : Promise<AppInfo> {
+    return await TAURI_INVOKE("app_info");
+},
+async getSettings() : Promise<Settings> {
+    return await TAURI_INVOKE("get_settings");
+},
+async updateSettings(settings: Settings) : Promise<Result<Settings, ApplyError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("app_info") };
+    return { status: "ok", data: await TAURI_INVOKE("update_settings", { settings }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listInputDevices() : Promise<InputDevice[]> {
+    return await TAURI_INVOKE("list_input_devices");
+},
+async getDashboard() : Promise<Result<Dashboard, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_dashboard") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listHistory(query: string, limit: number, offset: number) : Promise<Result<HistoryPage, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_history", { query, limit, offset }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteHistoryItem(id: string) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_history_item", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async clearHistory() : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("clear_history") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async retryHistoryItem(id: string) : Promise<Result<TranscriptRow, RetryError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("retry_history_item", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async copyText(text: string) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("copy_text", { text }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listModels() : Promise<ModelInfo[]> {
+    return await TAURI_INVOKE("list_models");
+},
+async downloadModel(id: string) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("download_model", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async cancelDownload(id: string) : Promise<void> {
+    await TAURI_INVOKE("cancel_download", { id });
+},
+async deleteModel(id: string) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_model", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Uses the same permission functions as recording and pasting (G8).
+ */
+async getPermissions() : Promise<Permissions> {
+    return await TAURI_INVOKE("get_permissions");
+},
+async requestMicrophone() : Promise<Permission> {
+    return await TAURI_INVOKE("request_microphone");
+},
+async requestAccessibility() : Promise<void> {
+    await TAURI_INVOKE("request_accessibility");
+},
+async openPrivacyPane(pane: PrivacyPane) : Promise<void> {
+    await TAURI_INVOKE("open_privacy_pane", { pane });
+},
+/**
+ * While the hotkey recorder listens, the current hotkeys must not fire (PLAN 2.9).
+ */
+async suspendHotkeys() : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("suspend_hotkeys") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async resumeHotkeys() : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("resume_hotkeys") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async resetStats() : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("reset_stats") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Same as pressing the hotkey (toggle mode). Used by the onboarding test and the tray.
+ */
+async toggleRecording() : Promise<void> {
+    await TAURI_INVOKE("toggle_recording");
+},
+async pillClicked() : Promise<void> {
+    await TAURI_INVOKE("pill_clicked");
+},
+async setPillWidth(width: number) : Promise<void> {
+    await TAURI_INVOKE("set_pill_width", { width });
+},
+async getPillState() : Promise<PillState> {
+    return await TAURI_INVOKE("get_pill_state");
+},
+/**
+ * Opens a license or source page in the default browser. Only https URLs on the hosts above;
+ * the app itself makes no request (G11).
+ */
+async openUrl(url: string) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("open_url", { url }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -18,6 +166,23 @@ async appInfo() : Promise<Result<AppInfo, IpcError>> {
 /** user-defined events **/
 
 
+export const events = __makeEvents__<{
+audioLevel: AudioLevel,
+historyChanged: HistoryChanged,
+modelProgress: ModelProgress,
+modelsChanged: ModelsChanged,
+navigate: Navigate,
+pillState: PillState,
+settingsChanged: SettingsChanged
+}>({
+audioLevel: "audio-level",
+historyChanged: "history-changed",
+modelProgress: "model-progress",
+modelsChanged: "models-changed",
+navigate: "navigate",
+pillState: "pill-state",
+settingsChanged: "settings-changed"
+})
 
 /** user-defined constants **/
 
@@ -26,13 +191,279 @@ async appInfo() : Promise<Result<AppInfo, IpcError>> {
 /** user-defined types **/
 
 /**
- * Static facts about the running app. Proves the Rust to UI round trip.
+ * Static facts about the running app.
  */
-export type AppInfo = { version: string; data_dir: string }
+export type AppInfo = { version: string; data_dir: string; speech_engine: string }
+export type ApplyError = { kind: "invalid"; message: string } | { kind: "hotkey"; message: string } | { kind: "autostart"; message: string } | { kind: "save"; message: string }
 /**
- * The error type every command returns. It crosses the IPC boundary as a tagged object.
+ * Audio level for the pill's waveform, about 30 per second while recording.
  */
-export type IpcError = { kind: "path"; message: string }
+export type AudioLevel = { level: number }
+export type Capabilities = { 
+/**
+ * Takes the dictionary as a custom vocabulary (Haas `keywords`).
+ */
+custom_vocabulary: boolean; 
+/**
+ * Takes the dictionary as a text prompt (Qwen3-ASR `prompt`).
+ */
+prompt_vocabulary: boolean; 
+/**
+ * Writes punctuation itself.
+ */
+punctuation: boolean; 
+/**
+ * Reports the language it heard.
+ */
+language_id: boolean }
+/**
+ * Why the microphone could not record.
+ */
+export type CaptureError = "permission_denied" | "no_device" | "open_timeout" | "device_error"
+/**
+ * Why the text was only copied and not pasted.
+ */
+export type CopyReason = "auto_paste_off" | "no_accessibility" | "secure_input" | "paste_failed"
+/**
+ * Everything the Home screen shows.
+ */
+export type Dashboard = { total_sessions: number; total_latin_words: number; total_cjk_chars: number; total_speech_ms: number; typing_ms: number; saved_ms: number; 
+/**
+ * English words per minute of English speech. `None` before any English session.
+ */
+speaking_wpm_en: number | null; 
+/**
+ * Japanese characters per minute of Japanese speech. `None` before any Japanese session.
+ */
+speaking_cpm_ja: number | null; 
+/**
+ * Median of the recent stop-to-clipboard latencies, ms.
+ */
+median_latency_ms: number | null; 
+/**
+ * Consecutive days with at least one session, ending today (or yesterday if today has none).
+ */
+streak_days: number; today_sessions: number; 
+/**
+ * The last 140 days (20 weeks), oldest first, for the heatmap.
+ */
+heatmap: DayPoint[]; 
+/**
+ * The last 14 days, oldest first, for the bar chart.
+ */
+last_14_days: DayPoint[] }
+export type DayPoint = { 
+/**
+ * "YYYY-MM-DD".
+ */
+date: string; sessions: number; latin_words: number; cjk_chars: number }
+/**
+ * What the output adapter did with the text.
+ */
+export type DeliveryOutcome = { kind: "pasted" } | { kind: "copied"; reason: CopyReason } | 
+/**
+ * The output adapter did not answer in time. The text is most likely on the clipboard.
+ */
+{ kind: "unconfirmed" }
+/**
+ * A custom vocabulary entry: how to write a term, and how it sounds (M11).
+ */
+export type DictionaryEntry = { 
+/**
+ * Stable id (UUID string) so the UI can edit entries in place.
+ */
+id: string; 
+/**
+ * The written form, for example "Claude Code".
+ */
+written: string; 
+/**
+ * Readings in kana, for example ["クロードコード"]. Empty when the model already writes it.
+ * English entries use readings as "heard as" spellings to replace, for example ["cloud code"].
+ */
+readings: string[]; scope: DictionaryScope }
+/**
+ * Which language a dictionary entry applies to.
+ */
+export type DictionaryScope = "ja" | "en" | "both"
+export type DownloadProgress = { received: number; total: number; bytes_per_sec: number }
+/**
+ * Why a transcription failed. The audio is kept and the history shows a retry button.
+ */
+export type FailureKind = 
+/**
+ * The engine did not finish within the transcription timeout.
+ */
+"timeout" | 
+/**
+ * Speech was detected but the model returned no text.
+ */
+"empty_result" | 
+/**
+ * The model for the language is not downloaded.
+ */
+"model_missing" | 
+/**
+ * The model file could not be loaded (corrupt, out of memory, device error).
+ */
+"model_load_failed" | 
+/**
+ * Any other engine error.
+ */
+"engine" | 
+/**
+ * The captured audio could not be read back.
+ */
+"audio"
+/**
+ * The model family decides how the engine adapter drives the model.
+ */
+export type Family = 
+/**
+ * Parakeet TDT and Haas (FastConformer encoder + TDT decoder).
+ */
+"fast_conformer" | 
+/**
+ * Qwen3-ASR (LLM decoder; takes a text prompt).
+ */
+"qwen_3_asr" | 
+/**
+ * Silero voice activity detection.
+ */
+"silero_vad"
+/**
+ * The history changed (insert, update, delete). The UI reloads what it shows.
+ */
+export type HistoryChanged = null
+export type HistoryPage = { items: TranscriptRow[]; total: number }
+export type HistoryRetention = { kind: "forever" } | { kind: "days"; days: number }
+export type InputDevice = { name: string; is_default: boolean }
+/**
+ * The error type of plain commands. It crosses the IPC boundary as a tagged object.
+ */
+export type IpcError = { kind: "store"; message: string } | { kind: "model"; message: string } | { kind: "clipboard"; message: string } | { kind: "hotkey"; message: string } | { kind: "url"; message: string }
+/**
+ * A spoken language that Murmur transcribes. Fixed for the length of one recording.
+ */
+export type Language = "ja" | "en"
+/**
+ * Model chosen for each language (catalog ids).
+ */
+export type ModelChoice = { ja: string; en: string }
+export type ModelEntry = { id: string; display_name: string; family: Family; role: Role; tier: Tier; languages: Language[]; repository: string; revision: string; file: string; bytes: number; sha256: string; license: string; 
+/**
+ * Credit text that must be shown (CC-BY models). Empty when none is required.
+ */
+attribution: string; capabilities: Capabilities }
+/**
+ * A catalog entry with its state on this Mac.
+ */
+export type ModelInfo = { entry: ModelEntry; status: ModelStatus; 
+/**
+ * Languages for which this model is the current choice.
+ */
+selected_for: Language[] }
+/**
+ * Download progress of one model, about 10 per second.
+ */
+export type ModelProgress = { id: string; progress: DownloadProgress }
+export type ModelStatus = { id: string; installed: boolean; downloading: DownloadProgress | null; 
+/**
+ * The error of the last failed download, until the next one starts.
+ */
+error: string | null }
+/**
+ * A download finished, failed or was cancelled, or a model was deleted. The UI refetches.
+ */
+export type ModelsChanged = null
+/**
+ * Tray or second launch asks the main window to show a view.
+ */
+export type Navigate = { view: string }
+/**
+ * Short feedback the pill shows before it hides.
+ */
+export type Notice = { kind: "delivered"; outcome: DeliveryOutcome } | { kind: "no_speech" } | 
+/**
+ * The audio is saved in the history and can be retried.
+ */
+{ kind: "failed"; failure: FailureKind } | { kind: "capture_failed"; error: CaptureError }
+/**
+ * State of one macOS privacy permission.
+ */
+export type Permission = "Granted" | "Denied" | "NotDetermined"
+export type Permissions = { microphone: Permission; accessibility: boolean }
+/**
+ * What the pill window receives after every step.
+ */
+export type PillState = { view: PillView; language: Language }
+/**
+ * What the pill shows. Derived from the state; the controller emits it after every step.
+ */
+export type PillView = { kind: "hidden" } | { kind: "recording"; elapsed_ms: number; mode: RecordMode } | { kind: "cancel_pending"; remaining_ms: number; from_recording: boolean } | { kind: "transcribing" } | { kind: "delivering" } | { kind: "notice"; notice: Notice }
+/**
+ * Which pane of System Settings > Privacy & Security to open.
+ */
+export type PrivacyPane = "Microphone" | "Accessibility"
+export type RecordMode = 
+/**
+ * Press to start, press again to stop.
+ */
+"toggle" | 
+/**
+ * Record while the hotkey is held (S2).
+ */
+"push_to_talk"
+export type RetryError = { kind: "not_found" } | { kind: "audio_missing" } | { kind: "model_missing" } | { kind: "no_speech" } | { kind: "failed"; message: string }
+export type Role = "recognition" | "voice_detection"
+/**
+ * All user settings. Stored in `settings.json`.
+ */
+export type Settings = { schema_version: number; 
+/**
+ * Global hotkey as a Tauri accelerator string, for example "Alt+Space".
+ */
+hotkey: string; record_mode: RecordMode; 
+/**
+ * Input device name. `None` follows the system default.
+ */
+microphone: string | null; language: Language; models: ModelChoice; auto_paste: boolean; restore_clipboard: boolean; remove_fillers: boolean; add_final_punctuation: boolean; dictionary: DictionaryEntry[]; typing_wpm_en: number; typing_cpm_ja: number; history_retention: HistoryRetention; launch_at_login: boolean; auto_check_updates: boolean; ui_language: UiLanguage; 
+/**
+ * Start and stop sounds (S4).
+ */
+sounds: boolean; 
+/**
+ * Unload the model after this many idle minutes. `None` keeps it loaded (S5).
+ */
+unload_model_after_min: number | null; 
+/**
+ * Optional second hotkey that records in the other language (S7).
+ */
+alternate_language_hotkey: string | null; onboarding_completed: boolean }
+/**
+ * Settings were saved; every window re-reads what it shows.
+ */
+export type SettingsChanged = { settings: Settings }
+export type Tier = 
+/**
+ * The default for its language.
+ */
+"standard" | 
+/**
+ * Smaller and lighter, slightly less accurate.
+ */
+"light" | 
+/**
+ * Many languages in one model.
+ */
+"multilingual" | 
+/**
+ * Internal helper model (VAD). Not chosen by the user.
+ */
+"internal"
+export type TranscriptRow = { id: string; created_at_ms: number; status: TranscriptStatus; text: string | null; raw_text: string | null; language: Language | null; duration_ms: number; latin_words: number; cjk_chars: number; model_id: string | null; latency_ms: number | null; asr_ms: number | null; audio_path: string | null; error: string | null }
+export type TranscriptStatus = "ok" | "failed" | "recovered"
+export type UiLanguage = "system" | "en" | "ja"
 
 /** tauri-specta globals **/
 

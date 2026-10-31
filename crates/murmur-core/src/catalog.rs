@@ -216,3 +216,152 @@ pub fn for_language(lang: Language) -> impl Iterator<Item = &'static ModelEntry>
         .iter()
         .filter(move |m| m.role == Role::Recognition && m.languages.contains(&lang))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn is_lower_hex(s: &str, len: usize) -> bool {
+        s.len() == len
+            && s.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    }
+
+    #[test]
+    fn ids_are_unique_and_well_formed() {
+        let mut ids: Vec<&str> = CATALOG.iter().map(|m| m.id).collect();
+        ids.sort_unstable();
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), before, "duplicate id");
+        for m in CATALOG {
+            assert!(!m.id.is_empty());
+            assert!(
+                m.id.chars().all(|c| c.is_ascii_lowercase()
+                    || c.is_ascii_digit()
+                    || matches!(c, '-' | '.' | '_')),
+                "{} is not a file-safe id",
+                m.id
+            );
+            assert!(!m.display_name.is_empty(), "{}", m.id);
+            assert!(!m.file.is_empty(), "{}", m.id);
+            assert!(m.bytes > 0, "{}", m.id);
+            assert!(!m.license.is_empty(), "{}", m.id);
+        }
+    }
+
+    #[test]
+    fn defaults_exist_with_the_right_role_and_language() {
+        let ja = find(DEFAULT_JA_MODEL).expect("default ja model");
+        assert_eq!(ja.role, Role::Recognition);
+        assert_eq!(ja.tier, Tier::Standard);
+        assert!(ja.languages.contains(&Language::Ja));
+        assert!(ja.capabilities.custom_vocabulary, "Haas takes keywords");
+
+        let en = find(DEFAULT_EN_MODEL).expect("default en model");
+        assert_eq!(en.role, Role::Recognition);
+        assert_eq!(en.tier, Tier::Standard);
+        assert!(en.languages.contains(&Language::En));
+        assert!(
+            !en.capabilities.custom_vocabulary,
+            "Parakeet needs text replacement"
+        );
+
+        let vad_entry = find(VAD_MODEL).expect("vad model");
+        assert_eq!(vad_entry.role, Role::VoiceDetection);
+        assert_eq!(vad_entry.family, Family::SileroVad);
+        assert_eq!(vad_entry.tier, Tier::Internal);
+        assert!(vad_entry.languages.is_empty());
+        assert_eq!(vad(), vad_entry);
+    }
+
+    #[test]
+    fn exactly_one_standard_model_per_language() {
+        for lang in Language::ALL {
+            let standard: Vec<&str> = for_language(lang)
+                .filter(|m| m.tier == Tier::Standard)
+                .map(|m| m.id)
+                .collect();
+            assert_eq!(standard.len(), 1, "{lang:?}: {standard:?}");
+        }
+    }
+
+    #[test]
+    fn for_language_lists_recognition_models_standard_first() {
+        let ja: Vec<&str> = for_language(Language::Ja).map(|m| m.id).collect();
+        assert_eq!(ja[0], DEFAULT_JA_MODEL);
+        assert!(ja.contains(&"qwen3-asr-0.6b-q8_0"));
+        assert!(!ja.contains(&VAD_MODEL));
+        assert!(!ja.contains(&DEFAULT_EN_MODEL));
+
+        let en: Vec<&str> = for_language(Language::En).map(|m| m.id).collect();
+        assert_eq!(en[0], DEFAULT_EN_MODEL);
+        assert!(en.contains(&"qwen3-asr-0.6b-q8_0"));
+        assert!(!en.contains(&DEFAULT_JA_MODEL));
+    }
+
+    #[test]
+    fn recognition_models_have_a_language_and_vad_has_none() {
+        for m in CATALOG {
+            match m.role {
+                Role::Recognition => assert!(!m.languages.is_empty(), "{}", m.id),
+                Role::VoiceDetection => assert!(m.languages.is_empty(), "{}", m.id),
+            }
+        }
+    }
+
+    #[test]
+    fn hashes_and_revisions_are_pinned() {
+        for m in CATALOG {
+            assert!(
+                is_lower_hex(m.sha256, 64),
+                "{}: sha256 {:?}",
+                m.id,
+                m.sha256
+            );
+            assert!(
+                is_lower_hex(m.revision, 40),
+                "{}: revision {:?}",
+                m.id,
+                m.revision
+            );
+        }
+    }
+
+    #[test]
+    fn urls_point_at_the_pinned_revision() {
+        for m in CATALOG {
+            let url = m.url();
+            assert_eq!(
+                url,
+                format!(
+                    "https://huggingface.co/{}/resolve/{}/{}",
+                    m.repository, m.revision, m.file
+                )
+            );
+            assert!(url.starts_with("https://huggingface.co/"));
+            assert!(url.contains(&format!("/resolve/{}/", m.revision)));
+            assert!(!url.contains("/main/"), "{}: not pinned", m.id);
+            assert!(!url.contains(' '), "{}: space in url", m.id);
+            assert_eq!(m.repository.split('/').count(), 2, "{}: owner/name", m.id);
+        }
+    }
+
+    #[test]
+    fn attribution_is_present_where_the_license_needs_it() {
+        for m in CATALOG {
+            if m.license.starts_with("CC-BY") {
+                assert!(!m.attribution.is_empty(), "{} needs attribution", m.id);
+            }
+        }
+    }
+
+    #[test]
+    fn find_unknown_is_none() {
+        assert!(find("").is_none());
+        assert!(
+            find("haas-ja-v1.0-Q8_0").is_none(),
+            "ids are case-sensitive"
+        );
+    }
+}

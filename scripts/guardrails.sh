@@ -16,7 +16,10 @@ REQUIRED_SOT_IDS=(
   ports
   recognition-plan
   app-version
+  db-schema
   ipc
+  ui-strings
+  design-tokens
 )
 
 # G2: the only file that may use the speech SDK crate.
@@ -72,7 +75,7 @@ done || true)
 $hits"
 
 echo "== R10: required SOT ids are declared"
-sot_hits=$(all_files | grep -E '\.(rs|toml|ts|tsx|md)$' | grep -v -E '^(docs/|scripts/)' | xargs grep -n -E 'SOT: [a-z0-9-]+' 2>/dev/null || true)
+sot_hits=$(all_files | grep -E '\.(rs|toml|ts|tsx|md|css)$' | grep -v -E '^(docs/|scripts/)' | xargs grep -n -E 'SOT: [a-z0-9-]+' 2>/dev/null || true)
 for id in "${REQUIRED_SOT_IDS[@]}"; do
   printf '%s\n' "$sot_hits" | grep -q -E "SOT: ${id}([^a-z0-9-]|\$)" || fail "missing SOT declaration: $id"
 done

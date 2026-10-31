@@ -8,7 +8,7 @@ change, say so in the report. Internal design is yours.
 |---|---|---|
 | T2-5 `adapters/audio.rs` (capture, resample, level, spool, debug WAV device) | audio-dev | todo |
 | T2-6 `crates/speech-sys` in repo + `adapters/engine.rs` + `inference.rs` | speech-sys-dev | todo |
-| T2-7 `platform/macos.rs` permissions + `adapters/output.rs` + `adapters/hotkeys.rs` | platform-dev | todo |
+| T2-7 `platform/macos.rs` permissions + `adapters/output.rs` + `adapters/hotkeys.rs` | platform-dev | review |
 | T2-8 `controller.rs`, `windows.rs`, wiring, minimal pill, debug triggers, E2E | orchestrator | todo |
 
 ## T2-5 audio
@@ -56,8 +56,12 @@ pub struct TranscribeRequest {
     pub pcm: std::sync::Arc<Vec<f32>>, pub language: Language, pub model: ModelSpec, pub vad: ModelSpec,
     pub vocabulary: Vec<DictionaryEntry>, pub cancel: CancelToken,
 }
-pub struct InferenceOutput { pub raw: Option<RawTranscript> /* None = no speech */, pub asr_ms: u64, pub model_id: &'static str }
-#[derive(thiserror::Error)] pub enum InferenceError { ModelLoad(EngineError), Engine(EngineError), Cancelled, Shutdown }
+pub struct InferenceOutput {
+    pub raw: Option<RawTranscript> /* None = no speech */, pub asr_ms: u64, pub model_id: &'static str,
+    pub custom_vocabulary: bool, // the model used the dictionary itself (Haas keywords); the text rules then skip replacements
+}
+#[derive(Debug, thiserror::Error)]
+pub enum InferenceError { ModelMissing, ModelLoad(EngineError), Engine(EngineError), Audio(String), Cancelled, Shutdown }
 #[derive(Clone)] pub struct Inference { /* channel to the inference thread */ }
 impl Inference {
     pub fn spawn(factory: fn(Family) -> Box<dyn SpeechEngine>, vad: fn() -> Box<dyn VoiceDetector>) -> Inference;
@@ -128,3 +132,36 @@ Acceptance:
 - Hotkeys: confirm that plain `Escape` registers with global-hotkey on macOS (PLAN risk table). Key release
   events must arrive (`ShortcutState::Released`) for push-to-talk.
 - Unit tests where possible (accelerator parsing/validation).
+
+## T2-9 windows + tray (owner: audio-dev)
+
+```rust
+// src-tauri/src/windows.rs
+pub fn setup(app: &tauri::AppHandle) -> Result<(), WindowError>;   // once at startup, on the main thread
+pub fn set_pill_visible(app: &tauri::AppHandle, visible: bool);     // any thread; hops to the main thread
+pub fn set_pill_width(app: &tauri::AppHandle, width: f64);          // any thread; animated, keeps the center
+pub fn show_main(app: &tauri::AppHandle);                           // Regular activation policy, show, focus
+// tray.rs
+#[derive(Clone)] pub struct TrayModel { pub recording: bool, pub language: Language, pub recent: Vec<(String, String)> /* (id, preview <= 40 chars) */, pub ui_ja: bool }
+pub enum TrayAction { OpenMain, ToggleRecording, SetLanguage(Language), CopyLast, CopyRecent(String), CheckUpdates, Quit }
+pub fn create(app: &tauri::AppHandle, model: &TrayModel, on_action: std::sync::Arc<dyn Fn(TrayAction) + Send + Sync>) -> Result<(), TrayError>;
+pub fn update(app: &tauri::AppHandle, model: &TrayModel);           // rebuilds the menu
+```
+
+Acceptance:
+- Pill = non-activating NSPanel via `tauri-nspanel` 2.1 (PLAN 2.12): `NonactivatingPanel` style, `hidesOnDeactivate = NO`,
+  `becomesKeyOnlyIfNeeded = YES`, collection behavior `canJoinAllSpaces | fullScreenAuxiliary | stationary | ignoresCycle`,
+  level above floating (status bar level is fine). Never steals focus: showing uses `orderFrontRegardless`, not `makeKey`.
+- Native frosted glass: NSVisualEffectView material `hudWindow`, state `active` (so it stays frosted when another app is
+  front), corner radius = height / 2 (capsule). Main window: vibrancy `sidebar` (or `underWindowBackground`), state active.
+  Use Tauri `windowEffects` if it can do this; otherwise objc2 directly. The web content stays transparent.
+- Position: bottom center of the `visibleFrame` of the screen that holds the mouse, 20 px above the bottom, recomputed
+  on every show. Height 40 px (+ shadow margin if needed).
+- `set_pill_width`: `setFrame:display:animate:` on the main thread, centered on the same x.
+- Main window: hide instead of close (red button and Cmd+W), then switch the activation policy back to `Accessory`;
+  `show_main` switches to `Regular` so it appears in Cmd+Tab. App starts as `Accessory` (no Dock icon).
+- Tray: template icon (monochrome, generated from a simple waveform glyph as PNG in `src-tauri/icons/tray*.png`),
+  menu items in the UI language (English and Japanese strings kept in tray.rs, short), Recent submenu, Language radio items.
+- Verify by running the app (`pnpm tauri dev`): the pill shows over another app without stealing focus (check with
+  `osascript -e 'tell application "System Events" to get name of first process whose frontmost is true'` before and
+  after showing it via a temporary debug call), the tray menu appears. Report what you could and could not verify.

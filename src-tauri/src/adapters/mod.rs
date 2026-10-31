@@ -3,5 +3,9 @@
 //! each other's internals.
 
 pub mod audio;
+pub mod engine;
 pub mod hotkeys;
+pub mod models;
 pub mod output;
+pub mod settings_file;
+pub mod store;

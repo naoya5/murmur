@@ -1,0 +1,7 @@
+# Build settings shared by every cargo invocation in this workspace.
+
+[env]
+# The minimum macOS of the app. rustc, cc and the CMake build of speech.cpp (crates/speech-sys)
+# all read it, so every object in the binary agrees. Keep it equal to
+# `bundle.macOS.minimumSystemVersion` in src-tauri/tauri.conf.json.
+MACOSX_DEPLOYMENT_TARGET = "14.0"

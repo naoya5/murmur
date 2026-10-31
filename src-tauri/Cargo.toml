@@ -19,7 +19,9 @@ tauri-build = { version = "2.7", features = [] }
 
 [dependencies]
 murmur-core = { path = "../crates/murmur-core" }
-tauri = { version = "2.12", features = ["macos-private-api"] }
+# T2-6: the speech SDK, used by adapters/engine.rs alone (G2).
+speech-sys = { path = "../crates/speech-sys" }
+tauri = { version = "2.12", features = ["macos-private-api", "tray-icon", "image-png"] }
 tauri-plugin-single-instance = "2"
 tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }
 specta-typescript = "=0.0.9"
@@ -27,6 +29,43 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 specta.workspace = true
+
+# T2-7: hotkeys, clipboard, permissions (macOS only for v1).
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-updater = "2"
+arboard = { version = "3", default-features = false }
+
+# T2-5: audio capture, resampling, WAV debug device.
+cpal = "0.18"
+rubato = "5"
+ringbuf = "0.6"
+hound = "3.5"
+
+# T3-1 / T3-2: history store and settings file.
+rusqlite = { version = "0.41", features = ["bundled"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+tracing = "0.1"
+
+# Assembly (orchestrator): logging, autostart, ids, locale.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+tauri-plugin-autostart = "2.7"
+uuid = { version = "1", features = ["v4"] }
+sys-locale = "0.3"
+
+# T4-1: model downloads (the only HTTP user, G11).
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "system-proxy"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt", "time", "macros", "sync", "signal"] }
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tauri-nspanel = "2.1"
+core-graphics = "0.25"
+block2 = "0.6"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSDictionary", "NSValue", "NSObject"] }
+objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "AVCaptureDevice", "AVMediaFormat"] }
 
 [lints]
 workspace = true

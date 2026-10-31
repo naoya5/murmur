@@ -1,0 +1,27 @@
+[package]
+name = "speech-sys"
+description = "Raw FFI bindings to speech.cpp, built from the submodule and linked statically (Metal on macOS)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+links = "speech"
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.72"
+cmake = "0.1"
+
+[dev-dependencies]
+hound = "3.5"
+libc = "0.2"
+
+[lints]
+workspace = true

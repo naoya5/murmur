@@ -15,6 +15,8 @@
 //! | Recording / CancelPending(Rec) | CaptureFailed              | Idle + notice; DropAudio, SetEscCapture(false)   |
 //! | CancelPending(Rec)         | Esc / PillClicked              | Recording; ResumeCapture, max timer re-armed with the time left |
 //! | CancelPending(Rec)         | HotkeyDown                     | Transcribing (audio heard during the pause is dropped) |
+//! | CancelPending(Rec)         | HotkeyUp                       | ignored: releasing a push-to-talk key after Esc is not a decision; the countdown or a press decides |
+//! | CancelPending(Rec)         | MicDisconnected                | stays, marks the microphone lost; Esc / PillClicked then transcribe what was recorded |
 //! | CancelPending(any)         | 3 s timer                      | Idle; audio and result discarded, nothing saved  |
 //! | Transcribing               | Transcribed(Text)              | Delivering; SetEscCapture(false), Deliver, delivery timer |
 //! | Transcribing               | Transcribed(NoSpeech)          | Idle + notice; DropAudio                         |
@@ -24,8 +26,11 @@
 //! | CancelPending(Tx)          | Esc / PillClicked              | the held outcome is handled, or back to Transcribing |
 //! | Delivering                 | Delivered / delivery timer     | Idle + notice; SaveSuccess (after the paste, G9) |
 //! | Idle with notice           | notice timer                   | Idle (pill hides)                                |
+//! | Idle with notice           | HotkeyDown                     | Recording (the notice is replaced by the pill)   |
+//! | Transcribing / Delivering  | HotkeyDown / HotkeyUp          | ignored (PLAN 2.4)                               |
 //!
-//! Every other (state, event) pair is ignored. A result or timer that carries an id other than
+//! Every other (state, event) pair is ignored. In push-to-talk, `HotkeyDown` while recording is
+//! key repeat and is ignored; after a resume with the key already up, press and release stops. A result or timer that carries an id other than
 //! the current one is stale and ignored. Esc is captured exactly while the state is Recording,
 //! CancelPending or Transcribing, so Esc reaches other apps the rest of the time.
 
@@ -689,6 +694,1454 @@ impl Machine {
                 deadline,
                 paused,
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::*;
+
+    const S1: SessionId = SessionId(1);
+    const S2: SessionId = SessionId(2);
+    const STALE_SESSION: SessionId = SessionId(9_999);
+    const STALE_TIMER: TimerId = TimerId(9_999);
+    const TOGGLE: Event = Event::HotkeyDown {
+        mode: RecordMode::Toggle,
+    };
+    const PTT: Event = Event::HotkeyDown {
+        mode: RecordMode::PushToTalk,
+    };
+
+    fn text(s: &str) -> TranscriptText {
+        TranscriptText(s.to_owned())
+    }
+
+    fn transcribed(session: SessionId, outcome: TranscribeOutcome) -> Event {
+        Event::Transcribed { session, outcome }
+    }
+
+    fn delivered(session: SessionId, outcome: DeliveryOutcome) -> Event {
+        Event::Delivered { session, outcome }
+    }
+
+    fn arm(id: TimerId, after_ms: Millis) -> Effect {
+        Effect::ArmTimer { id, after_ms }
+    }
+
+    /// The timers armed by a batch of effects.
+    fn armed(fx: &[Effect]) -> Vec<(TimerId, Millis)> {
+        fx.iter()
+            .filter_map(|f| match f {
+                Effect::ArmTimer { id, after_ms } => Some((*id, *after_ms)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The single timer armed by a batch, asserting its duration.
+    fn timer_for(fx: &[Effect], after_ms: Millis) -> TimerId {
+        let timers = armed(fx);
+        assert_eq!(timers.len(), 1, "expected one timer in {fx:?}");
+        assert_eq!(timers[0].1, after_ms, "timer duration in {fx:?}");
+        timers[0].0
+    }
+
+    /// A fake clock plus the timer bookkeeping that the controller will do.
+    struct Harness {
+        m: Machine,
+        now: Millis,
+        /// Armed timers with their due time; fired ones are removed.
+        timers: Vec<(TimerId, Millis)>,
+        fired: Vec<TimerId>,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            Self {
+                m: Machine::new(),
+                now: 1_000_000,
+                timers: Vec::new(),
+                fired: Vec::new(),
+            }
+        }
+
+        fn step(&mut self, event: Event) -> Vec<Effect> {
+            let fx = self.m.step(event, self.now);
+            for (id, after_ms) in armed(&fx) {
+                self.timers.push((id, self.now + after_ms));
+            }
+            fx
+        }
+
+        fn advance(&mut self, ms: Millis) {
+            self.now += ms;
+        }
+
+        /// Fires one armed timer by id, moving the clock to its due time if it is earlier.
+        fn fire(&mut self, id: TimerId) -> Vec<Effect> {
+            let i = self
+                .timers
+                .iter()
+                .position(|(t, _)| *t == id)
+                .unwrap_or_else(|| panic!("{id:?} is not armed"));
+            let (_, due) = self.timers.remove(i);
+            self.now = self.now.max(due);
+            self.fired.push(id);
+            self.step(Event::TimerFired(id))
+        }
+
+        /// Fires the earliest armed timer.
+        fn fire_next(&mut self) -> Vec<Effect> {
+            let id = self
+                .timers
+                .iter()
+                .min_by_key(|(_, due)| *due)
+                .map(|(id, _)| *id)
+                .expect("an armed timer");
+            self.fire(id)
+        }
+
+        fn state(&self) -> &State {
+            self.m.state()
+        }
+
+        fn view(&self) -> PillView {
+            self.m.view(self.now)
+        }
+    }
+
+    // --- state builders ---
+
+    fn recording(mode: RecordMode) -> Harness {
+        let mut h = Harness::new();
+        let fx = h.step(Event::HotkeyDown { mode });
+        assert!(matches!(h.state(), State::Recording(_)), "{fx:?}");
+        h
+    }
+
+    /// Recording for `recorded_ms`, then Esc.
+    fn cancel_rec(mode: RecordMode, recorded_ms: Millis) -> Harness {
+        let mut h = recording(mode);
+        h.advance(recorded_ms);
+        h.step(Event::Esc);
+        assert!(matches!(
+            h.state(),
+            State::CancelPending {
+                paused: Paused::Recording(_),
+                ..
+            }
+        ));
+        h
+    }
+
+    fn transcribing(recorded_ms: Millis) -> Harness {
+        let mut h = recording(RecordMode::Toggle);
+        h.advance(recorded_ms);
+        h.step(TOGGLE);
+        assert!(matches!(h.state(), State::Transcribing(_)));
+        h
+    }
+
+    fn cancel_tx() -> Harness {
+        let mut h = transcribing(5_000);
+        h.advance(300);
+        h.step(Event::Esc);
+        assert!(matches!(
+            h.state(),
+            State::CancelPending {
+                paused: Paused::Transcribing { held: None, .. },
+                ..
+            }
+        ));
+        h
+    }
+
+    fn delivering() -> Harness {
+        let mut h = transcribing(5_000);
+        h.advance(700);
+        h.step(transcribed(S1, TranscribeOutcome::Text(text("hello"))));
+        assert!(matches!(h.state(), State::Delivering { .. }));
+        h
+    }
+
+    fn idle_with_notice() -> Harness {
+        let mut h = delivering();
+        h.advance(100);
+        h.step(delivered(S1, DeliveryOutcome::Pasted));
+        assert!(matches!(h.state(), State::Idle { notice: Some(_) }));
+        h
+    }
+
+    fn timeout_for(recorded_ms: Millis) -> Millis {
+        TRANSCRIBE_TIMEOUT_BASE_MS
+            + (recorded_ms as f64 * TRANSCRIBE_TIMEOUT_PER_RECORDED_MS) as Millis
+    }
+
+    // --- Idle ---
+
+    #[test]
+    fn new_machine_is_hidden_and_wants_no_esc() {
+        let h = Harness::new();
+        assert_eq!(h.state(), &State::Idle { notice: None });
+        assert_eq!(h.view(), PillView::Hidden);
+        assert!(!h.m.wants_esc());
+        assert_eq!(h.m.active_session(), None);
+        assert_eq!(Machine::default().state(), &State::Idle { notice: None });
+    }
+
+    #[test]
+    fn idle_hotkey_starts_recording() {
+        let mut h = Harness::new();
+        let fx = h.step(TOGGLE);
+        let max = timer_for(&fx, MAX_RECORDING_MS);
+        assert_eq!(
+            fx,
+            vec![
+                Effect::StartCapture { session: S1 },
+                Effect::SetEscCapture(true),
+                arm(max, MAX_RECORDING_MS),
+            ]
+        );
+        assert!(h.m.wants_esc());
+        assert_eq!(h.m.active_session(), Some(S1));
+        assert_eq!(
+            h.view(),
+            PillView::Recording {
+                elapsed_ms: 0,
+                mode: RecordMode::Toggle
+            }
+        );
+        h.advance(1_234);
+        assert_eq!(
+            h.view(),
+            PillView::Recording {
+                elapsed_ms: 1_234,
+                mode: RecordMode::Toggle
+            }
+        );
+    }
+
+    #[test]
+    fn idle_ignores_everything_but_the_hotkey() {
+        let mut h = Harness::new();
+        for e in [
+            Event::HotkeyUp,
+            Event::Esc,
+            Event::PillClicked,
+            Event::TimerFired(STALE_TIMER),
+            Event::CaptureFailed {
+                session: S1,
+                error: CaptureError::NoDevice,
+            },
+            Event::MicDisconnected { session: S1 },
+            transcribed(S1, TranscribeOutcome::NoSpeech),
+            delivered(S1, DeliveryOutcome::Pasted),
+        ] {
+            assert!(h.step(e.clone()).is_empty(), "{e:?}");
+            assert_eq!(h.state(), &State::Idle { notice: None });
+        }
+    }
+
+    #[test]
+    fn session_ids_increase_per_recording() {
+        let mut h = Harness::new();
+        h.step(TOGGLE);
+        h.step(TOGGLE);
+        let fx = h.step(transcribed(S1, TranscribeOutcome::NoSpeech));
+        assert!(fx.contains(&Effect::DropAudio { session: S1 }));
+        let fx = h.step(TOGGLE);
+        assert!(fx.contains(&Effect::StartCapture { session: S2 }));
+        assert_eq!(h.m.active_session(), Some(S2));
+    }
+
+    // --- Recording ---
+
+    #[test]
+    fn recording_toggle_hotkey_down_transcribes() {
+        let mut h = recording(RecordMode::Toggle);
+        h.advance(10_000);
+        let fx = h.step(TOGGLE);
+        let timeout = timer_for(&fx, 20_000);
+        assert_eq!(
+            fx,
+            vec![
+                Effect::StopCapture { session: S1 },
+                Effect::Transcribe { session: S1 },
+                arm(timeout, 20_000),
+            ]
+        );
+        assert_eq!(
+            h.state(),
+            &State::Transcribing(Transcribing {
+                session: S1,
+                recorded_ms: 10_000,
+                timeout_timer: timeout,
+            })
+        );
+        assert_eq!(h.view(), PillView::Transcribing);
+        assert!(h.m.wants_esc(), "Esc still cancels while transcribing");
+    }
+
+    #[test]
+    fn transcription_timeout_grows_with_the_recording() {
+        for recorded in [0, 1_000, 60_000, MAX_RECORDING_MS] {
+            let mut h = recording(RecordMode::Toggle);
+            h.advance(recorded);
+            let fx = h.step(Event::PillClicked);
+            timer_for(&fx, timeout_for(recorded));
+        }
+        assert_eq!(timeout_for(MAX_RECORDING_MS), 315_000);
+    }
+
+    #[test]
+    fn recording_toggle_ignores_hotkey_up() {
+        let mut h = recording(RecordMode::Toggle);
+        assert!(h.step(Event::HotkeyUp).is_empty());
+        assert!(matches!(h.state(), State::Recording(_)));
+    }
+
+    #[test]
+    fn recording_push_to_talk_hotkey_up_transcribes() {
+        let mut h = recording(RecordMode::PushToTalk);
+        assert_eq!(
+            h.view(),
+            PillView::Recording {
+                elapsed_ms: 0,
+                mode: RecordMode::PushToTalk
+            }
+        );
+        h.advance(3_000);
+        let fx = h.step(Event::HotkeyUp);
+        assert_eq!(fx[0], Effect::StopCapture { session: S1 });
+        assert_eq!(fx[1], Effect::Transcribe { session: S1 });
+        timer_for(&fx, timeout_for(3_000));
+    }
+
+    #[test]
+    fn recording_push_to_talk_ignores_key_repeat() {
+        let mut h = recording(RecordMode::PushToTalk);
+        h.advance(500);
+        for _ in 0..3 {
+            assert!(h.step(PTT).is_empty());
+            // The mode in the event does not matter: the recording keeps its own.
+            assert!(h.step(TOGGLE).is_empty());
+        }
+        assert!(matches!(h.state(), State::Recording(_)));
+        assert_eq!(h.m.active_session(), Some(S1));
+    }
+
+    #[test]
+    fn recording_stops_on_pill_click_max_timer_and_mic_loss() {
+        let stop = |h: &mut Harness, fx: Vec<Effect>| {
+            assert_eq!(fx[0], Effect::StopCapture { session: S1 });
+            assert_eq!(fx[1], Effect::Transcribe { session: S1 });
+            assert_eq!(armed(&fx).len(), 1);
+            assert!(matches!(h.state(), State::Transcribing(_)));
+        };
+
+        let mut h = recording(RecordMode::Toggle);
+        let fx = h.step(Event::PillClicked);
+        stop(&mut h, fx);
+
+        let mut h = recording(RecordMode::PushToTalk);
+        let max = h.timers[0].0;
+        let fx = h.fire(max);
+        assert_eq!(h.now, 1_000_000 + MAX_RECORDING_MS);
+        stop(&mut h, fx);
+        let State::Transcribing(tx) = h.state() else {
+            panic!()
+        };
+        assert_eq!(tx.recorded_ms, MAX_RECORDING_MS);
+
+        let mut h = recording(RecordMode::Toggle);
+        h.advance(2_000);
+        let fx = h.step(Event::MicDisconnected { session: S1 });
+        stop(&mut h, fx);
+    }
+
+    #[test]
+    fn recording_esc_pauses_with_a_countdown() {
+        let mut h = recording(RecordMode::Toggle);
+        h.advance(4_000);
+        let fx = h.step(Event::Esc);
+        let timer = timer_for(&fx, CANCEL_WINDOW_MS);
+        assert_eq!(
+            fx,
+            vec![
+                Effect::PauseCapture { session: S1 },
+                arm(timer, CANCEL_WINDOW_MS)
+            ]
+        );
+        assert_eq!(
+            h.view(),
+            PillView::CancelPending {
+                remaining_ms: 3_000,
+                from_recording: true
+            }
+        );
+        h.advance(1_000);
+        assert_eq!(
+            h.view(),
+            PillView::CancelPending {
+                remaining_ms: 2_000,
+                from_recording: true
+            }
+        );
+        h.advance(5_000);
+        assert_eq!(
+            h.view(),
+            PillView::CancelPending {
+                remaining_ms: 0,
+                from_recording: true
+            }
+        );
+        assert!(h.m.wants_esc());
+        assert_eq!(h.m.active_session(), Some(S1));
+    }
+
+    #[test]
+    fn capture_failure_while_recording_drops_the_audio() {
+        let mut h = recording(RecordMode::Toggle);
+        let fx = h.step(Event::CaptureFailed {
+            session: S1,
+            error: CaptureError::PermissionDenied,
+        });
+        let notice = timer_for(&fx, NOTICE_ERROR_MS);
+        assert_eq!(
+            fx,
+            vec![
+                Effect::SetEscCapture(false),
+                Effect::DropAudio { session: S1 },
+                arm(notice, NOTICE_ERROR_MS),
+            ]
+        );
+        assert_eq!(
+            h.view(),
+            PillView::Notice {
+                notice: Notice::CaptureFailed {
+                    error: CaptureError::PermissionDenied
+                }
+            }
+        );
+        assert!(!h.m.wants_esc());
+        assert_eq!(h.m.active_session(), None);
+    }
+
+    #[test]
+    fn capture_failure_during_the_countdown_drops_the_audio() {
+        let mut h = cancel_rec(RecordMode::Toggle, 2_000);
+        let fx = h.step(Event::CaptureFailed {
+            session: S1,
+            error: CaptureError::DeviceError,
+        });
+        assert_eq!(fx[0], Effect::SetEscCapture(false));
+        assert_eq!(fx[1], Effect::DropAudio { session: S1 });
+        timer_for(&fx, NOTICE_ERROR_MS);
+        assert!(matches!(h.state(), State::Idle { notice: Some(_) }));
+    }
+
+    // --- CancelPending from Recording ---
+
+    #[test]
+    fn esc_twice_resumes_and_keeps_the_elapsed_time() {
+        let mut h = cancel_rec(RecordMode::Toggle, 5_000);
+        let old_max = h.timers[0].0;
+        h.advance(2_000);
+        let fx = h.step(Event::Esc);
+        let new_max = timer_for(&fx, MAX_RECORDING_MS - 5_000);
+        assert_eq!(
+            fx,
+            vec![
+                Effect::ResumeCapture { session: S1 },
+                arm(new_max, MAX_RECORDING_MS - 5_000),
+            ]
+        );
+        assert_ne!(old_max, new_max);
+        // The pause did not count.
+        assert_eq!(
+            h.view(),
+            PillView::Recording {
+                elapsed_ms: 5_000,
+                mode: RecordMode::Toggle
+            }
+        );
+        h.advance(1_000);
+        assert_eq!(
+            h.view(),
+            PillView::Recording {
+                elapsed_ms: 6_000,
+                mode: RecordMode::Toggle
+            }
+        );
+        // The old max timer is stale now.
+        assert!(h.fire(old_max).is_empty());
+        assert!(matches!(h.state(), State::Recording(_)));
+        // The new one stops the recording at exactly the maximum.
+        let fx = h.fire(new_max);
+        assert_eq!(fx[0], Effect::StopCapture { session: S1 });
+        let State::Transcribing(tx) = h.state() else {
+            panic!()
+        };
+        assert_eq!(tx.recorded_ms, MAX_RECORDING_MS);
+    }
+
+    #[test]
+    fn pill_click_during_the_countdown_resumes_too() {
+        let mut h = cancel_rec(RecordMode::PushToTalk, 1_000);
+        let fx = h.step(Event::PillClicked);
+        assert_eq!(fx[0], Effect::ResumeCapture { session: S1 });
+        assert!(matches!(h.state(), State::Recording(_)));
+    }
+
+    #[test]
+    fn pause_resume_twice_accumulates_only_recorded_time() {
+        let mut h = cancel_rec(RecordMode::Toggle, 3_000);
+        h.advance(2_500);
+        h.step(Event::Esc); // resume at 3 s recorded
+        h.advance(4_000); // 7 s recorded
+        h.step(Event::Esc);
+        h.advance(1_000);
+        let fx = h.step(Event::Esc);
+        timer_for(&fx, MAX_RECORDING_MS - 7_000);
+        assert_eq!(
+            h.view(),
+            PillView::Recording {
+                elapsed_ms: 7_000,
+                mode: RecordMode::Toggle
+            }
+        );
+        h.step(TOGGLE);
+        let State::Transcribing(tx) = h.state() else {
+            panic!()
+        };
+        assert_eq!(tx.recorded_ms, 7_000);
+    }
+
+    #[test]
+    fn hotkey_during_the_countdown_transcribes_what_was_recorded() {
+        let mut h = cancel_rec(RecordMode::Toggle, 6_000);
+        h.advance(1_500);
+        let fx = h.step(TOGGLE);
+        let timeout = timer_for(&fx, timeout_for(6_000));
+        assert_eq!(
+            fx,
+            vec![
+                Effect::StopCapture { session: S1 },
+                Effect::Transcribe { session: S1 },
+                arm(timeout, timeout_for(6_000)),
+            ]
+        );
+        let State::Transcribing(tx) = h.state() else {
+            panic!()
+        };
+        assert_eq!(tx.recorded_ms, 6_000, "the pause is not recorded time");
+    }
+
+    #[test]
+    fn push_to_talk_release_during_the_countdown_is_ignored() {
+        let mut h = cancel_rec(RecordMode::PushToTalk, 2_000);
+        assert!(h.step(Event::HotkeyUp).is_empty());
+        assert!(matches!(h.state(), State::CancelPending { .. }));
+        // A new press decides.
+        let fx = h.step(PTT);
+        assert_eq!(fx[0], Effect::StopCapture { session: S1 });
+        assert!(matches!(h.state(), State::Transcribing(_)));
+    }
+
+    #[test]
+    fn countdown_expiry_while_recording_discards_everything() {
+        let mut h = cancel_rec(RecordMode::Toggle, 2_000);
+        let cancel = h.timers[1].0;
+        let fx = h.fire(cancel);
+        assert_eq!(
+            fx,
+            vec![
+                Effect::StopCapture { session: S1 },
+                Effect::SetEscCapture(false),
+                Effect::DropAudio { session: S1 },
+            ]
+        );
+        assert_eq!(h.state(), &State::Idle { notice: None });
+        assert_eq!(h.view(), PillView::Hidden);
+        assert!(!h.m.wants_esc());
+    }
+
+    #[test]
+    fn mic_lost_during_the_countdown_transcribes_on_undo() {
+        let mut h = cancel_rec(RecordMode::Toggle, 4_000);
+        assert!(h.step(Event::MicDisconnected { session: S1 }).is_empty());
+        let State::CancelPending {
+            paused: Paused::Recording(rec),
+            ..
+        } = h.state()
+        else {
+            panic!()
+        };
+        assert!(rec.mic_lost);
+        let fx = h.step(Event::Esc);
+        assert_eq!(fx[0], Effect::StopCapture { session: S1 });
+        assert_eq!(fx[1], Effect::Transcribe { session: S1 });
+        timer_for(&fx, timeout_for(4_000));
+        assert!(matches!(h.state(), State::Transcribing(_)));
+    }
+
+    #[test]
+    fn mic_lost_during_the_countdown_still_expires_quietly() {
+        let mut h = cancel_rec(RecordMode::Toggle, 4_000);
+        h.step(Event::MicDisconnected { session: S1 });
+        let fx = h.fire_next();
+        assert!(fx.contains(&Effect::DropAudio { session: S1 }));
+        assert_eq!(h.state(), &State::Idle { notice: None });
+    }
+
+    // --- Transcribing ---
+
+    #[test]
+    fn transcribed_text_is_delivered() {
+        let mut h = transcribing(5_000);
+        let fx = h.step(transcribed(S1, TranscribeOutcome::Text(text("hello"))));
+        let delivery = timer_for(&fx, DELIVERY_TIMEOUT_MS);
+        assert_eq!(
+            fx,
+            vec![
+                Effect::SetEscCapture(false),
+                Effect::Deliver {
+                    session: S1,
+                    text: text("hello"),
+                },
+                arm(delivery, DELIVERY_TIMEOUT_MS),
+            ]
+        );
+        assert_eq!(
+            h.state(),
+            &State::Delivering {
+                session: S1,
+                timer: delivery
+            }
+        );
+        assert_eq!(h.view(), PillView::Delivering);
+        assert!(
+            !h.m.wants_esc(),
+            "Esc goes back to other apps while pasting"
+        );
+        assert_eq!(h.m.active_session(), Some(S1));
+    }
+
+    #[test]
+    fn transcribed_no_speech_drops_the_audio() {
+        let mut h = transcribing(5_000);
+        let fx = h.step(transcribed(S1, TranscribeOutcome::NoSpeech));
+        let notice = timer_for(&fx, NOTICE_OK_MS * 2);
+        assert_eq!(
+            fx,
+            vec![
+                Effect::SetEscCapture(false),
+                Effect::DropAudio { session: S1 },
+                arm(notice, NOTICE_OK_MS * 2),
+            ]
+        );
+        assert_eq!(
+            h.view(),
+            PillView::Notice {
+                notice: Notice::NoSpeech
+            }
+        );
+    }
+
+    #[test]
+    fn transcribed_failure_is_saved_for_retry() {
+        for failure in [
+            FailureKind::EmptyResult,
+            FailureKind::ModelMissing,
+            FailureKind::ModelLoadFailed,
+            FailureKind::Engine,
+            FailureKind::Audio,
+        ] {
+            let mut h = transcribing(5_000);
+            let fx = h.step(transcribed(S1, TranscribeOutcome::Failed(failure)));
+            let notice = timer_for(&fx, NOTICE_ERROR_MS);
+            assert_eq!(
+                fx,
+                vec![
+                    Effect::SetEscCapture(false),
+                    Effect::SaveFailure {
+                        session: S1,
+                        failure
+                    },
+                    arm(notice, NOTICE_ERROR_MS),
+                ]
+            );
+            assert_eq!(
+                h.view(),
+                PillView::Notice {
+                    notice: Notice::Failed { failure }
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn transcription_timeout_cancels_the_engine_and_saves_a_failure() {
+        let mut h = transcribing(10_000);
+        let timeout = h.timers[1].0;
+        let fx = h.fire(timeout);
+        assert_eq!(h.now, 1_000_000 + 10_000 + 20_000);
+        let notice = timer_for(&fx, NOTICE_ERROR_MS);
+        assert_eq!(
+            fx,
+            vec![
+                Effect::CancelTranscription { session: S1 },
+                Effect::SetEscCapture(false),
+                Effect::SaveFailure {
+                    session: S1,
+                    failure: FailureKind::Timeout
+                },
+                arm(notice, NOTICE_ERROR_MS),
+            ]
+        );
+        // A late result from the cancelled engine is stale.
+        assert!(
+            h.step(transcribed(S1, TranscribeOutcome::Text(text("late"))))
+                .is_empty()
+        );
+        assert!(matches!(h.state(), State::Idle { notice: Some(_) }));
+    }
+
+    #[test]
+    fn transcribing_ignores_hotkeys_mic_and_delivery() {
+        let mut h = transcribing(5_000);
+        for e in [
+            TOGGLE,
+            PTT,
+            Event::HotkeyUp,
+            Event::MicDisconnected { session: S1 },
+            Event::CaptureFailed {
+                session: S1,
+                error: CaptureError::DeviceError,
+            },
+            delivered(S1, DeliveryOutcome::Pasted),
+        ] {
+            assert!(h.step(e.clone()).is_empty(), "{e:?}");
+            assert!(matches!(h.state(), State::Transcribing(_)));
+        }
+    }
+
+    #[test]
+    fn transcribing_esc_starts_a_countdown_and_keeps_the_engine_running() {
+        let mut h = transcribing(5_000);
+        let fx = h.step(Event::Esc);
+        let timer = timer_for(&fx, CANCEL_WINDOW_MS);
+        assert_eq!(fx, vec![arm(timer, CANCEL_WINDOW_MS)]);
+        assert_eq!(
+            h.view(),
+            PillView::CancelPending {
+                remaining_ms: 3_000,
+                from_recording: false
+            }
+        );
+        assert!(h.m.wants_esc());
+    }
+
+    // --- CancelPending from Transcribing ---
+
+    #[test]
+    fn held_result_is_delivered_on_undo() {
+        let mut h = cancel_tx();
+        assert!(
+            h.step(transcribed(S1, TranscribeOutcome::Text(text("kept"))))
+                .is_empty()
+        );
+        assert!(matches!(
+            h.state(),
+            State::CancelPending {
+                paused: Paused::Transcribing {
+                    held: Some(TranscribeOutcome::Text(_)),
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(
+            h.view(),
+            PillView::CancelPending {
+                remaining_ms: 3_000,
+                from_recording: false
+            }
+        );
+        let fx = h.step(Event::Esc);
+        let delivery = timer_for(&fx, DELIVERY_TIMEOUT_MS);
+        assert_eq!(
+            fx,
+            vec![
+                Effect::SetEscCapture(false),
+                Effect::Deliver {
+                    session: S1,
+                    text: text("kept"),
+                },
+                arm(delivery, DELIVERY_TIMEOUT_MS),
+            ]
+        );
+    }
+
+    #[test]
+    fn held_failure_is_saved_on_undo() {
+        let mut h = cancel_tx();
+        h.step(transcribed(
+            S1,
+            TranscribeOutcome::Failed(FailureKind::Engine),
+        ));
+        let fx = h.step(Event::PillClicked);
+        assert_eq!(fx[0], Effect::SetEscCapture(false));
+        assert_eq!(
+            fx[1],
+            Effect::SaveFailure {
+                session: S1,
+                failure: FailureKind::Engine
+            }
+        );
+        timer_for(&fx, NOTICE_ERROR_MS);
+    }
+
+    #[test]
+    fn held_no_speech_is_dropped_on_undo() {
+        let mut h = cancel_tx();
+        h.step(transcribed(S1, TranscribeOutcome::NoSpeech));
+        let fx = h.step(Event::Esc);
+        assert_eq!(fx[0], Effect::SetEscCapture(false));
+        assert_eq!(fx[1], Effect::DropAudio { session: S1 });
+        assert_eq!(
+            h.view(),
+            PillView::Notice {
+                notice: Notice::NoSpeech
+            }
+        );
+    }
+
+    #[test]
+    fn timeout_during_the_countdown_cancels_the_engine_once_and_holds_the_failure() {
+        let mut h = cancel_tx();
+        let timeout = h.timers[1].0;
+        h.advance(100);
+        let fx = h.step(Event::TimerFired(timeout));
+        assert_eq!(fx, vec![Effect::CancelTranscription { session: S1 }]);
+        assert!(matches!(
+            h.state(),
+            State::CancelPending {
+                paused: Paused::Transcribing {
+                    held: Some(TranscribeOutcome::Failed(FailureKind::Timeout)),
+                    ..
+                },
+                ..
+            }
+        ));
+        // A result that arrives after the timeout is ignored; the failure stays held.
+        assert!(
+            h.step(transcribed(S1, TranscribeOutcome::Text(text("late"))))
+                .is_empty()
+        );
+        let fx = h.step(Event::Esc);
+        assert_eq!(
+            fx[..2],
+            [
+                Effect::SetEscCapture(false),
+                Effect::SaveFailure {
+                    session: S1,
+                    failure: FailureKind::Timeout
+                },
+            ]
+        );
+        assert!(!fx.contains(&Effect::CancelTranscription { session: S1 }));
+    }
+
+    #[test]
+    fn countdown_expiry_while_transcribing_cancels_the_engine() {
+        let mut h = cancel_tx();
+        let cancel = h.timers[2].0;
+        let fx = h.fire(cancel);
+        assert_eq!(
+            fx,
+            vec![
+                Effect::CancelTranscription { session: S1 },
+                Effect::SetEscCapture(false),
+                Effect::DropAudio { session: S1 },
+            ]
+        );
+        assert_eq!(h.state(), &State::Idle { notice: None });
+        // The engine may still answer; the answer is stale.
+        assert!(
+            h.step(transcribed(S1, TranscribeOutcome::Text(text("late"))))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn countdown_expiry_with_a_held_result_only_discards() {
+        for held in [
+            TranscribeOutcome::Text(text("kept")),
+            TranscribeOutcome::Failed(FailureKind::Engine),
+            TranscribeOutcome::NoSpeech,
+        ] {
+            let mut h = cancel_tx();
+            h.step(transcribed(S1, held));
+            let cancel = h.timers[2].0;
+            let fx = h.fire(cancel);
+            assert_eq!(
+                fx,
+                vec![
+                    Effect::SetEscCapture(false),
+                    Effect::DropAudio { session: S1 }
+                ],
+                "nothing is saved and the engine is already done"
+            );
+            assert_eq!(h.state(), &State::Idle { notice: None });
+        }
+    }
+
+    #[test]
+    fn undo_without_a_result_returns_to_transcribing() {
+        let mut h = cancel_tx();
+        let timeout = h.timers[1].0;
+        h.advance(1_000);
+        assert!(h.step(Event::Esc).is_empty());
+        assert_eq!(
+            h.state(),
+            &State::Transcribing(Transcribing {
+                session: S1,
+                recorded_ms: 5_000,
+                timeout_timer: timeout,
+            })
+        );
+        // The original timeout timer still works after the detour.
+        let fx = h.fire(timeout);
+        assert_eq!(fx[0], Effect::CancelTranscription { session: S1 });
+        assert!(matches!(h.state(), State::Idle { notice: Some(_) }));
+    }
+
+    #[test]
+    fn countdown_from_transcribing_ignores_hotkeys_and_mic_events() {
+        let mut h = cancel_tx();
+        for e in [
+            TOGGLE,
+            PTT,
+            Event::HotkeyUp,
+            Event::MicDisconnected { session: S1 },
+            Event::CaptureFailed {
+                session: S1,
+                error: CaptureError::DeviceError,
+            },
+            delivered(S1, DeliveryOutcome::Pasted),
+        ] {
+            assert!(h.step(e.clone()).is_empty(), "{e:?}");
+            assert!(matches!(
+                h.state(),
+                State::CancelPending {
+                    paused: Paused::Transcribing { held: None, .. },
+                    ..
+                }
+            ));
+        }
+    }
+
+    // --- Delivering ---
+
+    #[test]
+    fn delivered_saves_after_the_paste() {
+        let cases = [
+            (DeliveryOutcome::Pasted, NOTICE_OK_MS),
+            (
+                DeliveryOutcome::Copied {
+                    reason: CopyReason::SecureInput,
+                },
+                NOTICE_ERROR_MS,
+            ),
+            (
+                DeliveryOutcome::Copied {
+                    reason: CopyReason::AutoPasteOff,
+                },
+                NOTICE_ERROR_MS,
+            ),
+            (DeliveryOutcome::Unconfirmed, NOTICE_ERROR_MS),
+        ];
+        for (outcome, notice_ms) in cases {
+            let mut h = delivering();
+            let fx = h.step(delivered(S1, outcome));
+            let notice = timer_for(&fx, notice_ms);
+            assert_eq!(
+                fx,
+                vec![
+                    Effect::SaveSuccess {
+                        session: S1,
+                        outcome
+                    },
+                    arm(notice, notice_ms),
+                ],
+                "{outcome:?}"
+            );
+            assert_eq!(
+                h.view(),
+                PillView::Notice {
+                    notice: Notice::Delivered { outcome }
+                }
+            );
+            assert_eq!(h.m.active_session(), None);
+        }
+    }
+
+    #[test]
+    fn delivery_timeout_saves_as_unconfirmed() {
+        let mut h = delivering();
+        let delivery = h.timers[2].0;
+        let fx = h.fire(delivery);
+        assert_eq!(
+            fx[0],
+            Effect::SaveSuccess {
+                session: S1,
+                outcome: DeliveryOutcome::Unconfirmed
+            }
+        );
+        timer_for(&fx, NOTICE_ERROR_MS);
+        // The late confirmation is stale.
+        assert!(h.step(delivered(S1, DeliveryOutcome::Pasted)).is_empty());
+    }
+
+    #[test]
+    fn delivering_ignores_user_input_and_engine_events() {
+        let mut h = delivering();
+        for e in [
+            TOGGLE,
+            Event::HotkeyUp,
+            Event::Esc,
+            Event::PillClicked,
+            Event::MicDisconnected { session: S1 },
+            transcribed(S1, TranscribeOutcome::Text(text("again"))),
+        ] {
+            assert!(h.step(e.clone()).is_empty(), "{e:?}");
+            assert!(matches!(h.state(), State::Delivering { .. }));
+        }
+    }
+
+    // --- Idle with notice ---
+
+    #[test]
+    fn notice_hides_when_its_timer_fires() {
+        let mut h = idle_with_notice();
+        assert!(matches!(h.view(), PillView::Notice { .. }));
+        let notice = h.timers.last().expect("notice timer").0;
+        assert!(h.fire(notice).is_empty());
+        assert_eq!(h.state(), &State::Idle { notice: None });
+        assert_eq!(h.view(), PillView::Hidden);
+    }
+
+    #[test]
+    fn notice_durations() {
+        assert_eq!(
+            Notice::Delivered {
+                outcome: DeliveryOutcome::Pasted
+            }
+            .duration_ms(),
+            800
+        );
+        assert_eq!(Notice::NoSpeech.duration_ms(), 1_600);
+        assert_eq!(
+            Notice::Failed {
+                failure: FailureKind::Engine
+            }
+            .duration_ms(),
+            2_800
+        );
+        assert_eq!(
+            Notice::CaptureFailed {
+                error: CaptureError::NoDevice
+            }
+            .duration_ms(),
+            2_800
+        );
+    }
+
+    #[test]
+    fn hotkey_during_a_notice_starts_a_new_recording() {
+        let mut h = idle_with_notice();
+        let notice = h.timers.last().expect("notice timer").0;
+        let fx = h.step(TOGGLE);
+        assert_eq!(fx[0], Effect::StartCapture { session: S2 });
+        assert_eq!(
+            h.view(),
+            PillView::Recording {
+                elapsed_ms: 0,
+                mode: RecordMode::Toggle
+            }
+        );
+        // The old notice timer is stale now.
+        assert!(h.fire(notice).is_empty());
+        assert!(matches!(h.state(), State::Recording(_)));
+    }
+
+    #[test]
+    fn notice_ignores_other_input() {
+        let mut h = idle_with_notice();
+        for e in [
+            Event::HotkeyUp,
+            Event::Esc,
+            Event::PillClicked,
+            Event::TimerFired(STALE_TIMER),
+            delivered(S1, DeliveryOutcome::Pasted),
+        ] {
+            assert!(h.step(e.clone()).is_empty(), "{e:?}");
+            assert!(matches!(h.state(), State::Idle { notice: Some(_) }));
+        }
+    }
+
+    // --- stale events in every state ---
+
+    fn stale_events() -> Vec<Event> {
+        vec![
+            Event::TimerFired(STALE_TIMER),
+            Event::TimerFired(TimerId(0)),
+            Event::CaptureFailed {
+                session: STALE_SESSION,
+                error: CaptureError::DeviceError,
+            },
+            Event::MicDisconnected {
+                session: STALE_SESSION,
+            },
+            transcribed(STALE_SESSION, TranscribeOutcome::Text(text("stale"))),
+            transcribed(STALE_SESSION, TranscribeOutcome::NoSpeech),
+            transcribed(
+                STALE_SESSION,
+                TranscribeOutcome::Failed(FailureKind::Engine),
+            ),
+            delivered(STALE_SESSION, DeliveryOutcome::Pasted),
+        ]
+    }
+
+    type Builder = (&'static str, fn() -> Harness);
+
+    #[test]
+    fn stale_timers_and_sessions_are_ignored_in_every_state() {
+        let builders: Vec<Builder> = vec![
+            ("idle", Harness::new),
+            ("recording", || recording(RecordMode::Toggle)),
+            ("cancel from recording", || {
+                cancel_rec(RecordMode::Toggle, 1_000)
+            }),
+            ("transcribing", || transcribing(1_000)),
+            ("cancel from transcribing", cancel_tx),
+            ("cancel with held result", || {
+                let mut h = cancel_tx();
+                h.step(transcribed(S1, TranscribeOutcome::Text(text("kept"))));
+                h
+            }),
+            ("delivering", delivering),
+            ("idle with notice", idle_with_notice),
+        ];
+        for (name, build) in builders {
+            let mut h = build();
+            let before = h.state().clone();
+            let view = h.view();
+            for e in stale_events() {
+                assert!(h.step(e.clone()).is_empty(), "{name}: {e:?}");
+                assert_eq!(h.state(), &before, "{name}: {e:?}");
+                assert_eq!(h.view(), view, "{name}: {e:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn previous_session_events_are_stale_in_the_next_session() {
+        let mut h = idle_with_notice();
+        h.step(TOGGLE); // session 2
+        for e in [
+            transcribed(S1, TranscribeOutcome::Text(text("old"))),
+            delivered(S1, DeliveryOutcome::Pasted),
+            Event::MicDisconnected { session: S1 },
+            Event::CaptureFailed {
+                session: S1,
+                error: CaptureError::DeviceError,
+            },
+        ] {
+            assert!(h.step(e.clone()).is_empty(), "{e:?}");
+        }
+        assert!(matches!(h.state(), State::Recording(_)));
+    }
+
+    // --- full scenarios from IDEATION 5.1 ---
+
+    #[test]
+    fn happy_path_toggle() {
+        let mut h = Harness::new();
+        h.step(TOGGLE);
+        h.advance(3_000);
+        h.step(TOGGLE);
+        h.advance(600);
+        h.step(transcribed(
+            S1,
+            TranscribeOutcome::Text(text("今日は晴れです。")),
+        ));
+        h.advance(80);
+        let fx = h.step(delivered(S1, DeliveryOutcome::Pasted));
+        assert!(matches!(fx[0], Effect::SaveSuccess { session: S1, .. }));
+        assert!(matches!(h.view(), PillView::Notice { .. }));
+        h.fire_next();
+        assert_eq!(h.view(), PillView::Hidden);
+        assert!(
+            h.timers
+                .iter()
+                .all(|(id, _)| h.fired.iter().all(|f| f != id))
+        );
+    }
+
+    #[test]
+    fn esc_then_nothing_cancels_without_a_trace() {
+        let mut h = cancel_rec(RecordMode::Toggle, 2_000);
+        let fx = h.fire_next();
+        assert!(
+            !fx.iter()
+                .any(|f| matches!(f, Effect::SaveSuccess { .. } | Effect::SaveFailure { .. }))
+        );
+        assert!(fx.contains(&Effect::DropAudio { session: S1 }));
+        assert_eq!(h.view(), PillView::Hidden);
+    }
+
+    // --- invariants over random event sequences ---
+
+    /// xorshift64*: small, deterministic, no dependency.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+
+        fn pick<T: Clone>(&mut self, items: &[T]) -> T {
+            items[self.below(items.len() as u64) as usize].clone()
+        }
+    }
+
+    /// What the controller would have done so far, checked against the machine.
+    #[derive(Default)]
+    struct Ledger {
+        esc_registered: bool,
+        started: BTreeSet<u64>,
+        transcribe_count: BTreeMap<u64, u32>,
+        delivered: BTreeSet<u64>,
+        terminals: BTreeMap<u64, Vec<String>>,
+    }
+
+    impl Ledger {
+        fn record(&mut self, fx: &[Effect]) {
+            for f in fx {
+                match f {
+                    Effect::StartCapture { session } => {
+                        assert!(self.started.insert(session.0), "{session:?} started twice");
+                    }
+                    Effect::Transcribe { session } => {
+                        assert!(self.started.contains(&session.0));
+                        let n = self.transcribe_count.entry(session.0).or_default();
+                        *n += 1;
+                        assert_eq!(*n, 1, "{session:?} transcribed twice");
+                    }
+                    Effect::Deliver { session, .. } => {
+                        assert_eq!(self.transcribe_count.get(&session.0), Some(&1));
+                        assert!(
+                            self.delivered.insert(session.0),
+                            "{session:?} delivered twice"
+                        );
+                    }
+                    Effect::SaveSuccess { session, .. } => {
+                        assert!(
+                            self.delivered.contains(&session.0),
+                            "SaveSuccess before Deliver for {session:?}"
+                        );
+                        self.terminal(*session, "SaveSuccess");
+                    }
+                    Effect::SaveFailure { session, .. } => self.terminal(*session, "SaveFailure"),
+                    Effect::DropAudio { session } => self.terminal(*session, "DropAudio"),
+                    Effect::PauseCapture { session }
+                    | Effect::ResumeCapture { session }
+                    | Effect::StopCapture { session }
+                    | Effect::CancelTranscription { session } => {
+                        assert!(
+                            self.started.contains(&session.0),
+                            "{f:?} for unknown session"
+                        );
+                        assert!(
+                            !self.terminals.contains_key(&session.0),
+                            "{f:?} after the session ended"
+                        );
+                    }
+                    Effect::SetEscCapture(on) => self.esc_registered = *on,
+                    Effect::ArmTimer { .. } => {}
+                }
+            }
+        }
+
+        fn terminal(&mut self, session: SessionId, what: &str) {
+            assert!(
+                self.started.contains(&session.0),
+                "{what} for unknown {session:?}"
+            );
+            let list = self.terminals.entry(session.0).or_default();
+            list.push(what.to_owned());
+            assert_eq!(list.len(), 1, "{session:?} ended twice: {list:?}");
+        }
+
+        fn assert_all_sessions_ended(&self) {
+            for s in &self.started {
+                assert_eq!(
+                    self.terminals.get(s).map(Vec::len),
+                    Some(1),
+                    "session {s} did not end exactly once: {:?}",
+                    self.terminals.get(s)
+                );
+            }
+        }
+    }
+
+    fn random_event(rng: &mut Rng, h: &Harness) -> Option<Event> {
+        let active = h.m.active_session();
+        let session = |rng: &mut Rng| {
+            if rng.below(100) < 80 {
+                active.unwrap_or(STALE_SESSION)
+            } else {
+                SessionId(rng.below(6))
+            }
+        };
+        let event = match rng.below(12) {
+            0 => Event::HotkeyDown {
+                mode: rng.pick(&[RecordMode::Toggle, RecordMode::PushToTalk]),
+            },
+            1 => Event::HotkeyUp,
+            2 | 3 => Event::Esc,
+            4 => Event::PillClicked,
+            5 | 6 => {
+                // The earliest armed timer, fired at its due time.
+                let (id, _) = *h.timers.iter().min_by_key(|(_, due)| *due)?;
+                Event::TimerFired(id)
+            }
+            7 => {
+                // A stale timer: already fired, or never armed.
+                if h.fired.is_empty() || rng.below(2) == 0 {
+                    Event::TimerFired(TimerId(1_000_000 + rng.below(50)))
+                } else {
+                    Event::TimerFired(rng.pick(&h.fired))
+                }
+            }
+            8 | 9 => {
+                let outcome = match rng.below(5) {
+                    0 => TranscribeOutcome::NoSpeech,
+                    1 => TranscribeOutcome::Failed(rng.pick(&[
+                        FailureKind::Engine,
+                        FailureKind::EmptyResult,
+                        FailureKind::ModelMissing,
+                    ])),
+                    _ => TranscribeOutcome::Text(text("random")),
+                };
+                transcribed(session(rng), outcome)
+            }
+            10 => delivered(
+                session(rng),
+                rng.pick(&[
+                    DeliveryOutcome::Pasted,
+                    DeliveryOutcome::Copied {
+                        reason: CopyReason::PasteFailed,
+                    },
+                ]),
+            ),
+            _ => {
+                if rng.below(2) == 0 {
+                    Event::MicDisconnected {
+                        session: session(rng),
+                    }
+                } else {
+                    Event::CaptureFailed {
+                        session: session(rng),
+                        error: CaptureError::DeviceError,
+                    }
+                }
+            }
+        };
+        Some(event)
+    }
+
+    #[test]
+    fn invariants_hold_over_random_event_sequences() {
+        let mut endings: BTreeMap<String, u32> = BTreeMap::new();
+        for seed in 1..=400u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let mut h = Harness::new();
+            let mut ledger = Ledger::default();
+            let mut trace: Vec<Event> = Vec::new();
+
+            for _ in 0..80 {
+                h.advance(rng.below(4_000));
+                let Some(event) = random_event(&mut rng, &h) else {
+                    continue;
+                };
+                trace.push(event.clone());
+                let fx = match &event {
+                    Event::TimerFired(id) if h.timers.iter().any(|(t, _)| t == id) => h.fire(*id),
+                    _ => h.step(event.clone()),
+                };
+                ledger.record(&fx);
+                assert_eq!(
+                    ledger.esc_registered,
+                    h.m.wants_esc(),
+                    "seed {seed}: Esc registration drifted after {trace:?}\nstate {:?}",
+                    h.state()
+                );
+                if matches!(h.state(), State::Idle { .. }) {
+                    assert_eq!(h.m.active_session(), None);
+                    ledger.assert_all_sessions_ended();
+                } else {
+                    let active =
+                        h.m.active_session()
+                            .expect("a non-idle state has a session");
+                    assert!(ledger.started.contains(&active.0));
+                    assert!(
+                        !ledger.terminals.contains_key(&active.0),
+                        "seed {seed}: active session already ended"
+                    );
+                }
+            }
+
+            // Drain: firing every armed timer must bring the machine to rest.
+            let mut rounds = 0;
+            while !h.timers.is_empty() {
+                let fx = h.fire_next();
+                ledger.record(&fx);
+                assert_eq!(ledger.esc_registered, h.m.wants_esc(), "seed {seed}");
+                rounds += 1;
+                assert!(rounds < 1_000, "seed {seed}: the drain does not converge");
+            }
+            assert_eq!(
+                h.state(),
+                &State::Idle { notice: None },
+                "seed {seed}: not at rest after {trace:?}"
+            );
+            assert!(!ledger.esc_registered);
+            ledger.assert_all_sessions_ended();
+            for what in ledger.terminals.values().flatten() {
+                *endings.entry(what.clone()).or_default() += 1;
+            }
+        }
+        // The generator reached every kind of ending many times.
+        for what in ["SaveSuccess", "SaveFailure", "DropAudio"] {
+            assert!(
+                endings.get(what).is_some_and(|n| *n >= 50),
+                "{what} was rarely reached: {endings:?}"
+            );
         }
     }
 }

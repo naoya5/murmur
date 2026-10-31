@@ -1,7 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "pill",
-  "description": "Capability for the pill window: event subscription only",
-  "windows": ["pill"],
-  "permissions": ["core:event:default"]
+  "description": "Capability for the pill window: its own state, click and size only",
+  "windows": [
+    "pill"
+  ],
+  "permissions": [
+    "core:event:default",
+    "allow-pill-clicked",
+    "allow-set-pill-width",
+    "allow-get-pill-state"
+  ]
 }

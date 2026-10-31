@@ -20,6 +20,7 @@
         "minHeight": 480,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
+        "transparent": true,
         "visible": false
       },
       {
@@ -27,7 +28,7 @@
         "title": "Murmur Pill",
         "url": "pill.html",
         "width": 220,
-        "height": 48,
+        "height": 40,
         "transparent": true,
         "decorations": false,
         "alwaysOnTop": true,
@@ -45,13 +46,30 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": [
+      "app",
+      "dmg"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "createUpdaterArtifacts": true,
+    "macOS": {
+      "minimumSystemVersion": "14.0",
+      "hardenedRuntime": true,
+      "entitlements": "Entitlements.plist"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDBDNzU0RTUwRDZCQjhDNDIKUldSQ2pMdldVRTUxRENkM2kvZllKU05vcHFSWmdKemVvRmNQTWh4OWVBbndraktIQnBQQWlWaDQK",
+      "endpoints": [
+        "https://github.com/naoya5/murmur/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

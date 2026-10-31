@@ -4,10 +4,10 @@ Rules: [RULES.md](./RULES.md). Owner: core-dev. Files: `crates/murmur-core/**` o
 
 | Ticket | Status |
 |---|---|
-| T2-1 Session state machine: exhaustive transition tests | todo |
-| T2-2 `text.rs`: implement formatting rules + tests | todo |
-| T2-3 `metrics.rs`: median, dates, dashboard + tests | todo |
-| T2-4 `pipeline.rs`, `settings.rs`, `catalog.rs`: tests | todo |
+| T2-1 Session state machine: exhaustive transition tests | done (47 tests incl. random invariant run; no machine behavior change, 4 table rows added for documentation) |
+| T2-2 `text.rs`: implement formatting rules + tests | done (28 tests; perf test passes in release) |
+| T2-3 `metrics.rs`: median, dates, dashboard + tests | done (21 tests) |
+| T2-4 `pipeline.rs`, `settings.rs`, `catalog.rs`: tests | done (13 + 14 + 9 tests; `migrate` now rejects non-object JSON) |
 
 ## T2-1 Session state machine tests
 
