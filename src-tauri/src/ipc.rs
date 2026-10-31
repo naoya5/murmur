@@ -129,12 +129,16 @@ pub fn get_settings(services: Services<'_>) -> Settings {
 
 #[tauri::command]
 #[specta::specta]
-pub fn update_settings(
+pub async fn update_settings(
     app: AppHandle,
     services: Services<'_>,
     settings: Settings,
 ) -> Result<Settings, ApplyError> {
-    settings_apply::update(&app, services.inner(), settings)
+    // Off the main thread: the file write and hotkey registration may take a moment.
+    let services = services.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || settings_apply::update(&app, &services, settings))
+        .await
+        .map_err(|e| ApplyError::Save(e.to_string()))?
 }
 
 #[tauri::command]

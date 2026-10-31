@@ -187,8 +187,11 @@ pub fn tray_model(services: &App) -> TrayModel {
 }
 
 /// Rebuilds the tray menu (after settings or history changes).
-pub fn refresh_tray(app: &AppHandle, services: &App) {
-    tray::update(app, &tray_model(services));
+pub fn refresh_tray(app: &AppHandle, services: &Arc<App>) {
+    // The history read runs on a blocking thread, never on the main thread.
+    let app = app.clone();
+    let services = services.clone();
+    tauri::async_runtime::spawn_blocking(move || tray::update(&app, &tray_model(&services)));
 }
 
 fn sys_locale_is_ja() -> bool {
@@ -206,23 +209,32 @@ fn on_tray(app: &AppHandle, services: &Arc<App>, action: TrayAction) {
             }
         }
         TrayAction::SetLanguage(language) => {
-            let mut settings = services.settings();
-            settings.language = language;
-            if let Err(error) = settings_apply::update(app, services, settings) {
-                tracing::warn!(%error, "language change from the tray failed");
-            }
+            let (app, services) = (app.clone(), services.clone());
+            tauri::async_runtime::spawn_blocking(move || {
+                let mut settings = services.settings();
+                settings.language = language;
+                if let Err(error) = settings_apply::update(&app, &services, settings) {
+                    tracing::warn!(%error, "language change from the tray failed");
+                }
+            });
         }
         TrayAction::CopyLast => {
-            if let Some(text) = services.last_text().or_else(|| last_saved_text(services)) {
-                copy_in_background(text);
-            }
+            let services = services.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Some(text) = services.last_text().or_else(|| last_saved_text(&services)) {
+                    copy_text_now(&text);
+                }
+            });
         }
         TrayAction::CopyRecent(id) => {
-            if let Ok(Some(row)) = services.store().get(&id)
-                && let Some(text) = row.text
-            {
-                copy_in_background(text);
-            }
+            let services = services.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Ok(Some(row)) = services.store().get(&id)
+                    && let Some(text) = row.text
+                {
+                    copy_text_now(&text);
+                }
+            });
         }
         TrayAction::CheckUpdates => {
             windows::show_main(app);
@@ -245,12 +257,10 @@ fn last_saved_text(services: &App) -> Option<String> {
         .text
 }
 
-fn copy_in_background(text: String) {
-    tauri::async_runtime::spawn_blocking(move || {
-        if let Err(error) = adapters::output::copy_text(&text) {
-            tracing::warn!(%error, "copy failed");
-        }
-    });
+fn copy_text_now(text: &str) {
+    if let Err(error) = adapters::output::copy_text(text) {
+        tracing::warn!(%error, "copy failed");
+    }
 }
 
 /// S5: frees the model after the configured idle time. Off by default (speed first).
@@ -284,7 +294,7 @@ fn shutdown(handle: &AppHandle) {
         if let Some(controller) = services.controller() {
             controller.send(Msg::Shutdown);
         }
-        services.inference().shutdown(Duration::from_secs(3));
+        services.inference().shutdown(Duration::from_secs(10));
     }
 }
 

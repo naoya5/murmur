@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use murmur_core::Language;
 use murmur_core::ports::{CancelToken, RawTranscript};
 use murmur_core::session::{
-    CaptureError, DeliveryOutcome, Effect, Event, FailureKind, Machine, PillView, SessionId,
+    self, CaptureError, DeliveryOutcome, Effect, Event, FailureKind, Machine, PillView, SessionId,
     TranscribeOutcome, TranscriptText,
 };
 use murmur_core::text::{self, FormatOptions};
@@ -179,6 +179,8 @@ impl Controller {
                 for effect in effects {
                     self.execute(effect);
                 }
+                // An alternate-hotkey press the machine ignored must not change a later recording.
+                self.language_override = None;
                 self.publish();
             }
         }
@@ -216,7 +218,11 @@ impl Controller {
         let Some(ctx) = self.sessions.get_mut(&session) else {
             // The session ended while the microphone was opening: close it again.
             if let Ok(recorder) = result {
-                tauri::async_runtime::spawn_blocking(move || drop(recorder.stop()));
+                tauri::async_runtime::spawn_blocking(move || {
+                    if let Ok(audio) = recorder.stop() {
+                        let _ = std::fs::remove_file(&audio.spool_path);
+                    }
+                });
             }
             return None;
         };
@@ -489,15 +495,29 @@ impl Controller {
                         .collect();
                     match services.model_specs(language) {
                         Some((model, vad)) => {
+                            let loading =
+                                services.inference().loaded_model() != Some(model.entry.id);
+                            if loading {
+                                let _ = tx.send(Msg::Core(Event::ModelLoading { session }));
+                            }
+                            let budget = backstop_timeout(pcm.len(), loading);
                             let request = TranscribeRequest {
                                 pcm,
                                 language,
                                 model,
                                 vad,
                                 vocabulary,
-                                cancel,
+                                cancel: cancel.clone(),
                             };
-                            services.inference().transcribe(request).await
+                            let job = services.inference().transcribe(request);
+                            match tokio::time::timeout(budget, job).await {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    // The machine has timed out already; free the inference thread.
+                                    cancel.cancel();
+                                    Err(InferenceError::Cancelled)
+                                }
+                            }
                         }
                         None => Err(InferenceError::ModelMissing),
                     }
@@ -631,6 +651,17 @@ impl Controller {
             }
         }
     }
+}
+
+/// A hard bound for one transcription task, above the machine's own timeout (which reports the
+/// failure). It only guarantees that the task and its channel do not live forever (G5).
+pub fn backstop_timeout(samples: usize, loading: bool) -> Duration {
+    let recorded_ms = samples as u64 * 1000 / u64::from(murmur_core::SAMPLE_RATE_HZ);
+    let mut ms = session::TRANSCRIBE_TIMEOUT_BASE_MS + recorded_ms + 5_000;
+    if loading {
+        ms += session::MODEL_LOAD_TIMEOUT_MS;
+    }
+    Duration::from_millis(ms)
 }
 
 /// Checks the microphone permission (G8), then opens the device within `OPEN_TIMEOUT`.

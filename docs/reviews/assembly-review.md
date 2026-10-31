@@ -136,3 +136,17 @@ plugin, and start `updater::schedule(handle, || services.settings().auto_check_u
   closing the stream (matches PLAN 2.4).
 - Model switch frees the old model before loading the new one (`inference.rs:217-219`), and `unload_all`
   runs on `Job::Shutdown` and `Job::Unload`.
+
+---
+
+## Resolution (orchestrator, 2026-11-01)
+
+| Finding | Status |
+|---|---|
+| F1 | Fixed: core `Event::ModelLoading` re-arms the transcription timeout once with the 60 s load budget (3 new session tests); the controller sends it when the model is not loaded yet; every transcription task has a backstop `tokio::time::timeout` that cancels the token; exit waits up to 10 s for the inference thread |
+| F2 | Fixed: the language override is cleared after every step |
+| F3 | Fixed: `update_settings` is async and runs on a blocking thread; tray copy, language change and refresh read the store off the main thread |
+| F4 | Fixed: retry has the same backstop timeout and cancels on expiry |
+| F5 | Fixed: an orphan recorder's spool file is deleted after it stops |
+| F6 | Accepted as low: registration of plain Esc has not failed in tests; logged |
+| F7 | Open until T7-1 (updater) is wired |

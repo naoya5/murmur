@@ -180,14 +180,20 @@ pub async fn retry(
         vocabulary,
         cancel: murmur_core::ports::CancelToken::new(),
     };
-    let output = services
-        .inference()
-        .transcribe(request)
-        .await
-        .map_err(|e| match e {
+    let loading = services.inference().loaded_model() != Some(request.model.entry.id);
+    let budget = crate::controller::backstop_timeout(request.pcm.len(), loading);
+    let cancel = request.cancel.clone();
+    let job = services.inference().transcribe(request);
+    let output = match tokio::time::timeout(budget, job).await {
+        Ok(result) => result.map_err(|e| match e {
             InferenceError::ModelMissing => RetryError::ModelMissing,
             other => RetryError::Failed(other.to_string()),
-        })?;
+        })?,
+        Err(_) => {
+            cancel.cancel();
+            return Err(RetryError::Failed("timed out".into()));
+        }
+    };
     let raw = output.raw.ok_or(RetryError::NoSpeech)?;
     let opts = FormatOptions {
         remove_fillers: settings.remove_fillers,

@@ -22,6 +22,7 @@
 //! | Transcribing               | Transcribed(NoSpeech)          | Idle + notice; DropAudio                         |
 //! | Transcribing               | Transcribed(Failed) / timeout  | Idle + notice; SaveFailure (audio kept), engine cancelled on timeout |
 //! | Transcribing               | Esc                            | CancelPending(from Transcribing); engine keeps running |
+//! | Transcribing / CancelPending(Tx) | ModelLoading             | timeout re-armed with the 60 s model load budget |
 //! | CancelPending(Tx)          | Transcribed / timeout          | stays; the outcome is held                       |
 //! | CancelPending(Tx)          | Esc / PillClicked              | the held outcome is handled, or back to Transcribing |
 //! | Delivering                 | Delivered / delivery timer     | Idle + notice; SaveSuccess (after the paste, G9) |
@@ -49,6 +50,8 @@ pub const TRANSCRIBE_TIMEOUT_BASE_MS: Millis = 15_000;
 pub const TRANSCRIBE_TIMEOUT_PER_RECORDED_MS: f64 = 0.5;
 /// Safety net if the output adapter never reports back (its own paste timeout is 1 s).
 pub const DELIVERY_TIMEOUT_MS: Millis = 2_500;
+/// Extra budget when the model must be loaded before transcribing (PLAN 2.13: model load 60 s).
+pub const MODEL_LOAD_TIMEOUT_MS: Millis = 60_000;
 /// How long the pill shows a result before it hides.
 pub const NOTICE_OK_MS: Millis = 800;
 pub const NOTICE_ERROR_MS: Millis = 2_800;
@@ -193,6 +196,11 @@ pub enum Event {
     Delivered {
         session: SessionId,
         outcome: DeliveryOutcome,
+    },
+    /// The model for this session is still loading: the transcription timeout is re-armed once
+    /// with the model load budget added, so a normal first load is not reported as a failure.
+    ModelLoading {
+        session: SessionId,
     },
 }
 
@@ -451,6 +459,18 @@ impl Machine {
         })
     }
 
+    /// Replaces the transcription timer with one that also covers a model load.
+    fn extend_for_model_load(&mut self, tx: Transcribing, fx: &mut Vec<Effect>) -> Transcribing {
+        let timeout = MODEL_LOAD_TIMEOUT_MS
+            + TRANSCRIBE_TIMEOUT_BASE_MS
+            + (tx.recorded_ms as f64 * TRANSCRIBE_TIMEOUT_PER_RECORDED_MS) as Millis;
+        let timeout_timer = self.timer(timeout, fx);
+        Transcribing {
+            timeout_timer,
+            ..tx
+        }
+    }
+
     fn pause(
         &mut self,
         session: SessionId,
@@ -571,6 +591,9 @@ impl Machine {
                     let session = tx.session;
                     self.pause(session, Paused::Transcribing { tx, held: None }, now, fx)
                 }
+                Event::ModelLoading { session } if session == tx.session => {
+                    State::Transcribing(self.extend_for_model_load(tx, fx))
+                }
                 _ => State::Transcribing(tx),
             },
 
@@ -681,6 +704,17 @@ impl Machine {
                         tx,
                         held: Some(TranscribeOutcome::Failed(FailureKind::Timeout)),
                     },
+                }
+            }
+            (Paused::Transcribing { tx, held: None }, Event::ModelLoading { session: s })
+                if same(s) =>
+            {
+                let tx = self.extend_for_model_load(tx, fx);
+                State::CancelPending {
+                    session,
+                    timer,
+                    deadline,
+                    paused: Paused::Transcribing { tx, held: None },
                 }
             }
             (Paused::Transcribing { tx, held }, Event::Esc | Event::PillClicked) => match held {
@@ -878,6 +912,57 @@ mod tests {
     fn timeout_for(recorded_ms: Millis) -> Millis {
         TRANSCRIBE_TIMEOUT_BASE_MS
             + (recorded_ms as f64 * TRANSCRIBE_TIMEOUT_PER_RECORDED_MS) as Millis
+    }
+
+    // --- Model loading ---
+
+    #[test]
+    fn model_loading_extends_the_transcription_timeout_once() {
+        let mut h = transcribing(5_000);
+        let State::Transcribing(before) = h.state().clone() else {
+            panic!()
+        };
+        let fx = h.step(Event::ModelLoading { session: S1 });
+        let extended = MODEL_LOAD_TIMEOUT_MS + timeout_for(5_000);
+        let id = timer_for(&fx, extended);
+        let State::Transcribing(after) = h.state().clone() else {
+            panic!()
+        };
+        assert_eq!(after.timeout_timer, id);
+        // The old timer is stale now; firing it changes nothing.
+        let fx = h.step(Event::TimerFired(before.timeout_timer));
+        assert!(fx.is_empty());
+        assert!(matches!(h.state(), State::Transcribing(_)));
+        // The new timer still times out with a saved failure.
+        let fx = h.fire(id);
+        assert!(fx.contains(&Effect::SaveFailure {
+            session: S1,
+            failure: FailureKind::Timeout
+        }));
+    }
+
+    #[test]
+    fn model_loading_for_another_session_is_ignored() {
+        let mut h = transcribing(5_000);
+        let fx = h.step(Event::ModelLoading {
+            session: SessionId(99),
+        });
+        assert!(fx.is_empty());
+    }
+
+    #[test]
+    fn model_loading_during_the_countdown_extends_the_held_transcription() {
+        let mut h = cancel_tx();
+        let fx = h.step(Event::ModelLoading { session: S1 });
+        let id = timer_for(&fx, MODEL_LOAD_TIMEOUT_MS + timeout_for(5_000));
+        let State::CancelPending {
+            paused: Paused::Transcribing { tx, held: None },
+            ..
+        } = h.state().clone()
+        else {
+            panic!()
+        };
+        assert_eq!(tx.timeout_timer, id);
     }
 
     // --- Idle ---
