@@ -17,7 +17,7 @@ Requirements: macOS 14 or later on Apple Silicon (M1 or newer). About 0.7 GB of 
 ## Install
 
 1. Download `Murmur_<version>_aarch64.dmg` from the Releases page and drag Murmur to Applications.
-2. Open Murmur. macOS says it cannot verify the developer (the app is signed but not notarized, to keep it free).
+2. Open Murmur. macOS says it cannot verify the developer (the app is not notarized, to keep it free).
    Open **System Settings > Privacy & Security**, scroll down and click **Open Anyway**. You only do this once;
    in-app updates do not ask again.
 3. The welcome window walks you through four steps: microphone permission, accessibility permission (for
@@ -50,7 +50,19 @@ brew install cmake          # speech.cpp builds with CMake
 pnpm install
 pnpm tauri dev              # development
 pnpm check                  # lint, types, tests, guardrails
-pnpm tauri build            # release .app and .dmg
+CI=true pnpm tauri build    # release .app and .dmg (CI=true skips the Finder styling of the DMG)
+```
+
+Release builds sign the bundle ad-hoc with the hardened runtime. Set `APPLE_SIGNING_IDENTITY` to a stable
+identity (for example the one `scripts/make-signing-cert.sh` creates) so that macOS keeps the microphone and
+accessibility permissions across updates. Updater artifacts are signed when `TAURI_SIGNING_PRIVATE_KEY` and
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` are set; the public key is in `src-tauri/tauri.conf.json`.
+
+End-to-end tests drive the real debug app with a WAV file as the microphone and signals as the hotkey:
+
+```sh
+MURMUR_TEST_MODELS=~/.murmur-dev-models scripts/e2e.sh            # dictation, Esc, crash recovery, failures
+MURMUR_TEST_MODELS=~/.murmur-dev-models cargo test -p murmur with_models -- --ignored --test-threads=1
 ```
 
 Architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Rules for contributors and agents: [CLAUDE.md](CLAUDE.md).
