@@ -13,7 +13,8 @@
 # Needs: the speech models in $MURMUR_TEST_MODELS (default ~/.murmur-dev-models), macOS tools pbcopy/pbpaste,
 #        sqlite3, python3. The user's text clipboard is saved and restored (images and other types are lost).
 #
-# Usage: scripts/e2e.sh [case ...]     cases: ja en silence cancel undo crash long   (default: all)
+# Usage: scripts/e2e.sh [case ...]     cases: ja en silence cancel undo crash long   (default: all of these)
+#        scripts/e2e.sh mic            opt-in, makes sound: real microphone + afplay through the speakers
 # Exit code: 0 all passed, 1 an assertion failed, 2 the environment is not ready.
 
 set -u -o pipefail
@@ -33,6 +34,8 @@ DATA=""
 LOG=""
 APP_PID=""
 CLIP_SAVE=""
+VOLUME_SAVE=""
+AFPLAY_PID=""
 FAILS=0
 CHECKS=0
 
@@ -45,6 +48,8 @@ die() { printf 'e2e: %s\n' "$*" >&2; exit 2; }
 cleanup() {
   # An early exit can happen before the app helpers are defined.
   if type stop_app > /dev/null 2>&1; then stop_app; fi
+  if [ -n "$AFPLAY_PID" ]; then kill "$AFPLAY_PID" 2> /dev/null; fi
+  if [ -n "$VOLUME_SAVE" ]; then osascript -e "set volume output volume $VOLUME_SAVE" > /dev/null 2>&1; fi
   if [ -n "$CLIP_SAVE" ] && [ -f "$CLIP_SAVE" ]; then
     pbcopy < "$CLIP_SAVE"
   fi
@@ -122,7 +127,7 @@ path, language, wav = sys.argv[1:4]
 settings = {
     "schema_version": 1,
     "onboarding_completed": True,
-    "microphone": "wav:" + wav,
+    "microphone": ("wav:" + wav) if wav else None,  # empty = the system default microphone
     "language": language,
     "auto_paste": False,
     "restore_clipboard": False,
@@ -209,7 +214,7 @@ last_row() { # status|latency_ms|asr_ms|duration_ms|model_id of the newest row
 }
 
 failure_lines() {
-  grep -E 'model load failed|audio unavailable|transcription failed|stopping the recorder failed' "$LOG" 2> /dev/null | head -3
+  grep -E 'could not start|model load failed|audio unavailable|transcription failed|stopping the recorder failed' "$LOG" 2> /dev/null | head -3
 }
 
 set_sentinel() { SENTINEL="E2E-SENTINEL-$RANDOM-$RANDOM"; printf '%s' "$SENTINEL" | pbcopy; }
@@ -379,6 +384,67 @@ case_long() {
   case_dictation "long (77 s Japanese)" ja ja60
 }
 
+# Opt-in (it makes sound): the REAL microphone path. The fixture is played through the speakers with afplay and
+# picked up by the default microphone. Room acoustics matter, so only one expected word per language is required.
+mic_one() { # <name> <language> <wav name> <word>...
+  local name="$1" language="$2" wav="$FIXTURES/$3.wav"
+  shift 3
+  say "== mic: $name (real microphone, played through the speakers)"
+  local before
+  before="$(rows)"
+  set_sentinel
+  start_app "$language" "" || return
+  begin_recording || { stop_app; return; }
+  afplay "$wav" &
+  AFPLAY_PID=$!
+  wait "$AFPLAY_PID" 2> /dev/null
+  AFPLAY_PID=""
+  sleep 0.7
+  hotkey
+  if wait_for_log 'session saved' "$RESULT_TIMEOUT"; then
+    pass "session saved"
+  else
+    fail "no 'session saved' within ${RESULT_TIMEOUT}s"
+    failure_lines | sed 's/^/    log: /'
+    note "clipboard: $(pbpaste)"
+    stop_app
+    return
+  fi
+  wait_for_rows $((before + 1)) 10 && pass "one new history row" || fail "no new history row"
+  local clip found="" word row status latency asr duration model
+  clip="$(pbpaste)"
+  for word in "$@"; do
+    if printf '%s' "$clip" | grep -q -F -- "$word"; then found="$found $word"; fi
+  done
+  if [ -n "$found" ]; then
+    pass "clipboard contains at least one expected word:$found"
+  else
+    fail "clipboard has none of: $*"
+  fi
+  note "clipboard text (our own fixture, not user data): $clip"
+  row="$(last_row)"
+  IFS='|' read -r status latency asr duration model <<< "$row"
+  [ "$status" = "ok" ] && pass "row status ok" || fail "row status is '$status'"
+  note "latency (stop -> clipboard): ${latency} ms, asr: ${asr} ms, audio: ${duration} ms, model: ${model}"
+  stop_app
+}
+
+case_mic() {
+  command -v afplay > /dev/null 2>&1 || die "afplay not found"
+  VOLUME_SAVE="$(osascript -e 'output volume of (get volume settings)' 2> /dev/null)"
+  case "$VOLUME_SAVE" in
+    '' | *[!0-9]*) VOLUME_SAVE="" ;; # "missing value": a device without a volume control
+  esac
+  osascript -e 'set volume output volume 45' > /dev/null 2>&1
+  note "output volume: ${VOLUME_SAVE:-unknown} -> 45 (restored at the end)"
+  mic_one "ja" ja ja 公園 コーヒー
+  mic_one "en" en en settings hotkey
+  if [ -n "$VOLUME_SAVE" ]; then
+    osascript -e "set volume output volume $VOLUME_SAVE" > /dev/null 2>&1
+    VOLUME_SAVE=""
+  fi
+}
+
 run_case() {
   case "$1" in
     ja) case_dictation "ja" ja ja 公園 コーヒー ;;
@@ -388,7 +454,8 @@ run_case() {
     undo) case_undo ;;
     crash) case_crash ;;
     long) case_long ;;
-    *) die "unknown case: $1 (ja en silence cancel undo crash long)" ;;
+    mic) case_mic ;;
+    *) die "unknown case: $1 (ja en silence cancel undo crash long mic)" ;;
   esac
 }
 
