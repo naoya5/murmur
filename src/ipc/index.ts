@@ -2,7 +2,7 @@
 // Types and commands come from the generated `bindings.ts`; do not edit that file by hand.
 import type { EventCallback, UnlistenFn } from "@tauri-apps/api/event";
 import { useEffect, useRef } from "react";
-import type { Result } from "./bindings";
+import { events, type Result } from "./bindings";
 
 export * from "./bindings";
 
@@ -14,13 +14,23 @@ export function unwrap<T, E>(result: Result<T, E>): T {
   throw new Error(JSON.stringify(result.error));
 }
 
+export type EventName = keyof typeof events;
+
+/** The payload type of a named event, derived from the generated bindings. */
+export type EventPayload<K extends EventName> = (typeof events)[K] extends {
+  listen: (cb: EventCallback<infer P>) => unknown;
+}
+  ? P
+  : never;
+
 /**
  * Subscribe to a typed event for the lifetime of the component.
- * Usage: `useEvent(events.someEvent.listen, (event) => ...)`.
+ * Usage: `useEvent("pillState", (payload) => ...)`.
+ * The subscription is made once per event name; the handler may change freely.
  */
-export function useEvent<T>(
-  listen: (callback: EventCallback<T>) => Promise<UnlistenFn>,
-  handler: EventCallback<T>,
+export function useEvent<K extends EventName>(
+  name: K,
+  handler: (payload: EventPayload<K>) => void,
 ): void {
   const handlerRef = useRef(handler);
   handlerRef.current = handler;
@@ -28,7 +38,10 @@ export function useEvent<T>(
   useEffect(() => {
     let cancelled = false;
     let unlisten: UnlistenFn | undefined;
-    listen((event) => handlerRef.current(event)).then((fn) => {
+    const listen = events[name].listen as (
+      cb: EventCallback<EventPayload<K>>,
+    ) => Promise<UnlistenFn>;
+    listen((event) => handlerRef.current(event.payload)).then((fn) => {
       if (cancelled) {
         fn();
       } else {
@@ -39,5 +52,5 @@ export function useEvent<T>(
       cancelled = true;
       unlisten?.();
     };
-  }, [listen]);
+  }, [name]);
 }

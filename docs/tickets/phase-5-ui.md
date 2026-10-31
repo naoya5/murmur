@@ -10,12 +10,12 @@ Your files: everything under `src/` except `src/ipc/bindings.ts` (generated), pl
 
 | Ticket | Status |
 |---|---|
-| T5-1 Design tokens (`src/styles.css`, `//`-free CSS header `SOT: design-tokens`) + UI strings (`src/i18n.ts`, `SOT: ui-strings`, en + ja, follows `settings.ui_language`, System = OS language) | todo |
-| T5-2 Components in `src/ui/`: Glass surfaces, Button, Toggle, Segmented, Select, TextField, KeyRecorder, ProgressBar, Charts (hand-made SVG: heatmap, bar chart, sparkline), EmptyState, Toast | todo |
-| T5-3 The pill (`src/pill/Pill.tsx`) | todo |
-| T5-4 Main window shell + views: Home (dashboard), History, Dictionary, Models, Settings (incl. About + licenses), Onboarding | todo |
-| T5-5 App icon (1024 master -> `pnpm tauri icon`) | todo |
-| T5-6 Visual QA: screenshots of every view and pill state, light and dark, minimum window size (680x480), reduced motion | todo |
+| T5-1 Design tokens (`src/styles.css`, `//`-free CSS header `SOT: design-tokens`) + UI strings (`src/i18n.ts`, `SOT: ui-strings`, en + ja, follows `settings.ui_language`, System = OS language) | done |
+| T5-2 Components in `src/ui/`: Glass surfaces, Button, Toggle, Segmented, Select, TextField, KeyRecorder, ProgressBar, Charts (hand-made SVG: heatmap, bar chart, sparkline), EmptyState, Toast | done |
+| T5-3 The pill (`src/pill/Pill.tsx`) | done (browser mock; not yet run against the native pill window) |
+| T5-4 Main window shell + views: Home (dashboard), History, Dictionary, Models, Settings (incl. About + licenses), Onboarding | done (browser mock; not yet run against the backend) |
+| T5-5 App icon (1024 master -> `pnpm tauri icon`) | done |
+| T5-6 Visual QA: screenshots of every view and pill state, light and dark, minimum window size (680x480), reduced motion | done in the browser mock (chrome-devtools-axi, 760x540 and 680x480, light and dark); reduced motion checked by CSS review only |
 
 ## Design direction
 
