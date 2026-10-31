@@ -1,12 +1,28 @@
-import { defineConfig } from "vite";
-import react from "@vitejs/plugin-react";
-// @ts-expect-error type error without @types/node package
+import { resolve } from "node:path";
 import process from "node:process";
+import react from "@vitejs/plugin-react";
+import { defineConfig } from "vitest/config";
+
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
-export default defineConfig(() => ({
+export default defineConfig({
   plugins: [react()],
+
+  // Two windows, two pages: `main` (index.html) and `pill` (pill.html).
+  build: {
+    rollupOptions: {
+      input: {
+        main: resolve(import.meta.dirname, "index.html"),
+        pill: resolve(import.meta.dirname, "pill.html"),
+      },
+    },
+  },
+
+  test: {
+    environment: "jsdom",
+    include: ["src/**/*.test.{ts,tsx}"],
+  },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
@@ -29,4 +45,4 @@ export default defineConfig(() => ({
       ignored: ["**/src-tauri/**"],
     },
   },
-}));
+});

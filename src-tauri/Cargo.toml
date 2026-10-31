@@ -19,8 +19,10 @@ tauri-build = { version = "2.7", features = [] }
 
 [dependencies]
 murmur-core = { path = "../crates/murmur-core" }
-tauri = { version = "2.12", features = [] }
-tauri-plugin-opener = "2.7"
+tauri = { version = "2.12", features = ["macos-private-api"] }
+tauri-plugin-single-instance = "2"
+tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }
+specta-typescript = "=0.0.9"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

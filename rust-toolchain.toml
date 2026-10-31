@@ -1,0 +1,4 @@
+# Used by CI (rustup). Local Homebrew Rust ignores this file; that is expected.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

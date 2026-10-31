@@ -1,0 +1,43 @@
+/* Placeholder styles. The UI designer owns the design tokens (SOT: design-tokens) later. */
+:root {
+  color-scheme: light dark;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+  font-size: 14px;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+
+.titlebar {
+  height: 40px;
+}
+
+.page {
+  padding: 0 24px;
+}
+
+.pill-page {
+  background: transparent;
+}
+
+.pill {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  border-radius: 9999px;
+  background: rgba(30, 30, 30, 0.85);
+  color: #fff;
+  font-weight: 600;
+}

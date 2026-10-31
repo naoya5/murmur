@@ -5,9 +5,9 @@ Rules: [RULES.md](./RULES.md). Status values: todo / doing / review / done.
 | Ticket | Owner | Status |
 |---|---|---|
 | T1-1 Cargo workspace + murmur-core skeleton (SOT files, ports, session machine) | orchestrator | done |
-| T1-2 Tooling, guardrails script, `pnpm check`, CI | platform-dev | todo |
-| T1-3 tauri-specta IPC, two windows, CSP, capabilities | platform-dev | todo |
-| T1-4 CLAUDE.md, docs/ARCHITECTURE.md, README.md, LICENSE | orchestrator | todo |
+| T1-2 Tooling, guardrails script, `pnpm check`, CI | platform-dev | done |
+| T1-3 tauri-specta IPC, two windows, CSP, capabilities | platform-dev | done |
+| T1-4 CLAUDE.md, docs/ARCHITECTURE.md, README.md, LICENSE | orchestrator | done |
 | T1-5 `crates/speech-sys` as a submodule-backed `-sys` crate | speech-sys-dev | doing (Phase 0 probe) |
 
 ## T1-2 Tooling, guardrails, `pnpm check`, CI

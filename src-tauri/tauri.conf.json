@@ -11,14 +11,37 @@
   "app": {
     "windows": [
       {
-        "title": "murmur",
-        "width": 800,
-        "height": 600
+        "label": "main",
+        "title": "Murmur",
+        "url": "index.html",
+        "width": 760,
+        "height": 540,
+        "minWidth": 680,
+        "minHeight": 480,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "visible": false
+      },
+      {
+        "label": "pill",
+        "title": "Murmur Pill",
+        "url": "pill.html",
+        "width": 220,
+        "height": 48,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "resizable": false,
+        "shadow": false,
+        "focus": false
       }
     ],
     "security": {
-      "csp": null
-    }
+      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'"
+    },
+    "macOSPrivateApi": true
   },
   "bundle": {
     "active": true,
