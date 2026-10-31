@@ -12,12 +12,12 @@ export function Card({ tight, className, children, ...rest }: CardProps) {
   );
 }
 
-type GroupProps = { title?: string; children: ReactNode };
+type GroupProps = { title?: string; children: ReactNode; id?: string };
 
 /** A titled group of rows, as in System Settings. */
-export function Group({ title, children }: GroupProps) {
+export function Group({ title, children, id }: GroupProps) {
   return (
-    <section className="settings__section">
+    <section className="settings__section" id={id}>
       {title && <h2 className="group__title">{title}</h2>}
       <div className="group">{children}</div>
     </section>

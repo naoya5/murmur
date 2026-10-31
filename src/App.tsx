@@ -1,10 +1,18 @@
 import { BookA, Clock, House, Layers, Settings as SettingsIcon } from "lucide-react";
 import { type ReactNode, useEffect, useMemo, useState } from "react";
-import { asView, NavigationContext, useNavigation, type View } from "./app/navigation";
+import {
+  NavigationContext,
+  parseTarget,
+  type Target,
+  useNavigation,
+  type View,
+} from "./app/navigation";
 import { SettingsProvider, useSettings } from "./app/settings";
+import { UpdateProvider } from "./app/updates";
 import { I18nContext, resolveLocale, strings, useT } from "./i18n";
 import { useEvent } from "./ipc";
 import { ToastProvider } from "./ui/Toast";
+import { UpdateBanner } from "./ui/UpdateBanner";
 import { Dictionary } from "./views/Dictionary";
 import { History } from "./views/History";
 import { Home } from "./views/Home";
@@ -66,9 +74,27 @@ function CurrentView({ view }: { view: View }) {
 
 function Shell() {
   const { settings } = useSettings();
-  const [view, setView] = useState<View>("home");
-  useEvent("navigate", (payload) => setView(asView(payload.view)));
-  const nav = useMemo(() => ({ view, navigate: setView }), [view]);
+  const [target, setTarget] = useState<Target>({ view: "home", anchor: null });
+  const view = target.view;
+  useEvent("navigate", (payload) => setTarget(parseTarget(payload.view)));
+  const nav = useMemo(
+    () => ({
+      view,
+      navigate: (next: View, anchor?: string) => setTarget({ view: next, anchor: anchor ?? null }),
+    }),
+    [view],
+  );
+
+  // A target with an anchor scrolls that element into view once the view has rendered.
+  useEffect(() => {
+    if (!target.anchor) {
+      return;
+    }
+    const id = window.requestAnimationFrame(() => {
+      document.getElementById(target.anchor ?? "")?.scrollIntoView({ block: "start" });
+    });
+    return () => window.cancelAnimationFrame(id);
+  }, [target]);
 
   if (!settings) {
     return <div className="titlebar" data-tauri-drag-region />;
@@ -90,6 +116,7 @@ function Shell() {
         <Sidebar />
         <main className="content">
           <div className="content__drag" data-tauri-drag-region />
+          <UpdateBanner />
           <div className="view" key={view}>
             <div className="view__inner">
               <CurrentView view={view} />
@@ -106,7 +133,9 @@ export default function App() {
     <SettingsProvider>
       <Localized>
         <ToastProvider>
-          <Shell />
+          <UpdateProvider>
+            <Shell />
+          </UpdateProvider>
         </ToastProvider>
       </Localized>
     </SettingsProvider>

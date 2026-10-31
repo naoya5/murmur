@@ -3,7 +3,7 @@
 // It must never reach the production bundle: `pnpm build` is checked for the sentinel below.
 //
 // Drive it from the URL or the console:
-//   index.html?view=history&empty=1&onboarding=1&lang=ja
+//   index.html?view=history&empty=1&onboarding=1&lang=ja&update=available|banner|error|installfail
 //   pill.html?state=recording|cancel|transcribing|delivering|pasted|copied|nospeech|failed|capture
 //   window.__murmurMock.pill("copied"), .cycle(), .failDownloads(true)
 import { emit } from "@tauri-apps/api/event";
@@ -23,6 +23,7 @@ import type {
   PillView,
   Settings,
   TranscriptRow,
+  UpdateInfo,
 } from "./bindings";
 
 export const MOCK_SENTINEL = "murmur-dev-mock-fixture-7f3a";
@@ -344,6 +345,13 @@ const appInfo: AppInfo = {
   speech_engine: "speech.cpp (Metal)",
 };
 
+const updateInfo: UpdateInfo = {
+  version: "0.2.0",
+  notes:
+    "Faster Japanese model loading.\nThe pill remembers its width between sessions.\nFixes for push-to-talk on external keyboards.",
+  date: "2026-11-08T09:00:00Z",
+};
+
 // ---------- Pill state ----------
 
 let pill: PillState = { view: { kind: "hidden" }, language: settings.language };
@@ -606,6 +614,20 @@ mockIPC(
         window.setTimeout(() => setPill(pillViewFor("hidden")), 3200);
         simulateDictation();
         return null;
+      case "check_for_updates": {
+        await new Promise((r) => window.setTimeout(r, 900));
+        const mode = params.get("update") ?? "none";
+        if (mode === "error") {
+          throw { kind: "check", message: "dns: github.com could not be resolved" };
+        }
+        return mode === "none" ? null : updateInfo;
+      }
+      case "install_update":
+        await new Promise((r) => window.setTimeout(r, 2500));
+        if (params.get("update") === "installfail") {
+          throw { kind: "install", message: "signature mismatch" };
+        }
+        return null;
       case "pill_clicked":
         setPill(pillViewFor(pill.view.kind === "recording" ? "transcribing" : "hidden"));
         return null;
@@ -628,6 +650,10 @@ mockIPC(
 // ---------- Page dressing and console handles ----------
 
 document.documentElement.classList.add("mock", isPill ? "mock-pill" : "mock-main");
+
+if (!isPill && params.get("update") === "banner") {
+  window.setTimeout(() => void emit("update-available", { info: updateInfo }), 1200);
+}
 
 if (!isPill && params.has("view")) {
   window.setTimeout(() => void emit("navigate", { view: params.get("view") ?? "home" }), 150);

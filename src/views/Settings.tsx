@@ -1,7 +1,8 @@
-import { ExternalLink } from "lucide-react";
+import { Check, ExternalLink, LoaderCircle } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { useNavigation } from "../app/navigation";
 import { useSettings } from "../app/settings";
+import { useUpdates } from "../app/updates";
 import { type Strings, useT } from "../i18n";
 import {
   type AppInfo,
@@ -40,6 +41,7 @@ export function Settings() {
   const toast = useToast();
   const { navigate } = useNavigation();
   const { settings, update } = useSettings();
+  const updates = useUpdates();
   const [errors, setErrors] = useState<Partial<Record<Field, string>>>({});
   const [devices, setDevices] = useState<InputDevice[]>([]);
   const [permissions, setPermissions] = useState<Permissions | null>(null);
@@ -479,9 +481,12 @@ export function Settings() {
           <Row label={t.settings.privacyNote} />
         </Group>
 
-        <Group title={t.settings.about}>
+        <Group title={t.settings.about} id="about">
           <Row label={t.settings.version} hint={t.app.name}>
             <span className="tnum">{info?.version ?? ""}</span>
+          </Row>
+          <Row label={t.settings.updates} stack>
+            <UpdateRow updates={updates} />
           </Row>
           <Row label={t.settings.engine}>
             <span>{info?.speech_engine ?? ""}</span>
@@ -549,5 +554,68 @@ export function Settings() {
         onCancel={() => setConfirmReset(false)}
       />
     </>
+  );
+}
+
+function UpdateRow({ updates }: { updates: ReturnType<typeof useUpdates> }) {
+  const t = useT();
+  const { state, check, install } = updates;
+  const busy = state.kind === "checking" || state.kind === "installing";
+  const info =
+    state.kind === "available" || state.kind === "installing"
+      ? state.info
+      : state.kind === "error"
+        ? state.info
+        : null;
+
+  let status: { tone: "ok" | "error" | "muted"; text: string; spin?: boolean } | null = null;
+  switch (state.kind) {
+    case "checking":
+      status = { tone: "muted", text: t.settings.checking, spin: true };
+      break;
+    case "up_to_date":
+      status = { tone: "ok", text: t.settings.upToDate };
+      break;
+    case "available":
+      status = { tone: "ok", text: t.settings.updateAvailable(state.info.version) };
+      break;
+    case "installing":
+      status = { tone: "muted", text: t.settings.installing, spin: true };
+      break;
+    case "error":
+      status = {
+        tone: "error",
+        text: `${state.error.kind === "check" ? t.settings.updateCheckFailed : t.settings.updateInstallFailed}. ${state.error.message}`,
+      };
+      break;
+  }
+
+  return (
+    <div className="update">
+      <div className="row__control">
+        <Button size="sm" onClick={check} disabled={busy}>
+          {t.settings.checkForUpdates}
+        </Button>
+        {info && (
+          <Button size="sm" variant="primary" onClick={install} disabled={busy}>
+            {state.kind === "installing" ? t.settings.installing : t.settings.installAndRestart}
+          </Button>
+        )}
+      </div>
+      {status && (
+        <div
+          className={`update__status${status.tone === "ok" ? " update__status--ok" : status.tone === "error" ? " update__status--error" : ""}`}
+          role="status"
+        >
+          {status.spin ? (
+            <LoaderCircle className="spin" aria-hidden="true" />
+          ) : status.tone === "ok" ? (
+            <Check aria-hidden="true" />
+          ) : null}
+          <span>{status.text}</span>
+        </div>
+      )}
+      {info?.notes && <div className="update__notes selectable">{info.notes}</div>}
+    </div>
   );
 }
