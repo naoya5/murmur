@@ -34,11 +34,15 @@ impl Paths {
             .then(|| std::env::var_os("MURMUR_DATA_DIR"))
             .flatten()
             .map(PathBuf::from);
+        // An isolated debug instance keeps its logs with its data, so parallel runs stay apart.
+        let logs = match &override_dir {
+            Some(dir) => dir.join("logs"),
+            None => app.path().app_log_dir().map_err(|e| e.to_string())?,
+        };
         let data = match override_dir {
             Some(dir) => dir,
             None => app.path().app_data_dir().map_err(|e| e.to_string())?,
         };
-        let logs = app.path().app_log_dir().map_err(|e| e.to_string())?;
         let paths = Paths {
             models: data.join("models"),
             spool: data.join("spool"),

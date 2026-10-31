@@ -14,7 +14,7 @@
 #        sqlite3, python3. The user's text clipboard is saved and restored (images and other types are lost).
 #
 # Usage: scripts/e2e.sh [case ...]     cases: ja en silence cancel undo crash long   (default: all of these)
-#        scripts/e2e.sh mic            opt-in, makes sound: real microphone + afplay through the speakers
+#        opt-in: mic (makes sound: real microphone + afplay through the speakers), tenmin (about 12 minutes)
 # Exit code: 0 all passed, 1 an assertion failed, 2 the environment is not ready.
 
 set -u -o pipefail
@@ -221,14 +221,16 @@ set_sentinel() { SENTINEL="E2E-SENTINEL-$RANDOM-$RANDOM"; printf '%s' "$SENTINEL
 
 # Starts a recording and waits until the (WAV) microphone is open.
 begin_recording() {
+  local seen
+  seen="$(grep -c 'recording started' "$LOG")" # earlier recordings of this app instance do not count
   hotkey
-  if ! wait_for_log 'recording started' 20; then
+  if ! wait_for_log 'recording started' 20 $((seen + 1)); then
     fail "recording did not start"
     failure_lines | sed 's/^/    log: /'
     return 1
   fi
   local open_ms
-  open_ms="$(plain_log | grep -E 'recording started' | head -1 | sed -E 's/.*open_ms=([0-9]+).*/\1/')"
+  open_ms="$(plain_log | grep -E 'recording started' | tail -1 | sed -E 's/.*open_ms=([0-9]+).*/\1/')"
   note "hotkey -> recording started: ${open_ms} ms"
   return 0
 }
@@ -445,6 +447,283 @@ case_mic() {
   fi
 }
 
+# ---------------------------------------------------------------------------------------------
+# Hardening cases (PLAN phase 8)
+# ---------------------------------------------------------------------------------------------
+
+# A clean data dir with all three models installed. The app must be stopped.
+fresh_data() {
+  stop_app
+  rm -r "$DATA"
+  mkdir -p "$DATA/models"
+  install_models > /dev/null || die "could not install models"
+}
+
+remove_recognition_models() {
+  find "$DATA/models" \( -name 'Haas*' -o -name 'parakeet*' -o -name 'Qwen*' \) -delete
+}
+
+# Plays the fixture and stops: one complete dictation on the running app.
+dictate_once() { # <wav name>
+  local length
+  length="$(wav_seconds "$FIXTURES/$1.wav")"
+  begin_recording || return 1
+  sleep "$(python3 -c "print($length + 0.5)")"
+  hotkey
+}
+
+# Spool files that no failed/recovered row refers to (a leftover, or an ok row that kept its audio).
+spool_orphans() {
+  local f
+  for f in "$DATA"/spool/*.pcm; do
+    [ -e "$f" ] || continue
+    [ -n "$(sqlite3 "$DATA/murmur.db" "SELECT 1 FROM transcripts WHERE audio_path='$f' AND status IN ('failed','recovered') LIMIT 1" 2> /dev/null)" ] || echo "$f"
+  done
+}
+
+# Rows that are neither a complete ok row nor a failed/recovered row with audio.
+broken_rows() {
+  sqlite3 -separator '|' "$DATA/murmur.db" "SELECT id, status, coalesce(error,''), coalesce(audio_path,'') FROM transcripts WHERE NOT ((status = 'ok' AND text IS NOT NULL AND latency_ms IS NOT NULL AND audio_path IS NULL) OR (status IN ('failed','recovered') AND audio_path IS NOT NULL))" 2> /dev/null
+}
+
+no_panic() {
+  if grep -q -i 'panicked' "$LOG" 2> /dev/null; then
+    fail "the log contains a panic"
+    grep -i 'panicked' "$LOG" | head -3 | sed 's/^/    log: /'
+  else
+    pass "no panic in the log"
+  fi
+}
+
+app_alive() {
+  [ -n "$APP_PID" ] && kill -0 "$APP_PID" 2> /dev/null && pass "$1: the app is still running" || fail "$1: the app died"
+}
+
+# Asserts the newest row is a failed one with the given error and an existing audio file.
+assert_failed_row() { # <error> <label>
+  local row status error path
+  row="$(sqlite3 -separator '|' "$DATA/murmur.db" \
+    "SELECT status, coalesce(error,''), coalesce(audio_path,'') FROM transcripts ORDER BY created_at DESC, id DESC LIMIT 1")"
+  IFS='|' read -r status error path <<< "$row"
+  [ "$status" = "failed" ] && pass "$2: row status failed" || fail "$2: row status is '$status'"
+  [ "$error" = "$1" ] && pass "$2: error is $1" || fail "$2: error is '$error'"
+  [ -n "$path" ] && [ -f "$path" ] && pass "$2: audio file kept" || fail "$2: audio file missing ('$path')"
+}
+
+case_nomodel() {
+  say "== nomodel (VAD only, no recognition model)"
+  fresh_data
+  remove_recognition_models
+  set_sentinel
+  start_app ja "$FIXTURES/ja.wav" || return
+  local round
+  for round in 1 2; do
+    dictate_once ja || { stop_app; return; }
+    if wait_for_rows "$round" 30; then
+      pass "dictation $round: a row was written"
+      assert_failed_row model_missing "dictation $round"
+    else
+      fail "dictation $round: no row within 30 s"
+      failure_lines | sed 's/^/    log: /'
+      break
+    fi
+  done
+  [ "$(pbpaste)" = "$SENTINEL" ] && pass "clipboard unchanged" || fail "clipboard changed"
+  app_alive nomodel
+  no_panic
+  stop_app
+}
+
+case_corrupt() {
+  say "== corrupt (recognition model present, marker does not match)"
+  local variant
+  for variant in size sha; do
+    fresh_data
+    python3 - "$DATA/models/Haas-616M-ja-v1.0-Q8_0.gguf.verified" "$variant" <<'PY'
+import json, sys
+path, variant = sys.argv[1:3]
+marker = json.load(open(path))
+if variant == "size":
+    marker["size"] -= 1
+else:
+    marker["sha256"] = "0" * 64
+json.dump(marker, open(path, "w"))
+PY
+    start_app ja "$FIXTURES/ja.wav" || return
+    dictate_once ja || { stop_app; return; }
+    if wait_for_rows 1 30; then
+      assert_failed_row model_missing "marker with wrong $variant"
+    else
+      fail "marker with wrong $variant: no row within 30 s (the file was trusted?)"
+      failure_lines | sed 's/^/    log: /'
+    fi
+    no_panic
+    stop_app
+  done
+}
+
+case_mash() {
+  say "== mash (12 hotkeys within 1.5 s)"
+  fresh_data
+  start_app ja "$FIXTURES/ja.wav" || return
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    hotkey
+    sleep 0.125
+  done
+  sleep 10
+  app_alive mash
+  no_panic
+  local started saved
+  started="$(grep -c 'recording started' "$LOG")"
+  saved="$(grep -c 'session saved' "$LOG")"
+  note "recordings started: $started, sessions saved: $saved, rows: $(rows)"
+  local bad
+  bad="$(broken_rows)"
+  [ -z "$bad" ] && pass "every row is complete (ok with text, or failed/recovered with audio)" || { fail "incomplete rows:"; printf '%s\n' "$bad" | sed 's/^/    row: /'; }
+  # A recording may still be open (an odd number of toggles got through): it shows as an unreferenced spool file.
+  bad="$(spool_orphans)"
+  if [ -n "$bad" ]; then
+    note "a recording was still open after the mash; closing it with one more hotkey"
+    hotkey
+    sleep 8
+    bad="$(spool_orphans)"
+  else
+    note "no recording was open after the mash"
+  fi
+  [ -z "$bad" ] && pass "spool holds only files of failed/recovered rows" || { fail "orphan spool files:"; printf '%s\n' "$bad" | sed 's/^/    file: /'; }
+  # The app still answers a normal dictation (up to two attempts: the state after the mash is not known).
+  local before attempt ok=""
+  before="$(rows)"
+  set_sentinel
+  for attempt in 1 2; do
+    dictate_once ja || break
+    if wait_for_rows $((before + 1)) 25; then ok=1; break; fi
+    hotkey # it may have been a "stop" of a recording that was still open
+    sleep 3
+    before="$(rows)"
+  done
+  if [ -n "$ok" ]; then
+    pass "a normal dictation works afterwards (attempt $attempt)"
+    local clip
+    clip="$(pbpaste)"
+    if printf '%s' "$clip" | grep -q -e 公園 -e コーヒー; then pass "and its text is right"; else fail "wrong text afterwards: $clip"; fi
+  else
+    fail "no normal dictation possible after the mash"
+    failure_lines | sed 's/^/    log: /'
+  fi
+  stop_app
+}
+
+case_escmash() {
+  say "== esc-mash (6 Esc within 1 s)"
+  fresh_data
+  start_app ja "$FIXTURES/ja.wav" || return
+  begin_recording || { stop_app; return; }
+  local i
+  for i in 1 2 3 4 5 6; do
+    esc
+    sleep 0.17
+  done
+  sleep 6
+  app_alive esc-mash
+  no_panic
+  local n
+  n="$(rows)"
+  [ "$n" -le 1 ] && pass "at most one row ($n)" || fail "$n rows"
+  local bad
+  bad="$(broken_rows)"
+  [ -z "$bad" ] && pass "every row is complete" || { fail "incomplete rows:"; printf '%s\n' "$bad" | sed 's/^/    row: /'; }
+  # Quit and start again: whatever was still being recorded comes back through the spool recovery.
+  stop_app
+  start_app ja "$FIXTURES/ja.wav" || return
+  sleep 1
+  bad="$(spool_orphans)"
+  [ -z "$bad" ] && pass "after restart the spool holds only files of failed/recovered rows" || { fail "orphan spool files:"; printf '%s\n' "$bad" | sed 's/^/    file: /'; }
+  note "rows after restart: $(rows) (statuses: $(sqlite3 "$DATA/murmur.db" "SELECT group_concat(status) FROM transcripts"))"
+  stop_app
+}
+
+case_readonly() {
+  say "== readonly (the database cannot be written)"
+  fresh_data
+  # Create the database, then close the app so no WAL files remain.
+  start_app ja "$FIXTURES/ja.wav" || return
+  stop_app
+  chmod 444 "$DATA/murmur.db"
+  set_sentinel
+  start_app ja "$FIXTURES/ja.wav" || { chmod 644 "$DATA/murmur.db"; return; }
+  dictate_once ja || { chmod 644 "$DATA/murmur.db"; stop_app; return; }
+  if wait_for_log 'session saved' "$RESULT_TIMEOUT"; then
+    pass "session saved (delivery does not depend on the database)"
+  else
+    fail "no 'session saved'"
+    failure_lines | sed 's/^/    log: /'
+  fi
+  sleep 2
+  local clip
+  clip="$(pbpaste)"
+  if printf '%s' "$clip" | grep -q -e 公園 -e コーヒー; then pass "clipboard has the text"; else fail "clipboard: '$clip'"; fi
+  grep -E 'could not save|readonly|read-only' "$LOG" | head -2 | sed 's/^/    log: /'
+  [ "$(rows)" = "0" ] && pass "no row could be written" || fail "a row was written into a read-only database?"
+  local files
+  files="$(ls -A "$DATA/spool" | wc -l | tr -d ' ')"
+  [ "$files" = "1" ] && pass "the spool file was kept" || fail "spool has $files file(s)"
+  app_alive readonly
+  stop_app
+  chmod 644 "$DATA/murmur.db"
+  start_app ja "$FIXTURES/ja.wav" || return
+  wait_for_rows 1 10 && pass "after restart: one row" || fail "after restart: no row"
+  local row status path duration
+  IFS='|' read -r status duration path <<< "$(sqlite3 -separator '|' "$DATA/murmur.db" "SELECT status, duration_ms, coalesce(audio_path,'') FROM transcripts LIMIT 1")"
+  [ "$status" = "recovered" ] && pass "the audio came back as a recovered row" || fail "row status is '$status'"
+  [ -n "$path" ] && [ -f "$path" ] && pass "its audio file exists (${duration} ms)" || fail "audio missing"
+  stop_app
+}
+
+# Opt-in (slow, about 12 minutes): the recording stops by itself at 10 minutes.
+case_tenmin() {
+  say "== tenmin (10 min 30 s of audio; the recorder must stop at 10 min)"
+  fresh_data
+  local wav="$SCRATCH/ten-minutes.wav"
+  python3 - "$FIXTURES/ja.wav" "$wav" 630 <<'PY'
+import sys, wave
+src, dst, seconds = sys.argv[1], sys.argv[2], int(sys.argv[3])
+with wave.open(src) as w:
+    params, frames = w.getparams(), w.readframes(w.getnframes())
+out = wave.open(dst, "wb")
+out.setparams(params)
+need = seconds * params.framerate * params.sampwidth * params.nchannels
+buf = b""
+while len(buf) < need:
+    buf += frames
+out.writeframes(buf[:need])
+out.close()
+PY
+  start_app ja "$wav" || return
+  begin_recording || { stop_app; return; }
+  note "recording; waiting for the automatic stop at 10 min (no hotkey is sent)"
+  if wait_for_log 'session saved' 900; then
+    pass "session saved without a second hotkey"
+  else
+    fail "no 'session saved' within 900 s"
+    failure_lines | sed 's/^/    log: /'
+    stop_app
+    return
+  fi
+  wait_for_rows 1 20 && pass "one row" || fail "no row"
+  local status latency asr duration model
+  IFS='|' read -r status latency asr duration model <<< "$(last_row)"
+  [ "$status" = "ok" ] && pass "row status ok" || fail "row status is '$status'"
+  if [ -n "$duration" ] && [ "$duration" -ge 598000 ] && [ "$duration" -le 602000 ]; then
+    pass "duration about 600000 ms"
+  else
+    fail "duration is '$duration' ms"
+  fi
+  note "latency (stop -> clipboard): ${latency} ms, asr: ${asr} ms, audio: ${duration} ms, clipboard: ${#SENTINEL} (sentinel) -> $(pbpaste | wc -c | tr -d ' ') bytes"
+  stop_app
+}
+
 run_case() {
   case "$1" in
     ja) case_dictation "ja" ja ja 公園 コーヒー ;;
@@ -455,14 +734,20 @@ run_case() {
     crash) case_crash ;;
     long) case_long ;;
     mic) case_mic ;;
-    *) die "unknown case: $1 (ja en silence cancel undo crash long mic)" ;;
+    nomodel) case_nomodel ;;
+    corrupt) case_corrupt ;;
+    mash) case_mash ;;
+    esc-mash) case_escmash ;;
+    readonly) case_readonly ;;
+    tenmin) case_tenmin ;;
+    *) die "unknown case: $1 (ja en silence cancel undo crash long mic nomodel corrupt mash esc-mash readonly tenmin)" ;;
   esac
 }
 
 if [ "$#" -gt 0 ]; then
   CASES=("$@")
 else
-  CASES=(ja en silence cancel undo crash long)
+  CASES=(ja en silence cancel undo crash long nomodel corrupt mash esc-mash readonly)
 fi
 for c in "${CASES[@]}"; do
   run_case "$c"
