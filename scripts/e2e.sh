@@ -6,13 +6,14 @@
 # scratch data dir (MURMUR_DATA_DIR) with auto_paste off (nothing is typed anywhere; the result is only copied),
 # and checks the clipboard (pbpaste) and the history database (sqlite3).
 #
-# Cases: ja, en, silence (no row, clipboard untouched), Esc cancel, Esc undo.
+# Cases: ja, en, silence (no row, clipboard untouched), cancel (Esc), undo (Esc twice), crash (kill -9, spool
+# recovery at the next start), long (77 s Japanese file through the chunk path).
 # Several Murmur instances may run at once (a debug build with MURMUR_DATA_DIR skips single-instance); the script
 #        only ever signals the PID it started.
 # Needs: the speech models in $MURMUR_TEST_MODELS (default ~/.murmur-dev-models), macOS tools pbcopy/pbpaste,
 #        sqlite3, python3. The user's text clipboard is saved and restored (images and other types are lost).
 #
-# Usage: scripts/e2e.sh [case ...]     cases: ja en silence cancel undo   (default: all)
+# Usage: scripts/e2e.sh [case ...]     cases: ja en silence cancel undo crash long   (default: all)
 # Exit code: 0 all passed, 1 an assertion failed, 2 the environment is not ready.
 
 set -u -o pipefail
@@ -341,6 +342,43 @@ case_undo() {
   stop_app
 }
 
+case_crash() {
+  say "== crash (kill -9 while recording, recovery at the next start)"
+  local before wav="$FIXTURES/ja.wav"
+  before="$(rows)"
+  set_sentinel
+  start_app ja "$wav" || return
+  begin_recording || { stop_app; return; }
+  sleep 2
+  kill -9 "$APP_PID" 2> /dev/null
+  wait "$APP_PID" 2> /dev/null # reap it, so the shell does not print "Killed: 9"
+  APP_PID=""
+  [ -n "$(ls -A "$DATA/spool" 2> /dev/null)" ] && pass "spool file survived the crash" || fail "no spool file after the crash"
+  start_app ja "$wav" || return
+  wait_for_rows $((before + 1)) 10 && pass "one new history row after restart" || fail "no recovered row"
+  local row status duration path
+  row="$(sqlite3 -separator '|' "$DATA/murmur.db" \
+    "SELECT status, duration_ms, coalesce(audio_path,'') FROM transcripts ORDER BY created_at DESC, id DESC LIMIT 1")"
+  IFS='|' read -r status duration path <<< "$row"
+  [ "$status" = "recovered" ] && pass "row status recovered" || fail "row status is '$status'"
+  [ -n "$path" ] && [ -f "$path" ] && pass "audio_path exists" || fail "audio_path missing: '$path'"
+  if [ -n "$duration" ] && [ "$duration" -ge 1500 ] && [ "$duration" -le 2300 ]; then
+    pass "duration about 2 s"
+  else
+    fail "duration is '$duration' ms"
+  fi
+  note "recovered audio: ${duration} ms (flush interval loses at most 250 ms)"
+  stop_app
+}
+
+case_long() {
+  if [ ! -f "$FIXTURES/ja60.wav" ]; then
+    say "== long (skipped: no $FIXTURES/ja60.wav)"
+    return
+  fi
+  case_dictation "long (77 s Japanese)" ja ja60
+}
+
 run_case() {
   case "$1" in
     ja) case_dictation "ja" ja ja 公園 コーヒー ;;
@@ -348,14 +386,16 @@ run_case() {
     silence) case_silence ;;
     cancel) case_cancel ;;
     undo) case_undo ;;
-    *) die "unknown case: $1 (ja en silence cancel undo)" ;;
+    crash) case_crash ;;
+    long) case_long ;;
+    *) die "unknown case: $1 (ja en silence cancel undo crash long)" ;;
   esac
 }
 
 if [ "$#" -gt 0 ]; then
   CASES=("$@")
 else
-  CASES=(ja en silence cancel undo)
+  CASES=(ja en silence cancel undo crash long)
 fi
 for c in "${CASES[@]}"; do
   run_case "$c"

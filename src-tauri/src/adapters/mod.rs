@@ -8,4 +8,5 @@ pub mod hotkeys;
 pub mod models;
 pub mod output;
 pub mod settings_file;
+pub mod sounds;
 pub mod store;

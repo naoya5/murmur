@@ -29,6 +29,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::adapters::audio::{self, AudioConfig, AudioError, AudioEvent, CapturedAudio, Recorder};
 use crate::adapters::output::{self, DeliverOptions};
+use crate::adapters::sounds::{self, Cue};
 use crate::app::App;
 use crate::history::{self, Record};
 use crate::inference::{InferenceError, InferenceOutput, TranscribeRequest};
@@ -310,6 +311,7 @@ impl Controller {
     }
 
     fn execute(&mut self, effect: Effect) {
+        self.cue(&effect);
         match effect {
             Effect::StartCapture { session } => self.start_capture(session),
             Effect::PauseCapture { session } => self.set_paused(session, true),
@@ -342,6 +344,20 @@ impl Controller {
                     let _ = tx.send(Msg::Core(Event::TimerFired(id)));
                 });
             }
+        }
+    }
+
+    /// Start and stop sounds (S4), read from settings at the moment they play.
+    fn cue(&self, effect: &Effect) {
+        let cue = match effect {
+            Effect::StartCapture { .. } => Cue::Start,
+            Effect::Transcribe { .. } => Cue::Stop,
+            Effect::DropAudio { .. } => Cue::Cancel,
+            Effect::SaveFailure { .. } => Cue::Error,
+            _ => return,
+        };
+        if self.services.settings().sounds {
+            sounds::play(cue);
         }
     }
 
