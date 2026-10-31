@@ -8,7 +8,6 @@
 //! Register in `lib.rs`: `.plugin(tauri_plugin_updater::Builder::new().build())`.
 //! Register in `ipc.rs`: the event `updater::UpdateAvailable` in `collect_events!`, and commands
 //! that call `updater::check` and `updater::install`.
-#![allow(dead_code)] // Wired by the controller / ipc; remove then.
 
 use std::time::Duration;
 
@@ -93,7 +92,7 @@ pub fn schedule(app: AppHandle, enabled: impl Fn() -> bool + Send + Sync + 'stat
                         let _ = UpdateAvailable { info }.emit(&app);
                     }
                     Ok(None) => {}
-                    Err(error) => eprintln!("{error}"),
+                    Err(error) => tracing::info!(%error, "update check failed; retrying later"),
                 }
             }
             tokio::time::sleep(CHECK_INTERVAL).await;

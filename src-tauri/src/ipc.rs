@@ -29,6 +29,7 @@ use crate::controller::{AudioLevel, HistoryChanged, PillState};
 use crate::history::{self, RetryError};
 use crate::platform::macos::{self, Permission, PrivacyPane};
 use crate::settings_apply::{self, ApplyError, SettingsChanged};
+use crate::updater::{self, UpdateAvailable, UpdateError, UpdateInfo};
 
 /// Command names in the order of `collect_commands!`. `build.rs` and the capabilities must
 /// list the same names; a test below checks `build.rs` and the capability files.
@@ -60,6 +61,8 @@ pub const COMMANDS: &[&str] = &[
     "set_pill_width",
     "get_pill_state",
     "open_url",
+    "check_for_updates",
+    "install_update",
 ];
 
 /// Commands the pill window may call (its capability lists exactly these).
@@ -467,6 +470,20 @@ pub fn open_url(url: String) -> Result<(), IpcError> {
         .map_err(|_| IpcError::Url(url))
 }
 
+/// Checks the update endpoint now (Settings > About). `None` = up to date.
+#[tauri::command]
+#[specta::specta]
+pub async fn check_for_updates(app: AppHandle) -> Result<Option<UpdateInfo>, UpdateError> {
+    updater::check(&app).await
+}
+
+/// Downloads, verifies (minisign) and installs the update, then restarts the app.
+#[tauri::command]
+#[specta::specta]
+pub async fn install_update(app: AppHandle) -> Result<(), UpdateError> {
+    updater::install(&app).await
+}
+
 /// Tray or second launch asks the main window to show a view.
 #[derive(Debug, Clone, Serialize, Deserialize, Type, tauri_specta::Event)]
 pub struct Navigate {
@@ -503,6 +520,8 @@ pub fn builder() -> Builder<Wry> {
             set_pill_width,
             get_pill_state,
             open_url,
+            check_for_updates,
+            install_update,
         ])
         .events(collect_events![
             PillState,
@@ -511,7 +530,8 @@ pub fn builder() -> Builder<Wry> {
             SettingsChanged,
             ModelProgress,
             ModelsChanged,
-            Navigate
+            Navigate,
+            UpdateAvailable
         ])
 }
 

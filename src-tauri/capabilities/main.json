@@ -30,6 +30,8 @@
     "allow-resume-hotkeys",
     "allow-reset-stats",
     "allow-toggle-recording",
-    "allow-open-url"
+    "allow-open-url",
+    "allow-check-for-updates",
+    "allow-install-update"
   ]
 }

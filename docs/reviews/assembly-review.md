@@ -149,4 +149,4 @@ plugin, and start `updater::schedule(handle, || services.settings().auto_check_u
 | F4 | Fixed: retry has the same backstop timeout and cancels on expiry |
 | F5 | Fixed: an orphan recorder's spool file is deleted after it stops |
 | F6 | Accepted as low: registration of plain Esc has not failed in tests; logged |
-| F7 | Open until T7-1 (updater) is wired |
+| F7 | Fixed: updater plugin registered, `check_for_updates` / `install_update` commands, `UpdateAvailable` event, background schedule gated by `auto_check_updates` |

@@ -16,6 +16,7 @@ mod ipc;
 mod platform;
 mod settings_apply;
 mod tray;
+mod updater;
 mod windows;
 
 use std::sync::Arc;
@@ -60,6 +61,7 @@ pub fn run() {
             None,
         ))
         .plugin(tauri_nspanel::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
             builder.mount_events(app);
@@ -133,6 +135,10 @@ fn start(handle: &AppHandle) -> Result<Arc<App>, Box<dyn std::error::Error>> {
         windows::show_main(handle);
     }
     spawn_idle_unload(services.clone());
+    let update_services = services.clone();
+    updater::schedule(handle.clone(), move || {
+        update_services.settings().auto_check_updates
+    });
     #[cfg(debug_assertions)]
     {
         debug::install(controller);

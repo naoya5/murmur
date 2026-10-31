@@ -29,6 +29,8 @@ fn main() {
             "set_pill_width",
             "get_pill_state",
             "open_url",
+            "check_for_updates",
+            "install_update",
         ]));
     if let Err(error) = tauri_build::try_build(attributes) {
         eprintln!("tauri build failed: {error:#}");

@@ -160,6 +160,28 @@ async openUrl(url: string) : Promise<Result<null, IpcError>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Checks the update endpoint now (Settings > About). `None` = up to date.
+ */
+async checkForUpdates() : Promise<Result<UpdateInfo | null, UpdateError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("check_for_updates") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Downloads, verifies (minisign) and installs the update, then restarts the app.
+ */
+async installUpdate() : Promise<Result<null, UpdateError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("install_update") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -173,7 +195,8 @@ modelProgress: ModelProgress,
 modelsChanged: ModelsChanged,
 navigate: Navigate,
 pillState: PillState,
-settingsChanged: SettingsChanged
+settingsChanged: SettingsChanged,
+updateAvailable: UpdateAvailable
 }>({
 audioLevel: "audio-level",
 historyChanged: "history-changed",
@@ -181,7 +204,8 @@ modelProgress: "model-progress",
 modelsChanged: "models-changed",
 navigate: "navigate",
 pillState: "pill-state",
-settingsChanged: "settings-changed"
+settingsChanged: "settings-changed",
+updateAvailable: "update-available"
 })
 
 /** user-defined constants **/
@@ -464,6 +488,23 @@ export type Tier =
 export type TranscriptRow = { id: string; created_at_ms: number; status: TranscriptStatus; text: string | null; raw_text: string | null; language: Language | null; duration_ms: number; latin_words: number; cjk_chars: number; model_id: string | null; latency_ms: number | null; asr_ms: number | null; audio_path: string | null; error: string | null }
 export type TranscriptStatus = "ok" | "failed" | "recovered"
 export type UiLanguage = "system" | "en" | "ja"
+/**
+ * Emitted when a background check finds a newer version.
+ */
+export type UpdateAvailable = { info: UpdateInfo }
+export type UpdateError = { kind: "check"; message: string } | { kind: "install"; message: string }
+/**
+ * A newer version found on the update endpoint.
+ */
+export type UpdateInfo = { version: string; 
+/**
+ * Release notes, if the release has any.
+ */
+notes: string | null; 
+/**
+ * Publication date as an RFC 3339 string, if known.
+ */
+date: string | null }
 
 /** tauri-specta globals **/
 
