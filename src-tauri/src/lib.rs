@@ -1,6 +1,8 @@
 //! Murmur app shell: wires the pure core to Tauri.
 
+mod adapters;
 mod ipc;
+mod platform;
 
 use tauri::{AppHandle, Manager};
 
