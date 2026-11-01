@@ -248,7 +248,7 @@ fn on_tray(app: &AppHandle, services: &Arc<App>, action: TrayAction) {
         TrayAction::CheckUpdates => {
             windows::show_main(app);
             let _ = ipc::Navigate {
-                view: "settings".into(),
+                view: "settings#about".into(),
             }
             .emit(app);
         }

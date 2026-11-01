@@ -1,5 +1,5 @@
-// Hand-made SVG charts: heatmap (20 weeks), bars (14 days), sparkline. No chart library.
-import { useLayoutEffect, useRef, useState } from "react";
+// Hand-made SVG charts: heatmap (20 weeks) and trend line (14 days). No chart library.
+import { useId, useLayoutEffect, useRef, useState } from "react";
 import type { Locale } from "../i18n";
 import type { DayPoint } from "../ipc";
 import { formatMonth, formatShortDay, parseDay } from "../lib/format";
@@ -78,26 +78,23 @@ export function Heatmap({ days, locale, label }: HeatmapProps) {
   );
 }
 
-type BarsProps = {
-  days: DayPoint[];
-  locale: Locale;
-  label: string;
-  /** What each bar measures; sessions by default. */
-  measure?: (d: DayPoint) => number;
-};
+type Size = { width: number; height: number };
 
-/** The rendered width of an element, kept current by a ResizeObserver. */
-function useMeasuredWidth<T extends HTMLElement>(
-  fallback: number,
-): [React.RefObject<T | null>, number] {
+/** The rendered size of an element, kept current by a ResizeObserver. */
+function useMeasuredSize<T extends HTMLElement>(fallback: Size): [React.RefObject<T | null>, Size] {
   const ref = useRef<T>(null);
-  const [width, setWidth] = useState(fallback);
+  const [size, setSize] = useState(fallback);
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) {
       return;
     }
-    const update = () => setWidth(Math.max(1, Math.round(el.getBoundingClientRect().width)));
+    const update = () => {
+      const box = el.getBoundingClientRect();
+      const width = Math.max(1, Math.round(box.width));
+      const height = Math.max(1, Math.round(box.height));
+      setSize((old) => (old.width === width && old.height === height ? old : { width, height }));
+    };
     update();
     if (typeof ResizeObserver === "undefined") {
       return;
@@ -106,22 +103,63 @@ function useMeasuredWidth<T extends HTMLElement>(
     observer.observe(el);
     return () => observer.disconnect();
   }, []);
-  return [ref, width];
+  return [ref, size];
 }
 
-export function Bars({ days, locale, label, measure = (d) => d.sessions }: BarsProps) {
-  const [hostRef, width] = useMeasuredWidth<HTMLDivElement>(420);
-  const chartH = 72;
-  const labelH = 14;
-  const gap = 6;
-  const n = Math.max(1, days.length);
-  const barW = (width - gap * (n - 1)) / n;
+type TrendProps = {
+  days: DayPoint[];
+  locale: Locale;
+  label: string;
+  /** What each point measures; sessions by default. */
+  measure?: (d: DayPoint) => number;
+};
+
+/**
+ * A line of light over an amber haze. One point is lit: the hovered day, or today when the
+ * pointer is away, with a dashed cursor and a glass tip that shows its value.
+ */
+export function Trend({ days, locale, label, measure = (d) => d.sessions }: TrendProps) {
+  // The host's size comes from the layout (it grows with the hero on a tall window); the SVG
+  // is drawn to fill it.
+  const [hostRef, size] = useMeasuredSize<HTMLDivElement>({ width: 480, height: 128 });
+  const width = size.width;
+  const [hover, setHover] = useState<number | null>(null);
+  const hazeId = `${useId().replace(/:/g, "")}-haze`;
+  const glowId = `${hazeId}-glow`;
+
+  const labelH = 18;
+  const chartH = Math.max(64, size.height - labelH);
+  const padTop = 14;
+  const padX = 8;
+  const n = days.length;
+  if (n === 0) {
+    return null;
+  }
   const values = days.map(measure);
   const max = Math.max(1, ...values);
-  const lastIndex = days.length - 1;
+  const span = Math.max(1, width - padX * 2);
+  const xAt = (i: number) => (n === 1 ? width / 2 : padX + (i / (n - 1)) * span);
+  const yAt = (v: number) => padTop + (1 - v / max) * (chartH - padTop - 3);
+  const points = values.map((v, i) => `${xAt(i).toFixed(1)},${yAt(v).toFixed(1)}`).join(" ");
+  const area = `${xAt(0).toFixed(1)},${chartH} ${points} ${xAt(n - 1).toFixed(1)},${chartH}`;
+
+  const lastIndex = n - 1;
+  const active = hover ?? lastIndex;
+  const activeX = xAt(active);
+  const activeY = yAt(values[active] ?? 0);
+  const activeDay = days[active];
+  // The tip sits above the point, or below it when the point is near the top edge.
+  const tipBelow = activeY < 48;
+  const tipX = Math.min(Math.max(activeX, 34), width - 34);
+
+  const onPointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    const box = e.currentTarget.getBoundingClientRect();
+    const index = Math.round(((e.clientX - box.left - padX) / span) * (n - 1));
+    setHover(Math.min(lastIndex, Math.max(0, index)));
+  };
 
   return (
-    <div ref={hostRef} className="bars">
+    <div ref={hostRef} className="trend">
       <svg
         className="chart"
         viewBox={`0 0 ${width} ${chartH + labelH}`}
@@ -129,76 +167,62 @@ export function Bars({ days, locale, label, measure = (d) => d.sessions }: BarsP
         height={chartH + labelH}
         role="img"
         aria-label={label}
+        onPointerMove={onPointerMove}
+        onPointerLeave={() => setHover(null)}
       >
         <title>{label}</title>
-        <line x1={0} x2={width} y1={chartH + 0.5} y2={chartH + 0.5} className="bars__base" />
+        <defs>
+          <linearGradient id={hazeId} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" stopColor="#ff9d4d" stopOpacity="0.2" />
+            <stop offset="1" stopColor="#ff9d4d" stopOpacity="0" />
+          </linearGradient>
+          <filter id={glowId} x="-100%" y="-100%" width="300%" height="300%">
+            <feGaussianBlur stdDeviation="3.5" />
+          </filter>
+        </defs>
+        <line className="trend__grid" x1={0} x2={width} y1={chartH + 0.5} y2={chartH + 0.5} />
+        <polygon points={area} fill={`url(#${hazeId})`} />
+        <polyline className="trend__line" points={points} />
+        <line className="trend__cursor" x1={activeX} x2={activeX} y1={4} y2={chartH} />
+        <circle
+          className="trend__halo"
+          cx={activeX}
+          cy={activeY}
+          r={9}
+          filter={`url(#${glowId})`}
+        />
+        <circle className="trend__ring" cx={activeX} cy={activeY} r={7} />
+        <circle className="trend__point" cx={activeX} cy={activeY} r={3.5} />
         {days.map((d, i) => {
-          const v = values[i];
-          const h = v > 0 ? Math.max(3, (v / max) * (chartH - 4)) : 2;
-          const x = i * (barW + gap);
-          const cls =
-            v === 0
-              ? "bars__bar bars__bar--empty"
-              : i === lastIndex
-                ? "bars__bar bars__bar--today"
-                : "bars__bar";
-          const date = parseDay(d.date);
           const showLabel = i === 0 || i === lastIndex || i === Math.floor(lastIndex / 2);
+          if (!showLabel) {
+            return null;
+          }
           return (
-            <g key={d.date}>
-              <rect className={cls} x={x} y={chartH - h} width={barW} height={h} rx={3}>
-                <title>{`${formatShortDay(date, locale)}: ${v}`}</title>
-              </rect>
-              {showLabel && (
-                <text
-                  className="bars__label"
-                  x={x + barW / 2}
-                  y={chartH + labelH - 2}
-                  textAnchor={i === 0 ? "start" : i === lastIndex ? "end" : "middle"}
-                >
-                  {formatShortDay(date, locale)}
-                </text>
-              )}
-            </g>
+            <text
+              key={d.date}
+              className="trend__label"
+              x={xAt(i)}
+              y={chartH + labelH - 3}
+              textAnchor={i === 0 ? "start" : i === lastIndex ? "end" : "middle"}
+            >
+              {formatShortDay(parseDay(d.date), locale)}
+            </text>
           );
         })}
       </svg>
+      {activeDay && (
+        <div
+          className={`trend__tip${tipBelow ? " trend__tip--below" : ""}`}
+          style={{ left: tipX, top: activeY }}
+          aria-hidden="true"
+        >
+          <span className="trend__tip-value">{values[active]}</span>
+          <span className="trend__tip-date">
+            {formatShortDay(parseDay(activeDay.date), locale)}
+          </span>
+        </div>
+      )}
     </div>
-  );
-}
-
-type SparkProps = {
-  values: number[];
-  label: string;
-  height?: number;
-};
-
-export function Sparkline({ values, label, height = 22 }: SparkProps) {
-  const width = 100;
-  const n = values.length;
-  if (n < 2) {
-    return null;
-  }
-  const max = Math.max(1, ...values);
-  const pts = values.map((v, i) => {
-    const x = (i / (n - 1)) * width;
-    const y = height - 2 - (v / max) * (height - 4);
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  });
-  const line = pts.join(" ");
-  const area = `0,${height} ${line} ${width},${height}`;
-  return (
-    <svg
-      className="chart"
-      viewBox={`0 0 ${width} ${height}`}
-      preserveAspectRatio="none"
-      role="img"
-      aria-label={label}
-      style={{ height }}
-    >
-      <title>{label}</title>
-      <polygon className="spark__area" points={area} />
-      <polyline className="spark__line" points={line} vectorEffect="non-scaling-stroke" />
-    </svg>
   );
 }

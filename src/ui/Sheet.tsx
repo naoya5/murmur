@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
 import { useT } from "../i18n";
 import { Button } from "./Button";
 
@@ -44,7 +45,9 @@ export function ConfirmSheet({
     return null;
   }
 
-  return (
+  // Portalled to <body>: the view masks and animates its content, and either would make the
+  // view, not the window, the box that a fixed backdrop covers.
+  return createPortal(
     <div className="sheet-backdrop">
       <div className="sheet" role="alertdialog" aria-modal="true" aria-labelledby="sheet-title">
         <p className="sheet__title" id="sheet-title">
@@ -60,6 +63,7 @@ export function ConfirmSheet({
           </Button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

@@ -245,9 +245,7 @@ export function Models() {
           <Group title={t.models.forEnglish}>{renderRows(section("en"), "en")}</Group>
           {helpers.length > 0 && (
             <Group title={t.models.helper}>
-              <p className="row__hint" style={{ padding: "10px 16px 0" }}>
-                {t.models.helperHint}
-              </p>
+              <p className="row__hint model__hint">{t.models.helperHint}</p>
               {renderRows(helpers, null)}
             </Group>
           )}

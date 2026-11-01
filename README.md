@@ -6,7 +6,7 @@ Everything runs on your Mac. No account, no subscription, no limits, no audio or
 - Japanese with [Haas-ja-v1.0](https://huggingface.co/third-intelligence/Haas-ja-v1.0), English with
   [NVIDIA Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), both running on the Apple GPU
   through [speech.cpp](https://github.com/nyosegawa/speech.cpp).
-- A small frosted-glass pill shows that you are recording. It never takes focus from the app you type in.
+- A small glass pill shows that you are recording. It never takes focus from the app you type in.
 - Every result is kept in a local history. If anything fails after recording, the audio is kept and can be
   transcribed again. Press Esc to cancel (press Esc again within 3 seconds to undo).
 - A dashboard shows how much time you saved, your speaking rate, latency and streak.

@@ -20,6 +20,7 @@
         "minHeight": 480,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
+        "theme": "Dark",
         "transparent": true,
         "visible": false
       },
@@ -29,6 +30,7 @@
         "url": "pill.html",
         "width": 220,
         "height": 40,
+        "theme": "Dark",
         "transparent": true,
         "decorations": false,
         "alwaysOnTop": true,

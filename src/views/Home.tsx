@@ -5,7 +5,8 @@ import { useT } from "../i18n";
 import { commands, type Dashboard, useEvent } from "../ipc";
 import { durationParts, formatDuration, formatNumber } from "../lib/format";
 import { displayAccelerator } from "../lib/hotkey";
-import { Bars, Heatmap, Sparkline } from "../ui/Charts";
+import { Badge } from "../ui/Badge";
+import { Heatmap, Trend } from "../ui/Charts";
 import { EmptyState } from "../ui/EmptyState";
 import { Card } from "../ui/Glass";
 
@@ -96,7 +97,6 @@ export function Home() {
   const saved = durationParts(data.saved_ms, t);
   const rateJa = data.speaking_cpm_ja;
   const rateEn = data.speaking_wpm_en;
-  const sessionsByDay = data.last_14_days.map((d) => d.sessions);
 
   return (
     <>
@@ -105,91 +105,89 @@ export function Home() {
       </header>
 
       <Card className="hero" tight>
-        <span className="hero__label">{t.home.timeSaved}</span>
-        <span className="hero__value">
-          {saved.map((part) => (
-            <span
-              key={part.unit}
-              style={{ display: "inline-flex", alignItems: "baseline", gap: 4 }}
-            >
-              {part.value}
-              <span className="hero__unit">{part.unit}</span>
-            </span>
-          ))}
-        </span>
-        <span className="hero__sub">
-          {t.home.timeSavedSub(
-            formatDuration(data.total_speech_ms, t),
-            formatDuration(data.typing_ms, t),
-          )}
-        </span>
-      </Card>
-
-      <div className="stats">
-        <Stat label={t.home.sessions} value={formatNumber(data.total_sessions, t.locale)}>
-          <span className="caption muted">{t.home.today(data.today_sessions)}</span>
-          <div className="stat__spark">
-            <Sparkline values={sessionsByDay} label={t.home.last14} />
+        <div className="hero__summary">
+          <span className="hero__label">{t.home.timeSaved}</span>
+          <span className="hero__value">
+            {saved.map((part) => (
+              <span key={part.unit} className="hero__part">
+                <span className="hero__num">{part.value}</span>
+                <span className="hero__unit">{part.unit}</span>
+              </span>
+            ))}
+          </span>
+          <span className="hero__chips">
+            <Badge tone="accent">{t.home.today(data.today_sessions)}</Badge>
+          </span>
+          <span className="hero__sub">
+            {t.home.timeSavedSub(
+              formatDuration(data.total_speech_ms, t),
+              formatDuration(data.typing_ms, t),
+            )}
+          </span>
+        </div>
+        <div className="hero__chart">
+          <div className="chart-card__head">
+            <span className="chart-card__title">{t.home.last14}</span>
+            <span className="chart-card__meta">{t.home.perDay}</span>
           </div>
-        </Stat>
-        <Stat label={t.home.words} value={formatNumber(data.total_latin_words, t.locale)} />
-        <Stat label={t.home.characters} value={formatNumber(data.total_cjk_chars, t.locale)} />
-        <Stat
-          label={t.home.speakingRate}
-          value={
-            rateJa !== null
-              ? formatNumber(rateJa, t.locale)
-              : rateEn !== null
-                ? formatNumber(rateEn, t.locale)
-                : "-"
-          }
-          unit={rateJa !== null ? t.home.cpm : rateEn !== null ? t.home.wpm : undefined}
-        >
-          {rateJa !== null && rateEn !== null && (
-            <span className="caption muted tnum">
-              {formatNumber(rateEn, t.locale)} {t.home.wpm}
-            </span>
-          )}
-        </Stat>
-        <Stat
-          label={t.home.latency}
-          value={
-            data.median_latency_ms === null ? "-" : formatNumber(data.median_latency_ms, t.locale)
-          }
-          unit={data.median_latency_ms === null ? undefined : t.units.ms}
-        >
-          <span className="caption muted">{t.home.latencyHint}</span>
-        </Stat>
-        <Stat
-          label={t.home.streak}
-          value={formatNumber(data.streak_days, t.locale)}
-          unit={data.streak_days === 1 ? t.home.day : t.home.days}
-        />
+          <Trend
+            days={data.last_14_days}
+            locale={t.locale}
+            label={`${t.home.last14}, ${t.home.perDay}`}
+          />
+        </div>
+      </Card>
+
+      <div className="home__grid">
+        <div className="stats">
+          <Stat label={t.home.sessions} value={formatNumber(data.total_sessions, t.locale)} />
+          <Stat label={t.home.words} value={formatNumber(data.total_latin_words, t.locale)} />
+          <Stat label={t.home.characters} value={formatNumber(data.total_cjk_chars, t.locale)} />
+          <Stat
+            label={t.home.speakingRate}
+            value={
+              rateJa !== null
+                ? formatNumber(rateJa, t.locale)
+                : rateEn !== null
+                  ? formatNumber(rateEn, t.locale)
+                  : "-"
+            }
+            unit={rateJa !== null ? t.home.cpm : rateEn !== null ? t.home.wpm : undefined}
+          >
+            {rateJa !== null && rateEn !== null && (
+              <span className="caption muted tnum">
+                {formatNumber(rateEn, t.locale)} {t.home.wpm}
+              </span>
+            )}
+          </Stat>
+          <Stat
+            label={t.home.latency}
+            value={
+              data.median_latency_ms === null ? "-" : formatNumber(data.median_latency_ms, t.locale)
+            }
+            unit={data.median_latency_ms === null ? undefined : t.units.ms}
+          >
+            <span className="caption muted">{t.home.latencyHint}</span>
+          </Stat>
+          <Stat
+            label={t.home.streak}
+            value={formatNumber(data.streak_days, t.locale)}
+            unit={data.streak_days === 1 ? t.home.day : t.home.days}
+          />
+        </div>
+
+        <Card className="home__activity">
+          <div className="chart-card__head">
+            <span className="chart-card__title">{t.home.activity}</span>
+            <span className="chart-card__meta">{t.home.lastWeeks}</span>
+          </div>
+          <Heatmap
+            days={data.heatmap}
+            locale={t.locale}
+            label={`${t.home.activity}, ${t.home.lastWeeks}`}
+          />
+        </Card>
       </div>
-
-      <Card>
-        <div className="chart-card__head">
-          <span className="chart-card__title">{t.home.activity}</span>
-          <span className="chart-card__meta">{t.home.lastWeeks}</span>
-        </div>
-        <Heatmap
-          days={data.heatmap}
-          locale={t.locale}
-          label={`${t.home.activity}, ${t.home.lastWeeks}`}
-        />
-      </Card>
-
-      <Card>
-        <div className="chart-card__head">
-          <span className="chart-card__title">{t.home.last14}</span>
-          <span className="chart-card__meta">{t.home.perDay}</span>
-        </div>
-        <Bars
-          days={data.last_14_days}
-          locale={t.locale}
-          label={`${t.home.last14}, ${t.home.perDay}`}
-        />
-      </Card>
     </>
   );
 }

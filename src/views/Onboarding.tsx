@@ -112,239 +112,245 @@ export function Onboarding() {
 
   return (
     <div className="onboard">
-      <Steps current={step} />
-      <div className="onboard__body">
-        {step === 0 && (
-          <>
-            <div className="onboard__icon">
-              <Mic aria-hidden="true" />
-            </div>
-            <h1 className="onboard__title">{t.onboarding.welcome}</h1>
-            <p className="onboard__text">{t.onboarding.welcomeText}</p>
-            <p className="onboard__text">{t.onboarding.stepMicText}</p>
-            <div className="onboard__status" aria-live="polite">
-              {micGranted ? (
-                <span className="onboard__status onboard__status--ok">
-                  <Check aria-hidden="true" />
-                  {t.onboarding.micGranted}
-                </span>
-              ) : micDenied ? (
-                <span>{t.onboarding.micDenied}</span>
-              ) : null}
-            </div>
-            {!micGranted && !micDenied && (
-              <Button
-                variant="primary"
-                size="lg"
-                onClick={() =>
-                  commands
-                    .requestMicrophone()
-                    .then(refreshPermissions)
-                    .catch(() => undefined)
-                }
-              >
-                {t.onboarding.allowMic}
-              </Button>
-            )}
-            {micDenied && (
-              <Button size="lg" onClick={() => commands.openPrivacyPane("Microphone")}>
-                {t.settings.openSystemSettings}
-              </Button>
-            )}
-          </>
-        )}
+      <div className="onboard__panel">
+        <Steps current={step} />
+        <div className="onboard__body">
+          {step === 0 && (
+            <>
+              <div className="onboard__icon">
+                <Mic aria-hidden="true" />
+              </div>
+              <h1 className="onboard__title">{t.onboarding.welcome}</h1>
+              <p className="onboard__text">{t.onboarding.welcomeText}</p>
+              <p className="onboard__text">{t.onboarding.stepMicText}</p>
+              <div className="onboard__status" aria-live="polite">
+                {micGranted ? (
+                  <span className="onboard__status onboard__status--ok">
+                    <Check aria-hidden="true" />
+                    {t.onboarding.micGranted}
+                  </span>
+                ) : micDenied ? (
+                  <span>{t.onboarding.micDenied}</span>
+                ) : null}
+              </div>
+              {!micGranted && !micDenied && (
+                <Button
+                  variant="primary"
+                  size="lg"
+                  onClick={() =>
+                    commands
+                      .requestMicrophone()
+                      .then(refreshPermissions)
+                      .catch(() => undefined)
+                  }
+                >
+                  {t.onboarding.allowMic}
+                </Button>
+              )}
+              {micDenied && (
+                <Button size="lg" onClick={() => commands.openPrivacyPane("Microphone")}>
+                  {t.settings.openSystemSettings}
+                </Button>
+              )}
+            </>
+          )}
 
-        {step === 1 && (
-          <>
-            <div className="onboard__icon">
-              <MousePointerClick aria-hidden="true" />
-            </div>
-            <h1 className="onboard__title">{t.onboarding.stepAx}</h1>
-            <p className="onboard__text">{t.onboarding.stepAxText}</p>
-            <div className="onboard__status" aria-live="polite">
-              {permissions?.accessibility ? (
+          {step === 1 && (
+            <>
+              <div className="onboard__icon">
+                <MousePointerClick aria-hidden="true" />
+              </div>
+              <h1 className="onboard__title">{t.onboarding.stepAx}</h1>
+              <p className="onboard__text">{t.onboarding.stepAxText}</p>
+              <div className="onboard__status" aria-live="polite">
+                {permissions?.accessibility ? (
+                  <span className="onboard__status onboard__status--ok">
+                    <Check aria-hidden="true" />
+                    {t.onboarding.axGranted}
+                  </span>
+                ) : (
+                  <span>{t.onboarding.axPending}</span>
+                )}
+              </div>
+              {!permissions?.accessibility && (
+                <Button
+                  variant="primary"
+                  size="lg"
+                  onClick={() =>
+                    commands
+                      .requestAccessibility()
+                      .then(refreshPermissions)
+                      .catch(() => undefined)
+                  }
+                >
+                  {t.onboarding.allowAx}
+                </Button>
+              )}
+            </>
+          )}
+
+          {step === 2 && (
+            <>
+              <div className="onboard__icon">
+                <Download aria-hidden="true" />
+              </div>
+              <h1 className="onboard__title">{t.onboarding.stepModel}</h1>
+              <p className="onboard__text">
+                {t.onboarding.stepModelText(languageName(t, language))}
+              </p>
+              <div className="perm">
+                <span className="muted">{t.onboarding.chooseLanguage}</span>
+                <Segmented<Language>
+                  label={t.onboarding.chooseLanguage}
+                  value={language}
+                  disabled={anyDownloading}
+                  onChange={(lang) => update({ language: lang })}
+                  options={[
+                    { value: "ja", label: t.common.japanese },
+                    { value: "en", label: t.common.english },
+                  ]}
+                />
+              </div>
+              <Card className="onboard__card" tight>
+                {needed.map((m) => {
+                  const p = m.status.downloading;
+                  return (
+                    <div key={m.entry.id} className="row">
+                      <div className="row__body">
+                        <span className="row__label">{m.entry.display_name}</span>
+                        <span className="row__hint tnum">
+                          {formatBytes(m.entry.bytes, t.locale)}
+                          {p
+                            ? `, ${formatPercent(p.received / Math.max(1, p.total), t.locale)}`
+                            : ""}
+                        </span>
+                        {p && (
+                          <div style={{ marginTop: 6 }}>
+                            <ProgressBar
+                              value={p.total > 0 ? p.received / p.total : undefined}
+                              label={m.entry.display_name}
+                            />
+                          </div>
+                        )}
+                        {m.status.error && (
+                          <span className="row__error" role="alert">
+                            {downloadErrorText(m.status.error, t)}
+                          </span>
+                        )}
+                      </div>
+                      <div className="row__control">
+                        {m.status.installed && (
+                          <span className="onboard__status onboard__status--ok">
+                            <Check aria-hidden="true" />
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </Card>
+              {downloadError && (
+                <p className="row__error" role="alert">
+                  {downloadErrorText(downloadError, t)}
+                </p>
+              )}
+              {allInstalled ? (
                 <span className="onboard__status onboard__status--ok">
                   <Check aria-hidden="true" />
-                  {t.onboarding.axGranted}
+                  {t.onboarding.modelReady}
                 </span>
               ) : (
-                <span>{t.onboarding.axPending}</span>
+                <Button variant="primary" size="lg" disabled={anyDownloading} onClick={downloadAll}>
+                  {anyDownloading ? t.models.downloading : t.onboarding.downloadAll}
+                </Button>
               )}
-            </div>
-            {!permissions?.accessibility && (
+            </>
+          )}
+
+          {step === 3 && (
+            <>
+              <div className="onboard__icon">
+                <Keyboard aria-hidden="true" />
+              </div>
+              <h1 className="onboard__title">{t.onboarding.stepTest}</h1>
+              <p className="onboard__text">{t.onboarding.stepTestText(hotkey)}</p>
+              {!permissions?.accessibility && (
+                <p className="onboard__text small">{t.onboarding.testCopyOnly}</p>
+              )}
+              <div className="onboard__card">
+                <TextArea
+                  label={t.onboarding.stepTest}
+                  placeholder={t.onboarding.testPlaceholder}
+                  value={testText}
+                  autoFocus
+                  onChange={(e) => {
+                    setTestText(e.target.value);
+                    if (e.target.value.trim().length > 0) {
+                      setTested(true);
+                    }
+                  }}
+                />
+              </div>
+              <div className="perm">
+                <Kbd tokens={hotkey.split(" ")} />
+                <Button
+                  size="sm"
+                  variant="quiet"
+                  onClick={() => commands.toggleRecording().catch(() => undefined)}
+                >
+                  {t.onboarding.startWithButton}
+                </Button>
+              </div>
+              <div className="onboard__status" aria-live="polite">
+                {tested && (
+                  <span className="onboard__status onboard__status--ok">
+                    <Check aria-hidden="true" />
+                    {t.onboarding.testSuccess}
+                  </span>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+
+        <div className="onboard__footer">
+          <span>
+            {step > 0 && (
+              <Button variant="quiet" onClick={back}>
+                {t.common.back}
+              </Button>
+            )}
+          </span>
+          <span className="onboard__footer-end">
+            {step === 1 && !permissions?.accessibility && (
+              <Button variant="quiet" onClick={next}>
+                {t.common.skip}
+              </Button>
+            )}
+            {step === 2 && !allInstalled && (
+              <Button variant="quiet" onClick={next}>
+                {t.common.skip}
+              </Button>
+            )}
+            {step < STEPS - 1 ? (
               <Button
                 variant="primary"
-                size="lg"
-                onClick={() =>
-                  commands
-                    .requestAccessibility()
-                    .then(refreshPermissions)
-                    .catch(() => undefined)
+                onClick={next}
+                disabled={
+                  (step === 0 && !micGranted) ||
+                  (step === 1 && !permissions?.accessibility) ||
+                  (step === 2 && !allInstalled)
                 }
               >
-                {t.onboarding.allowAx}
+                {t.common.next}
               </Button>
-            )}
-          </>
-        )}
-
-        {step === 2 && (
-          <>
-            <div className="onboard__icon">
-              <Download aria-hidden="true" />
-            </div>
-            <h1 className="onboard__title">{t.onboarding.stepModel}</h1>
-            <p className="onboard__text">{t.onboarding.stepModelText(languageName(t, language))}</p>
-            <div className="perm">
-              <span className="muted">{t.onboarding.chooseLanguage}</span>
-              <Segmented<Language>
-                label={t.onboarding.chooseLanguage}
-                value={language}
-                disabled={anyDownloading}
-                onChange={(lang) => update({ language: lang })}
-                options={[
-                  { value: "ja", label: t.common.japanese },
-                  { value: "en", label: t.common.english },
-                ]}
-              />
-            </div>
-            <Card className="onboard__card" tight>
-              {needed.map((m) => {
-                const p = m.status.downloading;
-                return (
-                  <div key={m.entry.id} className="row">
-                    <div className="row__body">
-                      <span className="row__label">{m.entry.display_name}</span>
-                      <span className="row__hint tnum">
-                        {formatBytes(m.entry.bytes, t.locale)}
-                        {p ? `, ${formatPercent(p.received / Math.max(1, p.total), t.locale)}` : ""}
-                      </span>
-                      {p && (
-                        <div style={{ marginTop: 6 }}>
-                          <ProgressBar
-                            value={p.total > 0 ? p.received / p.total : undefined}
-                            label={m.entry.display_name}
-                          />
-                        </div>
-                      )}
-                      {m.status.error && (
-                        <span className="row__error" role="alert">
-                          {downloadErrorText(m.status.error, t)}
-                        </span>
-                      )}
-                    </div>
-                    <div className="row__control">
-                      {m.status.installed && (
-                        <span className="onboard__status onboard__status--ok">
-                          <Check aria-hidden="true" />
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-            </Card>
-            {downloadError && (
-              <p className="row__error" role="alert">
-                {downloadErrorText(downloadError, t)}
-              </p>
-            )}
-            {allInstalled ? (
-              <span className="onboard__status onboard__status--ok">
-                <Check aria-hidden="true" />
-                {t.onboarding.modelReady}
-              </span>
             ) : (
-              <Button variant="primary" size="lg" disabled={anyDownloading} onClick={downloadAll}>
-                {anyDownloading ? t.models.downloading : t.onboarding.downloadAll}
+              <Button variant="primary" onClick={finish}>
+                {t.onboarding.finish}
               </Button>
             )}
-          </>
-        )}
-
-        {step === 3 && (
-          <>
-            <div className="onboard__icon">
-              <Keyboard aria-hidden="true" />
-            </div>
-            <h1 className="onboard__title">{t.onboarding.stepTest}</h1>
-            <p className="onboard__text">{t.onboarding.stepTestText(hotkey)}</p>
-            {!permissions?.accessibility && (
-              <p className="onboard__text small">{t.onboarding.testCopyOnly}</p>
-            )}
-            <div className="onboard__card">
-              <TextArea
-                label={t.onboarding.stepTest}
-                placeholder={t.onboarding.testPlaceholder}
-                value={testText}
-                autoFocus
-                onChange={(e) => {
-                  setTestText(e.target.value);
-                  if (e.target.value.trim().length > 0) {
-                    setTested(true);
-                  }
-                }}
-              />
-            </div>
-            <div className="perm">
-              <Kbd tokens={hotkey.split(" ")} />
-              <Button
-                size="sm"
-                variant="quiet"
-                onClick={() => commands.toggleRecording().catch(() => undefined)}
-              >
-                {t.onboarding.startWithButton}
-              </Button>
-            </div>
-            <div className="onboard__status" aria-live="polite">
-              {tested && (
-                <span className="onboard__status onboard__status--ok">
-                  <Check aria-hidden="true" />
-                  {t.onboarding.testSuccess}
-                </span>
-              )}
-            </div>
-          </>
-        )}
-      </div>
-
-      <div className="onboard__footer">
-        <span>
-          {step > 0 && (
-            <Button variant="quiet" onClick={back}>
-              {t.common.back}
-            </Button>
-          )}
-        </span>
-        <span style={{ display: "flex", gap: 8 }}>
-          {step === 1 && !permissions?.accessibility && (
-            <Button variant="quiet" onClick={next}>
-              {t.common.skip}
-            </Button>
-          )}
-          {step === 2 && !allInstalled && (
-            <Button variant="quiet" onClick={next}>
-              {t.common.skip}
-            </Button>
-          )}
-          {step < STEPS - 1 ? (
-            <Button
-              variant="primary"
-              onClick={next}
-              disabled={
-                (step === 0 && !micGranted) ||
-                (step === 1 && !permissions?.accessibility) ||
-                (step === 2 && !allInstalled)
-              }
-            >
-              {t.common.next}
-            </Button>
-          ) : (
-            <Button variant="primary" onClick={finish}>
-              {t.onboarding.finish}
-            </Button>
-          )}
-        </span>
+          </span>
+        </div>
       </div>
     </div>
   );

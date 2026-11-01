@@ -1,11 +1,11 @@
-//! Windows: the recording pill (a non-activating NSPanel with frosted glass) and the main window.
+//! Windows: the recording pill (a non-activating NSPanel with Liquid Glass) and the main window.
 //!
 //! The pill must never take focus from the app the user is typing in: it is ordered front with
 //! `orderFrontRegardless` and never made key. AppKit calls run on the main thread (`run_on_main_thread`).
 //! The app is an `Accessory` (no Dock icon, no Cmd+Tab entry) except while the main window is open.
 #![allow(dead_code)] // Wired by T2-8 (controller).
 
-use tauri::window::{Effect, EffectState, EffectsBuilder};
+use tauri::window::{Color, Effect, EffectState, EffectsBuilder};
 use tauri::{ActivationPolicy, AppHandle, Manager, WindowEvent};
 use tauri_nspanel::objc2_app_kit::{NSEvent, NSScreen, NSWindowStyleMask};
 use tauri_nspanel::objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize};
@@ -64,12 +64,17 @@ fn setup_pill(app: &AppHandle) -> Result<(), WindowError> {
     let window = app
         .get_webview_window(PILL_LABEL)
         .ok_or(WindowError::Missing(PILL_LABEL))?;
-    // Frosted glass that stays frosted while another app is in front. The web content stays transparent.
+    // The same Clear Liquid Glass as the main window (macOS 26), cut to the capsule. The pill floats
+    // over whatever app the user types in, often a white page, so its warm dark tint is denser than
+    // the main window's; the capsule's CSS fill completes it. macOS 14 and 15 fall back to the
+    // frosted HUD material, kept active so it stays frosted while another app is in front.
     window.set_effects(
         EffectsBuilder::new()
+            .effect(Effect::LiquidGlassClear)
             .effect(Effect::HudWindow)
             .state(EffectState::Active)
             .radius(PILL_HEIGHT / 2.0)
+            .color(Color(20, 14, 10, 96))
             .build(),
     )?;
     let panel = window.to_panel::<PillPanel>()?;
@@ -98,10 +103,15 @@ fn setup_main(app: &AppHandle) -> Result<(), WindowError> {
     let window = app
         .get_webview_window(MAIN_LABEL)
         .ok_or(WindowError::Missing(MAIN_LABEL))?;
+    // Clear Liquid Glass from macOS 26 (the most see-through style), with a light warm dark
+    // tint that the page's thin scene tint completes; macOS 14 and 15 fall back to the frosted
+    // sidebar material, kept active so it does not turn gray while another app is in front.
     window.set_effects(
         EffectsBuilder::new()
+            .effect(Effect::LiquidGlassClear)
             .effect(Effect::Sidebar)
             .state(EffectState::Active)
+            .color(Color(20, 14, 10, 72))
             .build(),
     )?;
     // The red button and Cmd+W hide the window; the app keeps running in the menu bar.

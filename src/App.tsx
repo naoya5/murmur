@@ -80,21 +80,11 @@ function Shell() {
   const nav = useMemo(
     () => ({
       view,
+      target,
       navigate: (next: View, anchor?: string) => setTarget({ view: next, anchor: anchor ?? null }),
     }),
-    [view],
+    [view, target],
   );
-
-  // A target with an anchor scrolls that element into view once the view has rendered.
-  useEffect(() => {
-    if (!target.anchor) {
-      return;
-    }
-    const id = window.requestAnimationFrame(() => {
-      document.getElementById(target.anchor ?? "")?.scrollIntoView({ block: "start" });
-    });
-    return () => window.cancelAnimationFrame(id);
-  }, [target]);
 
   if (!settings) {
     return <div className="titlebar" data-tauri-drag-region />;
@@ -115,6 +105,7 @@ function Shell() {
         <div className="titlebar" data-tauri-drag-region />
         <Sidebar />
         <main className="content">
+          <div className="content__rim" aria-hidden="true" />
           <div className="content__drag" data-tauri-drag-region />
           <UpdateBanner />
           <div className="view" key={view}>

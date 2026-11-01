@@ -278,7 +278,7 @@ export function History() {
           </Card>
           <div className="pager">
             <span>{t.history.pageOf(range.from, range.to, total)}</span>
-            <span style={{ display: "flex", gap: 4 }}>
+            <span className="pager__buttons">
               <Button
                 size="sm"
                 icon={<ChevronLeft aria-hidden="true" />}
