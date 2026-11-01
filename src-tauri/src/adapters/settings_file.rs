@@ -117,6 +117,16 @@ fn reset_key(settings: &mut Settings, key: SettingKey) {
         SettingKey::Models => settings.models = defaults.models,
         // Keep the good entries, drop only the broken ones.
         SettingKey::Dictionary => settings.dictionary.retain(|e| !e.written.trim().is_empty()),
+        SettingKey::AnnotationsRetentionDays => {
+            settings.annotations_retention_days = defaults.annotations_retention_days
+        }
+        // A clash with the dictation hotkeys is reported under this key. The default could clash
+        // too, so the feature is switched off as well; otherwise the loop below would give up and
+        // reset every setting.
+        SettingKey::AnnotationsHotkey => {
+            settings.annotations_hotkey = defaults.annotations_hotkey;
+            settings.annotations_enabled = false;
+        }
         // `validate` reports no other key today; if it starts to, fall back to all defaults.
         _ => *settings = defaults,
     }

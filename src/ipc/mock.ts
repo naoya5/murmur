@@ -74,6 +74,9 @@ let settings: Settings = {
   unload_model_after_min: null,
   alternate_language_hotkey: null,
   onboarding_completed: !params.has("onboarding"),
+  annotations_enabled: false,
+  annotations_hotkey: "Option+Shift+KeyS",
+  annotations_retention_days: 7,
 };
 
 const JA_TEXTS = [

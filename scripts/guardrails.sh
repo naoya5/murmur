@@ -20,6 +20,7 @@ REQUIRED_SOT_IDS=(
   ipc
   ui-strings
   design-tokens
+  annotations
 )
 
 # G2: the only file that may use the speech SDK crate.

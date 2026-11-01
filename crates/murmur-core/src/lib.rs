@@ -5,9 +5,11 @@
 //! `cargo tree -p murmur-core` for `tauri`.
 //!
 //! Reading order: `session` (the state machine) -> `pipeline` (how audio becomes text)
-//! -> `text` (formatting) -> `metrics` -> `settings` -> `catalog` -> `ports`.
+//! -> `text` (formatting) -> `metrics` -> `settings` -> `catalog` -> `ports`
+//! -> `annotations` (the experimental screen annotations: keyframes, marks, summary).
 //! Run `rg "SOT:"` to list every source of truth in the repository.
 
+pub mod annotations;
 pub mod catalog;
 pub mod metrics;
 pub mod pipeline;

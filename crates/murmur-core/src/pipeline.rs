@@ -7,7 +7,9 @@
 //! Where: the engine adapter calls `plan` after `VoiceDetector::regions` and transcribes each
 //!        range. While recording (S1), `IncrementalPlan` yields the same chunks one at a time from
 //!        the regions a streaming detector gives, so that only the tail is left at stop.
-//!        Tests at the end of this file.
+//!        Annotation sessions call `segment_at_boundaries` instead: the same regions, also cut
+//!        where a keyframe starts, so that each segment's words belong to one picture
+//!        (`annotations.rs` assigns them). Tests at the end of this file.
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -229,6 +231,226 @@ fn ends_cjk(s: &str) -> bool {
 
 fn starts_cjk(s: &str) -> bool {
     s.chars().next().is_some_and(is_cjk)
+}
+
+// --- annotation segments ---
+
+/// How far on each side of a keyframe boundary the quietest cut point is looked for (400 ms).
+pub const BOUNDARY_SEARCH_SAMPLES: usize = SAMPLE_RATE_HZ as usize * 2 / 5;
+/// Length of the quiet window whose centre becomes the cut point (20 ms).
+pub const QUIET_WINDOW_SAMPLES: usize = SAMPLE_RATE_HZ as usize / 50;
+/// Hop between two quiet windows tried (5 ms).
+const QUIET_HOP_SAMPLES: usize = QUIET_WINDOW_SAMPLES / 4;
+/// A segment shorter than this (1 s of speech) joins a neighbour.
+pub const MIN_SEGMENT_SAMPLES: usize = SAMPLE_RATE_HZ as usize;
+
+/// One piece of an annotation recording to transcribe on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Segment {
+    /// What to give the engine: the speech plus context padding at the edges that VAD found.
+    /// An edge cut inside speech (at a keyframe boundary) gets no padding, so that no word is
+    /// heard twice.
+    pub audio: Range<usize>,
+    /// The speech itself, without padding. Its start decides which keyframe gets the words.
+    pub speech: Range<usize>,
+}
+
+/// A speech range plus whether each edge came from a cut inside speech rather than from VAD.
+#[derive(Debug, Clone)]
+struct Piece {
+    range: Range<usize>,
+    cut_start: bool,
+    cut_end: bool,
+    /// Number of boundaries at or before the start; pieces in different slots never pack together.
+    slot: usize,
+}
+
+/// Cuts the recording of an annotation session into segments.
+///
+/// - The speech regions from VAD are the base, cleaned as in `plan`. No region: no segments.
+/// - A region that crosses a keyframe `boundary` (sample position) is cut at the centre of the
+///   quietest `QUIET_WINDOW_SAMPLES` within `BOUNDARY_SEARCH_SAMPLES` of the boundary, inside
+///   the region. `pcm` supplies the loudness; when it is too short the cut lands on the boundary.
+/// - Consecutive pieces between two boundaries pack greedily into segments of at most
+///   `MAX_CHUNK_SAMPLES`, as `plan` does; a single piece over the limit is split in equal parts.
+/// - A segment with less than `MIN_SEGMENT_SAMPLES` of speech joins the previous segment, or the
+///   next one when there is no previous or the previous is full, even across a boundary.
+/// - VAD edges are padded by `CHUNK_PAD_SAMPLES` and clamped to the buffer; cut edges are not.
+pub fn segment_at_boundaries(
+    total_samples: usize,
+    regions: &[SpeechRegion],
+    boundaries: &[usize],
+    pcm: &[f32],
+) -> Vec<Segment> {
+    let regions: Vec<SpeechRegion> = regions
+        .iter()
+        .copied()
+        .filter(|r| r.end > r.start && r.start < total_samples)
+        .map(|r| SpeechRegion {
+            start: r.start,
+            end: r.end.min(total_samples),
+        })
+        .collect();
+    if regions.is_empty() {
+        return Vec::new();
+    }
+    let mut boundaries: Vec<usize> = boundaries
+        .iter()
+        .copied()
+        .filter(|b| *b > 0 && *b < total_samples)
+        .collect();
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let limit = MAX_CHUNK_SAMPLES - 2 * CHUNK_PAD_SAMPLES;
+    let mut pieces: Vec<Piece> = Vec::new();
+    for region in regions {
+        let mut at = region.start;
+        let mut cut_start = false;
+        for &b in boundaries
+            .iter()
+            .filter(|b| region.start < **b && **b < region.end)
+        {
+            let cut = quietest_cut(pcm, b, at, region.end);
+            if cut <= at || cut >= region.end {
+                continue;
+            }
+            push_piece(&mut pieces, at..cut, cut_start, true, &boundaries, limit);
+            at = cut;
+            cut_start = true;
+        }
+        push_piece(
+            &mut pieces,
+            at..region.end,
+            cut_start,
+            false,
+            &boundaries,
+            limit,
+        );
+    }
+
+    // Pack pieces of one slot greedily, as `plan` packs regions.
+    let mut packed: Vec<Piece> = Vec::new();
+    for piece in pieces {
+        match packed.last_mut() {
+            Some(open)
+                if open.slot == piece.slot && piece.range.end - open.range.start <= limit =>
+            {
+                open.range.end = piece.range.end;
+                open.cut_end = piece.cut_end;
+            }
+            _ => packed.push(piece),
+        }
+    }
+
+    // Short segments join a neighbour (the previous when there is one).
+    let mut merged: Vec<Piece> = Vec::new();
+    let mut i = 0;
+    while i < packed.len() {
+        let piece = packed[i].clone();
+        let short = piece.range.end - piece.range.start < MIN_SEGMENT_SAMPLES;
+        if short {
+            if let Some(prev) = merged.last_mut()
+                && piece.range.end - prev.range.start <= limit
+            {
+                prev.range.end = piece.range.end;
+                prev.cut_end = piece.cut_end;
+                i += 1;
+                continue;
+            }
+            if let Some(next) = packed.get(i + 1)
+                && next.range.end - piece.range.start <= limit
+            {
+                merged.push(Piece {
+                    range: piece.range.start..next.range.end,
+                    cut_start: piece.cut_start,
+                    cut_end: next.cut_end,
+                    slot: piece.slot,
+                });
+                i += 2;
+                continue;
+            }
+        }
+        merged.push(piece);
+        i += 1;
+    }
+
+    merged
+        .into_iter()
+        .map(|p| {
+            let start = if p.cut_start {
+                p.range.start
+            } else {
+                p.range.start.saturating_sub(CHUNK_PAD_SAMPLES)
+            };
+            let end = if p.cut_end {
+                p.range.end
+            } else {
+                (p.range.end + CHUNK_PAD_SAMPLES).min(total_samples)
+            };
+            Segment {
+                audio: start..end,
+                speech: p.range,
+            }
+        })
+        .collect()
+}
+
+fn push_piece(
+    pieces: &mut Vec<Piece>,
+    range: Range<usize>,
+    cut_start: bool,
+    cut_end: bool,
+    boundaries: &[usize],
+    limit: usize,
+) {
+    if range.end <= range.start {
+        return;
+    }
+    let slot = boundaries.iter().filter(|b| **b <= range.start).count();
+    let parts = split_long(SpeechRegion {
+        start: range.start,
+        end: range.end,
+    });
+    let last = parts.len().saturating_sub(1);
+    for (i, part) in parts.into_iter().enumerate() {
+        debug_assert!(part.end - part.start <= limit);
+        pieces.push(Piece {
+            range: part,
+            cut_start: if i == 0 { cut_start } else { true },
+            cut_end: if i == last { cut_end } else { true },
+            slot,
+        });
+    }
+}
+
+/// The centre of the quietest window near `boundary`, kept inside `(lo, hi)`. Falls back to the
+/// boundary itself when the audio is too short to judge.
+fn quietest_cut(pcm: &[f32], boundary: usize, lo: usize, hi: usize) -> usize {
+    let search_start = boundary.saturating_sub(BOUNDARY_SEARCH_SAMPLES).max(lo);
+    let search_end = (boundary + BOUNDARY_SEARCH_SAMPLES).min(hi).min(pcm.len());
+    if search_end <= search_start || search_end - search_start < QUIET_WINDOW_SAMPLES {
+        return boundary.clamp(lo, hi);
+    }
+    let mut best_start = search_start;
+    let mut best_energy = f32::INFINITY;
+    let mut start = search_start;
+    while start + QUIET_WINDOW_SAMPLES <= search_end {
+        let energy = window_energy(pcm, start..start + QUIET_WINDOW_SAMPLES);
+        if energy < best_energy {
+            best_energy = energy;
+            best_start = start;
+        }
+        start += QUIET_HOP_SAMPLES;
+    }
+    (best_start + QUIET_WINDOW_SAMPLES / 2).clamp(lo, hi)
+}
+
+/// Sum of squares over `range` (out-of-range samples count as silence).
+pub fn window_energy(pcm: &[f32], range: Range<usize>) -> f32 {
+    pcm.get(range)
+        .map(|w| w.iter().map(|s| s * s).sum())
+        .unwrap_or(0.0)
 }
 
 #[cfg(test)]
@@ -596,5 +818,267 @@ mod tests {
         let regions = [region(0.0, 20.0), region(25.0, 45.0), region(50.0, 70.3)];
         assert_eq!(stream(total, &regions, 1), plan(total, &regions));
         assert_eq!(stream(total, &regions, 0), plan(total, &regions));
+    }
+
+    // --- segment_at_boundaries ---
+
+    /// A loud tone with a 20 ms quiet dip at `dip_start` samples.
+    fn pcm_with_dip(total: usize, dip_start: usize) -> Vec<f32> {
+        (0..total)
+            .map(|i| {
+                if (dip_start..dip_start + QUIET_WINDOW_SAMPLES).contains(&i) {
+                    0.001
+                } else {
+                    0.5
+                }
+            })
+            .collect()
+    }
+
+    fn speech_of(segments: &[Segment]) -> Vec<Range<usize>> {
+        segments.iter().map(|s| s.speech.clone()).collect()
+    }
+
+    /// Segments are ordered, non-empty, under the model limit, and inside the buffer; the audio
+    /// contains the speech.
+    fn check_segments(segments: &[Segment], total: usize) {
+        for s in segments {
+            assert!(s.speech.start < s.speech.end, "{s:?}");
+            assert!(
+                s.audio.start <= s.speech.start && s.speech.end <= s.audio.end,
+                "{s:?}"
+            );
+            assert!(s.audio.end <= total, "{s:?} exceeds {total}");
+            assert!(
+                s.audio.end - s.audio.start <= MAX_CHUNK_SAMPLES,
+                "{s:?} over the limit"
+            );
+        }
+        for pair in segments.windows(2) {
+            assert!(
+                pair[0].speech.end <= pair[1].speech.start,
+                "{pair:?} overlap"
+            );
+        }
+    }
+
+    #[test]
+    fn segment_constants() {
+        assert_eq!(BOUNDARY_SEARCH_SAMPLES, 6_400);
+        assert_eq!(QUIET_WINDOW_SAMPLES, 320);
+        assert_eq!(MIN_SEGMENT_SAMPLES, 16_000);
+    }
+
+    #[test]
+    fn segments_without_regions_are_empty() {
+        assert!(segment_at_boundaries(secs(10.0), &[], &[secs(5.0)], &[]).is_empty());
+        let bad = [SpeechRegion { start: 20, end: 10 }, region(11.0, 12.0)];
+        assert!(segment_at_boundaries(secs(10.0), &bad, &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn segments_without_boundaries_pack_the_regions_padded() {
+        let total = secs(20.0);
+        let regions = [region(1.0, 4.0), region(6.0, 9.0)];
+        let got = segment_at_boundaries(total, &regions, &[], &[]);
+        check_segments(&got, total);
+        assert_eq!(
+            got,
+            vec![Segment {
+                audio: secs(1.0) - CHUNK_PAD_SAMPLES..secs(9.0) + CHUNK_PAD_SAMPLES,
+                speech: secs(1.0)..secs(9.0),
+            }]
+        );
+        // Padding is clamped to the buffer.
+        let got = segment_at_boundaries(secs(5.0), &[region(0.0, 5.5)], &[], &[]);
+        assert_eq!(got[0].audio, 0..secs(5.0));
+    }
+
+    #[test]
+    fn a_boundary_inside_speech_cuts_at_the_quietest_window() {
+        let total = secs(20.0);
+        let boundary = secs(10.0);
+        // The dip sits 300 ms after the boundary, inside the 400 ms search range.
+        let dip = boundary + secs(0.3);
+        let pcm = pcm_with_dip(total, dip);
+        let got = segment_at_boundaries(total, &[region(2.0, 18.0)], &[boundary], &pcm);
+        check_segments(&got, total);
+        assert_eq!(got.len(), 2);
+        let cut = got[0].speech.end;
+        assert_eq!(got[1].speech.start, cut);
+        let centre = dip + QUIET_WINDOW_SAMPLES / 2;
+        assert!(
+            cut.abs_diff(centre) <= QUIET_WINDOW_SAMPLES / 4,
+            "cut {cut} is not at the dip centre {centre}"
+        );
+        // No padding across the cut; padding at the VAD edges.
+        assert_eq!(got[0].audio.end, cut);
+        assert_eq!(got[1].audio.start, cut);
+        assert_eq!(got[0].audio.start, secs(2.0) - CHUNK_PAD_SAMPLES);
+        assert_eq!(got[1].audio.end, secs(18.0) + CHUNK_PAD_SAMPLES);
+    }
+
+    #[test]
+    fn a_boundary_without_audio_cuts_at_the_boundary() {
+        let total = secs(20.0);
+        let got = segment_at_boundaries(total, &[region(2.0, 18.0)], &[secs(10.0)], &[]);
+        assert_eq!(
+            speech_of(&got),
+            vec![secs(2.0)..secs(10.0), secs(10.0)..secs(18.0)]
+        );
+    }
+
+    #[test]
+    fn a_boundary_in_a_silence_keeps_the_regions_apart() {
+        let total = secs(20.0);
+        let regions = [region(1.0, 4.0), region(6.0, 9.0)];
+        let got = segment_at_boundaries(total, &regions, &[secs(5.0)], &[]);
+        check_segments(&got, total);
+        assert_eq!(
+            speech_of(&got),
+            vec![secs(1.0)..secs(4.0), secs(6.0)..secs(9.0)]
+        );
+        // Both edges of each segment are VAD edges: padded.
+        assert_eq!(
+            got[0].audio,
+            secs(1.0) - CHUNK_PAD_SAMPLES..secs(4.0) + CHUNK_PAD_SAMPLES
+        );
+        assert_eq!(
+            got[1].audio,
+            secs(6.0) - CHUNK_PAD_SAMPLES..secs(9.0) + CHUNK_PAD_SAMPLES
+        );
+    }
+
+    #[test]
+    fn boundaries_outside_speech_or_buffer_are_ignored() {
+        let total = secs(20.0);
+        let regions = [region(2.0, 8.0)];
+        let got = segment_at_boundaries(
+            total,
+            &regions,
+            &[0, secs(1.0), secs(9.0), total, total + 5],
+            &[],
+        );
+        assert_eq!(speech_of(&got), vec![secs(2.0)..secs(8.0)]);
+        // Several boundaries at the same place cut once.
+        let got = segment_at_boundaries(total, &regions, &[secs(5.0), secs(5.0)], &[]);
+        assert_eq!(
+            speech_of(&got),
+            vec![secs(2.0)..secs(5.0), secs(5.0)..secs(8.0)]
+        );
+    }
+
+    #[test]
+    fn a_short_piece_joins_the_previous_segment() {
+        let total = secs(20.0);
+        // The boundary leaves 0.5 s of speech after the cut.
+        let got = segment_at_boundaries(total, &[region(2.0, 8.0)], &[secs(7.5)], &[]);
+        assert_eq!(speech_of(&got), vec![secs(2.0)..secs(8.0)]);
+        // The joined segment ends at a VAD edge again: padded.
+        assert_eq!(got[0].audio.end, secs(8.0) + CHUNK_PAD_SAMPLES);
+    }
+
+    #[test]
+    fn a_short_first_piece_joins_the_next_segment() {
+        let total = secs(20.0);
+        let got = segment_at_boundaries(total, &[region(2.0, 8.0)], &[secs(2.5)], &[]);
+        assert_eq!(speech_of(&got), vec![secs(2.0)..secs(8.0)]);
+        assert_eq!(got[0].audio.start, secs(2.0) - CHUNK_PAD_SAMPLES);
+    }
+
+    #[test]
+    fn a_short_region_between_boundaries_joins_across_the_boundary() {
+        let total = secs(30.0);
+        let regions = [region(1.0, 5.0), region(10.0, 10.5), region(20.0, 25.0)];
+        let got = segment_at_boundaries(total, &regions, &[secs(8.0), secs(15.0)], &[]);
+        check_segments(&got, total);
+        assert_eq!(
+            speech_of(&got),
+            vec![secs(1.0)..secs(10.5), secs(20.0)..secs(25.0)]
+        );
+    }
+
+    #[test]
+    fn long_speech_between_boundaries_is_split_under_the_limit() {
+        let total = secs(100.0);
+        let got = segment_at_boundaries(total, &[region(0.0, 100.0)], &[], &[]);
+        check_segments(&got, total);
+        assert_eq!(got.len(), 4);
+        // Inner edges are cuts inside speech: no padding, no gap.
+        for pair in got.windows(2) {
+            assert_eq!(pair[0].audio.end, pair[1].audio.start);
+            assert_eq!(pair[0].speech.end, pair[1].speech.start);
+        }
+        assert_eq!(got[0].audio.start, 0);
+        assert_eq!(got[3].audio.end, total);
+    }
+
+    #[test]
+    fn pieces_in_one_slot_pack_like_plan() {
+        let total = secs(60.0);
+        // 10 s of speech, 2 s of silence, repeated; one boundary at 30 s inside the silence.
+        let regions: Vec<SpeechRegion> = (0..5)
+            .map(|i| region(i as f64 * 12.0, i as f64 * 12.0 + 10.0))
+            .collect();
+        let got = segment_at_boundaries(total, &regions, &[secs(35.0)], &[]);
+        check_segments(&got, total);
+        // 0-22 fits, 24-34 does not join it; 24-34 is alone before the boundary; 36-58 after.
+        assert_eq!(
+            speech_of(&got),
+            vec![
+                0..secs(22.0),
+                secs(24.0)..secs(34.0),
+                secs(36.0)..secs(58.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn segments_cover_exactly_the_speech_for_random_inputs() {
+        for seed in 1..=150u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let total = secs(5.0) + rng.below(secs(90.0) as u64) as usize;
+            let regions = random_regions(&mut rng, total);
+            let boundaries: Vec<usize> = (0..rng.below(8))
+                .map(|_| rng.below(total as u64 + 10) as usize)
+                .collect();
+            let pcm: Vec<f32> = (0..total)
+                .map(|i| ((i as f32) * 0.37).sin() * 0.5)
+                .collect();
+            let got = segment_at_boundaries(total, &regions, &boundaries, &pcm);
+            check_segments(&got, total);
+            // Every speech sample is in exactly one segment, and a segment starts and ends on
+            // speech (it may span the silences between regions, as a chunk of `plan` does).
+            let mut is_speech = vec![false; total];
+            for r in &regions {
+                for flag in &mut is_speech[r.start..r.end.min(total)] {
+                    *flag = true;
+                }
+            }
+            let mut covered = vec![false; total];
+            for s in &got {
+                assert!(
+                    is_speech[s.speech.start],
+                    "seed {seed}: {s:?} starts in silence"
+                );
+                assert!(
+                    is_speech[s.speech.end - 1],
+                    "seed {seed}: {s:?} ends in silence"
+                );
+                for i in s.speech.clone() {
+                    assert!(!covered[i], "seed {seed}: sample {i} in two segments");
+                    covered[i] = true;
+                }
+            }
+            let missed = is_speech
+                .iter()
+                .zip(&covered)
+                .filter(|(speech, c)| **speech && !**c)
+                .count();
+            assert_eq!(
+                missed, 0,
+                "seed {seed}: {missed} speech samples in no segment"
+            );
+        }
     }
 }

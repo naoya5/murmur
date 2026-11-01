@@ -122,7 +122,19 @@ pub struct Settings {
     /// Optional second hotkey that records in the other language.
     pub alternate_language_hotkey: Option<String>,
     pub onboarding_completed: bool,
+    /// Experimental: screen annotations (pictures of the screen plus the spoken words). Off by
+    /// default; while off, nothing of the feature runs.
+    pub annotations_enabled: bool,
+    /// Hotkey that starts and stops an annotation recording (accelerator string).
+    pub annotations_hotkey: String,
+    /// How many days an annotation bundle is kept on disk.
+    pub annotations_retention_days: u32,
 }
+
+/// Default accelerator of the annotations hotkey.
+pub const DEFAULT_ANNOTATIONS_HOTKEY: &str = "Option+Shift+KeyS";
+pub const DEFAULT_ANNOTATIONS_RETENTION_DAYS: u32 = 7;
+pub const ANNOTATIONS_RETENTION_DAYS_RANGE: std::ops::RangeInclusive<u32> = 1..=90;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -151,6 +163,9 @@ impl Default for Settings {
             unload_model_after_min: None,
             alternate_language_hotkey: None,
             onboarding_completed: false,
+            annotations_enabled: false,
+            annotations_hotkey: DEFAULT_ANNOTATIONS_HOTKEY.to_owned(),
+            annotations_retention_days: DEFAULT_ANNOTATIONS_RETENTION_DAYS,
         }
     }
 }
@@ -179,6 +194,9 @@ pub enum SettingKey {
     UnloadModelAfterMin,
     AlternateLanguageHotkey,
     OnboardingCompleted,
+    AnnotationsEnabled,
+    AnnotationsHotkey,
+    AnnotationsRetentionDays,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -219,6 +237,9 @@ impl Settings {
             unload_model_after_min,
             alternate_language_hotkey,
             onboarding_completed,
+            annotations_enabled,
+            annotations_hotkey,
+            annotations_retention_days,
         } = self;
         let mut keys = Vec::new();
         let mut check = |changed: bool, key: SettingKey| {
@@ -273,6 +294,18 @@ impl Settings {
             *onboarding_completed != new.onboarding_completed,
             SettingKey::OnboardingCompleted,
         );
+        check(
+            *annotations_enabled != new.annotations_enabled,
+            SettingKey::AnnotationsEnabled,
+        );
+        check(
+            *annotations_hotkey != new.annotations_hotkey,
+            SettingKey::AnnotationsHotkey,
+        );
+        check(
+            *annotations_retention_days != new.annotations_retention_days,
+            SettingKey::AnnotationsRetentionDays,
+        );
         keys
     }
 
@@ -317,6 +350,33 @@ impl Settings {
                 return invalid(SettingKey::Dictionary, "written form is empty");
             }
         }
+        if self.annotations_hotkey.trim().is_empty() {
+            return invalid(SettingKey::AnnotationsHotkey, "empty");
+        }
+        if !ANNOTATIONS_RETENTION_DAYS_RANGE.contains(&self.annotations_retention_days) {
+            return invalid(SettingKey::AnnotationsRetentionDays, "must be 1 to 90");
+        }
+        // The annotations hotkey is registered only while the feature is on, so a clash with an
+        // unused key must not make the settings file invalid (the loader would reset the field).
+        if self.annotations_enabled {
+            let clashes = |other: &str| same_accelerator(&self.annotations_hotkey, other);
+            if clashes(&self.hotkey) {
+                return invalid(
+                    SettingKey::AnnotationsHotkey,
+                    "same key as the dictation hotkey",
+                );
+            }
+            if self
+                .alternate_language_hotkey
+                .as_deref()
+                .is_some_and(clashes)
+            {
+                return invalid(
+                    SettingKey::AnnotationsHotkey,
+                    "same key as the alternate language hotkey",
+                );
+            }
+        }
         Ok(())
     }
 
@@ -341,6 +401,54 @@ impl Settings {
             serde_json::from_value(value).map_err(|e| SettingsError::Parse(e.to_string()))?;
         settings.schema_version = SCHEMA_VERSION;
         Ok(settings)
+    }
+}
+
+/// Whether two accelerator strings name the same key combination.
+///
+/// The hotkey adapter accepts several spellings for one key ("Option" and "Alt", "Cmd" and
+/// "Command", "S" and "KeyS", any order of modifiers, any case). Two hotkeys clash when their
+/// normalised forms are equal. Syntax is not checked here; the adapter does that when it registers.
+pub fn same_accelerator(a: &str, b: &str) -> bool {
+    normalise_accelerator(a) == normalise_accelerator(b)
+}
+
+fn normalise_accelerator(accelerator: &str) -> (Vec<String>, String) {
+    let mut modifiers: Vec<String> = Vec::new();
+    let mut key = String::new();
+    for part in accelerator
+        .split('+')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        let lower = part.to_ascii_lowercase();
+        let modifier = match lower.as_str() {
+            "alt" | "option" => Some("alt"),
+            "ctrl" | "control" => Some("ctrl"),
+            "cmd" | "command" | "super" | "meta" => Some("meta"),
+            "shift" => Some("shift"),
+            "commandorcontrol" | "cmdorctrl" | "cmdorcontrol" | "commandorctrl" => {
+                Some("cmdorctrl")
+            }
+            _ => None,
+        };
+        match modifier {
+            Some(m) => modifiers.push(m.to_owned()),
+            None => key = canonical_key(&lower),
+        }
+    }
+    modifiers.sort();
+    modifiers.dedup();
+    (modifiers, key)
+}
+
+/// "s" and "keys" are the same key; "5" and "digit5" too.
+fn canonical_key(lower: &str) -> String {
+    let mut chars = lower.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if c.is_ascii_lowercase() => format!("key{c}"),
+        (Some(c), None) if c.is_ascii_digit() => format!("digit{c}"),
+        _ => lower.to_owned(),
     }
 }
 
@@ -383,6 +491,58 @@ mod tests {
         assert!(s.auto_check_updates);
         assert_eq!(s.ui_language, UiLanguage::System);
         assert!(!s.onboarding_completed);
+        assert!(!s.annotations_enabled);
+        assert_eq!(s.annotations_hotkey, "Option+Shift+KeyS");
+        assert_eq!(s.annotations_retention_days, 7);
+    }
+
+    #[test]
+    fn annotations_hotkey_may_not_clash_while_enabled() {
+        let clash = |mutate: &dyn Fn(&mut Settings)| {
+            let mut s = Settings {
+                annotations_enabled: true,
+                ..Settings::default()
+            };
+            mutate(&mut s);
+            s.validate()
+        };
+        // Same key, other spelling and order: refused under the annotations key.
+        assert_eq!(
+            clash(&|s| s.hotkey = "Shift+Alt+S".to_owned()),
+            Err(SettingsError::Invalid {
+                key: SettingKey::AnnotationsHotkey,
+                reason: "same key as the dictation hotkey".to_owned(),
+            })
+        );
+        assert!(matches!(
+            clash(&|s| s.alternate_language_hotkey = Some("option+shift+keys".to_owned())),
+            Err(SettingsError::Invalid {
+                key: SettingKey::AnnotationsHotkey,
+                ..
+            })
+        ));
+        // A different key is fine.
+        assert_eq!(
+            clash(&|s| s.alternate_language_hotkey = Some("Alt+Shift+Space".to_owned())),
+            Ok(())
+        );
+        // While the feature is off the clash is not an error: the key is not registered.
+        let s = Settings {
+            hotkey: "Option+Shift+KeyS".to_owned(),
+            ..Settings::default()
+        };
+        assert_eq!(s.validate(), Ok(()));
+    }
+
+    #[test]
+    fn same_accelerator_ignores_spelling_case_and_order() {
+        assert!(same_accelerator("Option+Shift+KeyS", "Shift+Alt+S"));
+        assert!(same_accelerator("Cmd+Shift+D", "shift+command+keyd"));
+        assert!(same_accelerator("CommandOrControl+5", "CmdOrCtrl+Digit5"));
+        assert!(same_accelerator(" Alt + Space ", "alt+space"));
+        assert!(!same_accelerator("Alt+Space", "Alt+Shift+Space"));
+        assert!(!same_accelerator("Alt+KeyS", "Ctrl+KeyS"));
+        assert!(!same_accelerator("F5", "F6"));
     }
 
     #[test]
@@ -421,6 +581,18 @@ mod tests {
                 Box::new(|s| s.dictionary = vec![entry("  ")]),
                 SettingKey::Dictionary,
             ),
+            (
+                Box::new(|s| s.annotations_hotkey = " ".to_owned()),
+                SettingKey::AnnotationsHotkey,
+            ),
+            (
+                Box::new(|s| s.annotations_retention_days = 0),
+                SettingKey::AnnotationsRetentionDays,
+            ),
+            (
+                Box::new(|s| s.annotations_retention_days = 91),
+                SettingKey::AnnotationsRetentionDays,
+            ),
         ];
         for (i, (mutate, key)) in cases.iter().enumerate() {
             let mut s = Settings::default();
@@ -444,6 +616,12 @@ mod tests {
                 en: "qwen3-asr-0.6b-q8_0".to_owned(),
             },
             dictionary: vec![entry("Claude Code")],
+            annotations_retention_days: 90,
+            ..Settings::default()
+        };
+        assert_eq!(s.validate(), Ok(()));
+        let s = Settings {
+            annotations_retention_days: 1,
             ..Settings::default()
         };
         assert_eq!(s.validate(), Ok(()));
@@ -531,6 +709,18 @@ mod tests {
                 Box::new(|s| s.onboarding_completed = true),
                 SettingKey::OnboardingCompleted,
             ),
+            (
+                Box::new(|s| s.annotations_enabled = true),
+                SettingKey::AnnotationsEnabled,
+            ),
+            (
+                Box::new(|s| s.annotations_hotkey = "Option+Shift+KeyA".to_owned()),
+                SettingKey::AnnotationsHotkey,
+            ),
+            (
+                Box::new(|s| s.annotations_retention_days = 30),
+                SettingKey::AnnotationsRetentionDays,
+            ),
         ];
         let old = Settings::default();
         let mut seen = Vec::new();
@@ -544,7 +734,7 @@ mod tests {
         // Every key is exercised exactly once (keep this list in step with `SettingKey`).
         seen.sort_by_key(|k| format!("{k:?}"));
         seen.dedup();
-        assert_eq!(seen.len(), 20);
+        assert_eq!(seen.len(), 23);
     }
 
     #[test]
@@ -644,6 +834,8 @@ mod tests {
             ui_language: UiLanguage::En,
             unload_model_after_min: Some(15),
             alternate_language_hotkey: Some("Alt+Shift+Space".to_owned()),
+            annotations_enabled: true,
+            annotations_retention_days: 14,
             ..Settings::default()
         };
         let json = serde_json::to_string_pretty(&s).unwrap();

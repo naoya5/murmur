@@ -351,6 +351,21 @@ impl Controller {
                     let _ = tx.send(Msg::Core(Event::TimerFired(id)));
                 });
             }
+            // Annotation effects: nothing sends `Event::AnnotationsHotkey` yet, so these arms
+            // are never reached. The platform ticket gives them their adapters.
+            Effect::StartScreen { .. }
+            | Effect::PauseScreen { .. }
+            | Effect::ResumeScreen { .. }
+            | Effect::StopScreen { .. }
+            | Effect::ShowOverlay
+            | Effect::HideOverlay
+            | Effect::PlanKeyframes { .. }
+            | Effect::TranscribeSegments { .. }
+            | Effect::Compose { .. }
+            | Effect::DeliverBundle { .. }
+            | Effect::DeliverText { .. }
+            | Effect::SaveAnnotation { .. }
+            | Effect::DropAll { .. } => {}
         }
     }
 

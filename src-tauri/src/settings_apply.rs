@@ -221,6 +221,11 @@ fn apply(
         SettingKey::Sounds => Ok(()),
         // Read by the main window on start.
         SettingKey::OnboardingCompleted => Ok(()),
+        // Annotations (experimental): the hotkey registration, the drawing layer and the
+        // retention cleanup arrive with the platform ticket. Until then the values are only stored.
+        SettingKey::AnnotationsEnabled
+        | SettingKey::AnnotationsHotkey
+        | SettingKey::AnnotationsRetentionDays => Ok(()),
     }
 }
 

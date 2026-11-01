@@ -215,6 +215,10 @@ updateAvailable: "update-available"
 /** user-defined types **/
 
 /**
+ * Why an annotation recording could not start. Decided by the controller before the event.
+ */
+export type AnnotationsRefusal = "screen_recording_denied" | "microphone_denied"
+/**
  * Static facts about the running app.
  */
 export type AppInfo = { version: string; data_dir: string; speech_engine: string }
@@ -411,7 +415,19 @@ export type Notice = { kind: "delivered"; outcome: DeliveryOutcome } | { kind: "
 /**
  * The audio is saved in the history and can be retried.
  */
-{ kind: "failed"; failure: FailureKind } | { kind: "capture_failed"; error: CaptureError }
+{ kind: "failed"; failure: FailureKind } | { kind: "capture_failed"; error: CaptureError } | 
+/**
+ * An annotation bundle went out. `images` is 0 when only the words were pasted.
+ */
+{ kind: "annotation_delivered"; outcome: DeliveryOutcome; images: number } | 
+/**
+ * An annotation recording had neither speech nor marks; nothing is kept.
+ */
+{ kind: "annotation_empty" } | 
+/**
+ * An annotation recording could not start (a permission is missing).
+ */
+{ kind: "annotations_refused"; reason: AnnotationsRefusal }
 /**
  * State of one macOS privacy permission.
  */
@@ -463,7 +479,20 @@ unload_model_after_min: number | null;
 /**
  * Optional second hotkey that records in the other language.
  */
-alternate_language_hotkey: string | null; onboarding_completed: boolean }
+alternate_language_hotkey: string | null; onboarding_completed: boolean; 
+/**
+ * Experimental: screen annotations (pictures of the screen plus the spoken words). Off by
+ * default; while off, nothing of the feature runs.
+ */
+annotations_enabled: boolean; 
+/**
+ * Hotkey that starts and stops an annotation recording (accelerator string).
+ */
+annotations_hotkey: string; 
+/**
+ * How many days an annotation bundle is kept on disk.
+ */
+annotations_retention_days: number }
 /**
  * Settings were saved; every window re-reads what it shows.
  */
