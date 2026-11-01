@@ -23,6 +23,10 @@ Local, private speech-to-text for macOS. Tauri 2 + Rust + React 19. Read `docs/A
 Also: English in code and comments; never the em dash (U+2014); never delete `docs/`;
 never run scaffolding generators in the repo root.
 
+Private docs: `docs/HANDOFF.md`, `docs/IDEATION.md`, `docs/PLAN.md`, `docs/PROGRESS.md` and
+`docs/features/` are local only (gitignored, not in the history). Read and update them, but never
+commit them, never `git add -f` them, and never copy their content into tracked files.
+
 ## Find the source of truth
 
 ```sh
@@ -44,4 +48,4 @@ MURMUR_TEST_MODELS=~/.murmur-dev-models cargo test -p murmur -- --ignored   # en
 
 ## Work tracking
 
-Tickets: `docs/tickets/` (rules in `RULES.md`). Progress: `docs/PROGRESS.md`.
+Tickets: `docs/tickets/` (rules in `RULES.md`). Progress: `docs/PROGRESS.md` (local only).

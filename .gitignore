@@ -17,3 +17,11 @@ dist-ssr
 .idea
 .DS_Store
 *.sw?
+
+# Private docs: the owner's requests, requirements, local paths and work notes.
+# They stay on this Mac only and are removed from the git history. Never `git add -f` them.
+/docs/HANDOFF.md
+/docs/IDEATION.md
+/docs/PLAN.md
+/docs/PROGRESS.md
+/docs/features/

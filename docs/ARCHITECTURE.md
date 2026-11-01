@@ -1,6 +1,6 @@
 # Murmur architecture
 
-This is the map of the code. The full rationale is in `PLAN.md` (Japanese). Rules for changes are in
+This is the map of the code. The full rationale is in `PLAN.md` (Japanese, kept local and not in the public repository). Rules for changes are in
 `/CLAUDE.md` and `docs/tickets/RULES.md`.
 
 ## One path through the code
