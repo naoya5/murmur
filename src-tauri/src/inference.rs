@@ -91,6 +91,35 @@ pub enum InferenceError {
 
 type Reply = oneshot::Sender<Result<InferenceOutput, InferenceError>>;
 
+/// Audio that may wait while the worker is busy (an engine call, or a cold model load at the
+/// start of a recording, which can take several seconds). 30 s is about 1.9 MB, so memory stays
+/// bounded; beyond it the stream gives up and the stop uses the offline path.
+const MAX_PENDING_SAMPLES: usize = murmur_core::SAMPLE_RATE_HZ as usize * 30;
+const MAX_STREAM_SAMPLES: usize =
+    murmur_core::SAMPLE_RATE_HZ as usize * murmur_core::session::MAX_RECORDING_MS as usize / 1000;
+
+#[derive(Default)]
+struct StreamBuffer {
+    pcm: Vec<f32>,
+    abandoned: bool,
+}
+
+impl StreamBuffer {
+    fn append(&mut self, pcm: &[f32]) {
+        if self.abandoned {
+            return;
+        }
+        if pcm.len() > MAX_PENDING_SAMPLES.saturating_sub(self.pcm.len()) {
+            self.abandoned = true;
+            self.pcm = Vec::new();
+        } else {
+            self.pcm.extend_from_slice(pcm);
+        }
+    }
+}
+
+type SharedStreamBuffer = Arc<Mutex<StreamBuffer>>;
+
 enum Job {
     Preload {
         model: ModelSpec,
@@ -103,10 +132,7 @@ enum Job {
     StreamStart {
         id: StreamId,
         req: StreamRequest,
-    },
-    StreamPush {
-        id: StreamId,
-        pcm: Vec<f32>,
+        buffer: SharedStreamBuffer,
     },
     /// The recording stopped: `req.pcm` is the complete audio, sample for sample what was pushed.
     StreamFinish {
@@ -129,6 +155,7 @@ enum Job {
 pub struct Inference {
     tx: std::sync::mpsc::Sender<Job>,
     loaded: Arc<Mutex<Option<&'static str>>>,
+    stream_buffer: Arc<Mutex<Option<(StreamId, SharedStreamBuffer)>>>,
 }
 
 impl Inference {
@@ -147,13 +174,27 @@ impl Inference {
                     stream: None,
                     loaded: worker_loaded,
                 };
-                while let Ok(job) = rx.recv() {
+                loop {
+                    let poll = if worker.stream.as_ref().is_some_and(|s| !s.dead) {
+                        Duration::from_millis(10)
+                    } else {
+                        Duration::from_secs(1)
+                    };
+                    let job = match rx.recv_timeout(poll) {
+                        Ok(job) => job,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            worker.poll_stream();
+                            continue;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
                     if let Job::Shutdown(ack) = job {
                         worker.unload_all();
                         let _ = ack.send(());
                         return;
                     }
                     worker.handle(job);
+                    worker.poll_stream();
                 }
                 worker.unload_all();
             });
@@ -161,7 +202,11 @@ impl Inference {
             // Without the thread every request fails with `Shutdown`; the app stays usable.
             tracing::error!(%error, "could not start the inference thread");
         }
-        Inference { tx, loaded }
+        Inference {
+            tx,
+            loaded,
+            stream_buffer: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// Loads the model and the VAD in the background (no-op if already loaded).
@@ -182,24 +227,32 @@ impl Inference {
 
     /// Starts a stream for a recording that is about to begin. Replaces an active stream.
     pub fn stream_start(&self, id: StreamId, req: StreamRequest) {
-        let _ = self.tx.send(Job::StreamStart { id, req });
+        let buffer = Arc::new(Mutex::new(StreamBuffer::default()));
+        if let Ok(mut current) = self.stream_buffer.lock() {
+            *current = Some((id, buffer.clone()));
+        }
+        let _ = self.tx.send(Job::StreamStart { id, req, buffer });
     }
 
     /// The tap to give the audio adapter: every call pushes the samples to the stream.
     pub fn stream_tap(&self, id: StreamId) -> PcmTap {
-        let tx = self.tx.clone();
+        let buffer = self.stream_buffer.lock().ok().and_then(|current| {
+            current
+                .as_ref()
+                .filter(|(stream, _)| *stream == id)
+                .map(|(_, buffer)| buffer.clone())
+        });
         Box::new(move |pcm: &[f32]| {
-            if !pcm.is_empty() {
-                let _ = tx.send(Job::StreamPush {
-                    id,
-                    pcm: pcm.to_vec(),
-                });
+            if let Some(buffer) = &buffer
+                && let Ok(mut buffer) = buffer.lock()
+            {
+                buffer.append(pcm);
             }
         })
     }
 
     /// Ends the stream with the complete audio and returns the whole text. Every push made before
-    /// this call is processed first (one channel, in order). An unknown or broken stream, and a
+    /// this call is coalesced in the stream buffer. An unknown or broken stream, and a
     /// recording that fits in one chunk, go through `transcribe` instead.
     pub async fn stream_finish(
         &self,
@@ -256,6 +309,7 @@ struct LoadedVad {
 /// A recording being transcribed while it is still running.
 struct Stream {
     id: StreamId,
+    buffer: SharedStreamBuffer,
     model: ModelSpec,
     opts: TranscribeOptions,
     plan: IncrementalPlan,
@@ -293,8 +347,7 @@ impl Worker {
                 let result = self.transcribe(req);
                 let _ = reply.send(result);
             }
-            Job::StreamStart { id, req } => self.stream_start(id, req),
-            Job::StreamPush { id, pcm } => self.stream_push(id, &pcm),
+            Job::StreamStart { id, req, buffer } => self.stream_start(id, req, buffer),
             Job::StreamFinish { id, req, reply } => {
                 let result = self.stream_finish(id, req);
                 let _ = reply.send(result);
@@ -306,6 +359,7 @@ impl Worker {
             }
             Job::Unload => self.unload_all(),
             Job::Sync(ack) => {
+                self.poll_stream();
                 let _ = ack.send(());
             }
             Job::Shutdown(ack) => {
@@ -512,7 +566,7 @@ impl Worker {
 
     // --- streaming (S1) ---
 
-    fn stream_start(&mut self, id: StreamId, req: StreamRequest) {
+    fn stream_start(&mut self, id: StreamId, req: StreamRequest, buffer: SharedStreamBuffer) {
         self.drop_stream();
         let started = match self.ensure_vad(&req.vad) {
             Ok(()) => self
@@ -528,6 +582,7 @@ impl Worker {
         }
         self.stream = Some(Stream {
             id,
+            buffer,
             model: req.model,
             opts: TranscribeOptions {
                 language: req.language,
@@ -543,15 +598,35 @@ impl Worker {
         });
     }
 
-    fn stream_push(&mut self, id: StreamId, pcm: &[f32]) {
-        let Some(mut stream) = self.stream.take_if(|s| s.id == id) else {
+    fn poll_stream(&mut self) {
+        let Some(mut stream) = self.stream.take() else {
             return;
         };
-        if self.push_into(&mut stream, pcm) {
+        if stream.dead {
             self.stream = Some(stream);
-        } else {
-            self.drop_stream_detector();
+            return;
         }
+        let pending = match stream.buffer.lock() {
+            Ok(mut buffer) if !buffer.abandoned => Some(std::mem::take(&mut buffer.pcm)),
+            _ => None,
+        };
+        match pending {
+            None => {
+                stream.dead = true;
+                stream.pcm = Vec::new();
+                stream.texts.clear();
+                stream.languages.clear();
+                self.drop_stream_detector();
+            }
+            Some(pcm) if !pcm.is_empty() => {
+                if !self.push_into(&mut stream, &pcm) {
+                    self.drop_stream_detector();
+                    return;
+                }
+            }
+            Some(_) => {}
+        }
+        self.stream = Some(stream);
     }
 
     /// Feeds the samples and transcribes the chunks that closed. False once the stream is
@@ -562,6 +637,11 @@ impl Worker {
         }
         if stream.opts.cancel.is_cancelled() {
             return false;
+        }
+        if pcm.len() > MAX_STREAM_SAMPLES.saturating_sub(stream.pcm.len()) {
+            stream.dead = true;
+            stream.pcm = Vec::new();
+            return true;
         }
         stream.pcm.extend_from_slice(pcm);
         let regions = match self.vad.as_mut() {
@@ -619,6 +699,7 @@ impl Worker {
         id: StreamId,
         req: TranscribeRequest,
     ) -> Result<InferenceOutput, InferenceError> {
+        self.poll_stream();
         let Some(stream) = self.stream.take_if(|s| s.id == id) else {
             return self.transcribe(req);
         };
@@ -705,6 +786,8 @@ mod tests {
     static LOADS: AtomicUsize = AtomicUsize::new(0);
     static UNLOADS: AtomicUsize = AtomicUsize::new(0);
     static CALLS: AtomicUsize = AtomicUsize::new(0);
+    type EngineGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+    static ENGINE_GATE: Mutex<Option<EngineGate>> = Mutex::new(None);
     /// The counters are global, so every test of this module runs alone.
     static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -742,6 +825,11 @@ mod tests {
             pcm: &[f32],
             opts: &TranscribeOptions,
         ) -> Result<RawTranscript, EngineError> {
+            let gate = ENGINE_GATE.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                entered.send(()).unwrap();
+                release.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
             CALLS.fetch_add(1, Ordering::SeqCst);
             if opts.cancel.is_cancelled() {
                 return Err(EngineError::Cancelled);
@@ -882,8 +970,11 @@ mod tests {
 
     fn push_all(inference: &Inference, id: StreamId, pcm: &[f32]) {
         let tap = inference.stream_tap(id);
-        for piece in pcm.chunks(4_000) {
+        for (i, piece) in pcm.chunks(4_000).enumerate() {
             tap(piece);
+            if i % 4 == 3 {
+                assert!(inference.wait_idle(Duration::from_secs(10)));
+            }
         }
         assert!(inference.wait_idle(Duration::from_secs(10)));
     }
@@ -962,6 +1053,64 @@ mod tests {
     }
 
     // --- streaming ---
+
+    #[test]
+    fn ten_minute_backlog_is_bounded_and_finish_uses_offline_text() {
+        let _serial = serial();
+        let inference = Inference::spawn(engines, vads);
+        let rt = rt();
+        let mut pcm = long_pcm();
+        pcm.resize(600 * 16000, 0.0);
+        let offline = rt
+            .block_on(inference.transcribe(request(pcm.clone(), catalog::DEFAULT_JA_MODEL)))
+            .unwrap();
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release_tx, release) = std::sync::mpsc::channel();
+        *ENGINE_GATE.lock().unwrap() = Some((entered_tx, release));
+        let (reply, reply_rx) = oneshot::channel();
+        inference
+            .tx
+            .send(Job::Transcribe {
+                req: request(vec![0.5; 16000], catalog::DEFAULT_JA_MODEL),
+                reply,
+            })
+            .unwrap();
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        let id = StreamId(77);
+        inference.stream_start(
+            id,
+            stream_request(catalog::DEFAULT_JA_MODEL, CancelToken::new()),
+        );
+        let tap = inference.stream_tap(id);
+        let buffer = inference
+            .stream_buffer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .1
+            .clone();
+        // No inference work can run while ten minutes of audio arrive through the real tap.
+        for piece in pcm.chunks(4000) {
+            tap(piece);
+            assert!(buffer.lock().unwrap().pcm.len() <= MAX_PENDING_SAMPLES);
+        }
+        assert!(buffer.lock().unwrap().abandoned);
+        assert!(buffer.lock().unwrap().pcm.is_empty());
+        release_tx.send(()).unwrap();
+        let out = rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                reply_rx.await.unwrap().unwrap();
+                inference
+                    .stream_finish(id, request(pcm, catalog::DEFAULT_JA_MODEL))
+                    .await
+                    .unwrap()
+            })
+            .await
+            .unwrap()
+        });
+        assert_eq!(out.raw.unwrap().text, offline.raw.unwrap().text);
+    }
 
     #[test]
     fn stream_gives_the_offline_text_and_works_ahead() {

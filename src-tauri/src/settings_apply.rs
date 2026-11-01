@@ -47,6 +47,12 @@ pub fn update(
     services: &Arc<App>,
     requested: Settings,
 ) -> Result<Settings, ApplyError> {
+    // Updates run one at a time; a second one (a quick double toggle in the UI) waits for the
+    // first instead of failing. The section is short: validation, side effects, one file write.
+    let _update = match services.settings_update.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
     requested.validate()?;
     let old = services.settings();
     let mut next = requested;
@@ -59,15 +65,42 @@ pub fn update(
             first_error.get_or_insert(error);
         }
     }
-    services.replace_settings(next.clone());
+    save_and_publish(
+        &services.paths().settings,
+        &next,
+        || services.replace_settings(next.clone()),
+        || {
+            if let Some(hotkeys) = services.hotkeys() {
+                if keys.contains(&SettingKey::Hotkey)
+                    && let Err(error) = hotkeys.set_main(&old.hotkey)
+                {
+                    tracing::error!(%error, "could not restore the main hotkey");
+                }
+                if keys.contains(&SettingKey::AlternateLanguageHotkey)
+                    && let Err(error) =
+                        hotkeys.set_alternate(old.alternate_language_hotkey.as_deref())
+                {
+                    tracing::error!(%error, "could not restore the alternate hotkey");
+                }
+            }
+            if keys.contains(&SettingKey::LaunchAtLogin) {
+                sync_autostart(app, old.launch_at_login);
+            }
+        },
+    )?;
+    if keys.contains(&SettingKey::HistoryRetention) {
+        let store = services.store().clone();
+        let retention = next.history_retention;
+        tauri::async_runtime::spawn_blocking(move || {
+            crate::history::apply_retention(&store, retention)
+        });
+    }
     if keys
         .iter()
         .any(|k| matches!(k, SettingKey::Language | SettingKey::Models))
     {
         services.ensure_model_loaded(next.language);
     }
-    settings_file::save(&services.paths().settings, &next)
-        .map_err(|e| ApplyError::Save(e.to_string()))?;
     if let Err(error) = (SettingsChanged {
         settings: next.clone(),
     })
@@ -80,6 +113,21 @@ pub fn update(
         Some(error) => Err(error),
         None => Ok(next),
     }
+}
+
+/// Publish only after the atomic file replacement; undo external changes on save failure.
+fn save_and_publish(
+    path: &std::path::Path,
+    next: &Settings,
+    publish: impl FnOnce(),
+    rollback: impl FnOnce(),
+) -> Result<(), ApplyError> {
+    if let Err(error) = settings_file::save(path, next) {
+        rollback();
+        return Err(ApplyError::Save(error.to_string()));
+    }
+    publish();
+    Ok(())
 }
 
 /// Side effects at startup, for keys whose state lives outside the settings file.
@@ -147,14 +195,8 @@ fn apply(
                 ))
             }
         }
-        SettingKey::HistoryRetention => {
-            let store = services.store().clone();
-            let retention = next.history_retention;
-            tauri::async_runtime::spawn_blocking(move || {
-                crate::history::apply_retention(&store, retention)
-            });
-            Ok(())
-        }
+        // Destructive retention work starts only after the settings commit in `update`.
+        SettingKey::HistoryRetention => Ok(()),
         SettingKey::UnloadModelAfterMin => {
             // Read by the idle check in lib.rs every minute.
             Ok(())
@@ -201,5 +243,56 @@ fn sync_autostart(app: &AppHandle, enabled: bool) -> bool {
             tracing::warn!(%error, enabled, "autostart change failed");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn save_failure_restores_effects_without_publishing() {
+        let dir = std::env::temp_dir().join(format!("murmur-apply-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let old = Settings::default();
+        settings_file::save(&path, &old).unwrap();
+        let next = Settings {
+            hotkey: "F14".into(),
+            launch_at_login: !old.launch_at_login,
+            ..old.clone()
+        };
+        let memory = RefCell::new(old.clone());
+        let effects = RefCell::new(next.clone());
+        // Blocking the temporary file forces a real save failure while preserving the old file.
+        std::fs::create_dir(dir.join("settings.json.tmp")).unwrap();
+        let result = save_and_publish(
+            &path,
+            &next,
+            || *memory.borrow_mut() = next.clone(),
+            || *effects.borrow_mut() = old.clone(),
+        );
+        assert!(matches!(result, Err(ApplyError::Save(_))));
+        assert_eq!(*memory.borrow(), old);
+        assert_eq!(*effects.borrow(), old);
+        assert_eq!(settings_file::load(&path).settings, old);
+        std::fs::remove_dir(dir.join("settings.json.tmp")).unwrap();
+        save_and_publish(
+            &path,
+            &next,
+            || {
+                assert_eq!(
+                    settings_file::load(&path).settings,
+                    next,
+                    "persist before publishing"
+                );
+                *memory.borrow_mut() = next.clone();
+            },
+            || panic!("successful save must not roll back"),
+        )
+        .unwrap();
+        assert_eq!(*memory.borrow(), next);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -1018,9 +1018,16 @@ mod tests {
                     },
                 );
                 let tap = inference.stream_tap(id);
-                // 100 ms pieces, as the converter thread delivers them.
-                for piece in pcm.chunks(SAMPLE_RATE_HZ as usize / 10) {
+                // 100 ms pieces, as the converter thread delivers them. A live recording arrives
+                // in real time, far slower than the worker; pause after every 20 s of audio so the
+                // test sees the same steady state without waiting 77 s (the pending audio stays
+                // under the stream's backlog limit).
+                let per_second = SAMPLE_RATE_HZ as usize;
+                for (i, piece) in pcm.chunks(per_second / 10).enumerate() {
                     tap(piece);
+                    if (i + 1) % 200 == 0 {
+                        std::thread::sleep(Duration::from_millis(1500));
+                    }
                 }
                 assert!(inference.wait_idle(Duration::from_secs(120)));
                 let runtime = tokio::runtime::Builder::new_current_thread()

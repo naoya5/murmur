@@ -61,6 +61,7 @@ impl Paths {
 pub struct App {
     paths: Paths,
     settings: RwLock<Settings>,
+    pub(crate) settings_update: Mutex<()>,
     store: Arc<Store>,
     models: ModelStore,
     inference: Inference,
@@ -82,6 +83,7 @@ impl App {
         App {
             paths,
             settings: RwLock::new(settings),
+            settings_update: Mutex::new(()),
             store: Arc::new(store),
             models,
             inference,

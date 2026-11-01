@@ -15,9 +15,9 @@
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -114,6 +114,7 @@ fn device_err(e: &cpal::Error) -> AudioError {
 
 /// State shared between the Recorder handle, the cpal callbacks and the threads.
 struct Shared {
+    pcm: Mutex<Option<Vec<f32>>>,
     paused: AtomicBool,
     stop_owner: AtomicBool,
     stop_converter: AtomicBool,
@@ -126,6 +127,7 @@ struct Shared {
 impl Shared {
     fn new() -> Shared {
         Shared {
+            pcm: Mutex::new(Some(Vec::new())),
             paused: AtomicBool::new(false),
             stop_owner: AtomicBool::new(false),
             stop_converter: AtomicBool::new(false),
@@ -155,7 +157,7 @@ pub struct Recorder {
     shared: Arc<Shared>,
     owner: Option<JoinHandle<()>>,
     owner_done: mpsc::Receiver<()>,
-    converter: Option<JoinHandle<Result<Vec<f32>, AudioError>>>,
+    converter_done: mpsc::Receiver<Result<(), AudioError>>,
     spool_path: PathBuf,
 }
 
@@ -212,12 +214,15 @@ impl Recorder {
             }
         };
 
-        let converter = {
+        let (converter_tx, converter_done) = mpsc::channel();
+        {
             let shared = Arc::clone(&shared);
             thread::Builder::new()
                 .name("murmur-audio-converter".into())
                 .spawn(move || {
-                    converter_main(opened, &shared, spool, on_event.as_ref(), tap.as_deref())
+                    let result =
+                        converter_main(opened, &shared, spool, on_event.as_ref(), tap.as_deref());
+                    let _ = converter_tx.send(result);
                 })
                 .map_err(|e| AudioError::Device(e.to_string()))?
         };
@@ -226,7 +231,7 @@ impl Recorder {
             shared,
             owner: Some(owner),
             owner_done: done_rx,
-            converter: Some(converter),
+            converter_done,
             spool_path,
         })
     }
@@ -256,13 +261,7 @@ impl Recorder {
         }
         // Everything the stream produced is in the ring now; the converter drains it and finishes.
         self.shared.stop_converter.store(true, Ordering::Release);
-        let converter = self
-            .converter
-            .take()
-            .ok_or_else(|| AudioError::Device("recorder already stopped".into()))?;
-        let pcm = converter
-            .join()
-            .map_err(|_| AudioError::Device("audio converter thread panicked".into()))??;
+        let pcm = finish_converter(&self.shared, &self.converter_done, CLOSE_TIMEOUT)?;
         let duration_ms = pcm.len() as u64 * 1000 / u64::from(TARGET_RATE);
         Ok(CapturedAudio {
             pcm,
@@ -270,6 +269,30 @@ impl Recorder {
             duration_ms,
         })
     }
+}
+
+/// A timed-out converter retains only its own file handle. Taking the buffer fences all later
+/// appends and callbacks; it cannot publish into this recording or a subsequent session.
+fn finish_converter(
+    shared: &Shared,
+    done: &mpsc::Receiver<Result<(), AudioError>>,
+    timeout: Duration,
+) -> Result<Vec<f32>, AudioError> {
+    match done.recv_timeout(timeout) {
+        Ok(result) => result?,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!("audio converter did not stop in time; using captured audio");
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(AudioError::Device("audio converter thread ended".into()));
+        }
+    }
+    Ok(shared
+        .pcm
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .unwrap_or_default())
 }
 
 impl Drop for Recorder {
@@ -568,7 +591,7 @@ fn converter_main(
     spool: File,
     on_event: &(dyn Fn(AudioEvent) + Send + Sync),
     tap: TapRef<'_>,
-) -> Result<Vec<f32>, AudioError> {
+) -> Result<(), AudioError> {
     let Opened {
         mut cons,
         rate,
@@ -577,7 +600,6 @@ fn converter_main(
     let mut converter = Converter::new(rate, channels)?;
     let mut meter = LevelMeter::new();
     let mut spool = BufWriter::new(spool);
-    let mut pcm: Vec<f32> = Vec::with_capacity(TARGET_RATE as usize * 60);
     let mut raw = vec![0.0_f32; 8192 - 8192 % channels];
     let mut converted: Vec<f32> = Vec::with_capacity(4096);
     let mut last_flush = Instant::now();
@@ -585,6 +607,14 @@ fn converter_main(
     let mut first_error: Option<AudioError> = None;
 
     loop {
+        if shared
+            .pcm
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+        {
+            return Ok(());
+        }
         // Read the flag before draining: the owner is already gone when it is set, so one more drain is final.
         let stopping = shared.stop_converter.load(Ordering::Acquire);
         loop {
@@ -601,7 +631,7 @@ fn converter_main(
             }
             append(
                 &converted,
-                &mut pcm,
+                shared,
                 &mut spool,
                 &mut meter,
                 on_event,
@@ -609,7 +639,14 @@ fn converter_main(
                 &mut first_error,
             );
         }
-        if shared.failed.load(Ordering::Acquire) && !disconnected_sent {
+        if shared.failed.load(Ordering::Acquire)
+            && !disconnected_sent
+            && shared
+                .pcm
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
+        {
             disconnected_sent = true;
             on_event(AudioEvent::Disconnected);
         }
@@ -631,7 +668,7 @@ fn converter_main(
     }
     append(
         &converted,
-        &mut pcm,
+        shared,
         &mut spool,
         &mut meter,
         on_event,
@@ -641,10 +678,14 @@ fn converter_main(
     if let Err(e) = spool.flush() {
         first_error.get_or_insert(AudioError::Io(e.to_string()));
     }
+    let pcm = shared
+        .pcm
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match first_error {
         // Keep the audio captured so far when only the spool failed; report hard errors otherwise.
-        Some(e) if pcm.is_empty() => Err(e),
-        _ => Ok(pcm),
+        Some(e) if pcm.as_ref().is_none_or(Vec::is_empty) => Err(e),
+        _ => Ok(()),
     }
 }
 
@@ -653,8 +694,8 @@ fn converter_main(
 #[allow(clippy::too_many_arguments)]
 fn append(
     converted: &[f32],
-    pcm: &mut Vec<f32>,
-    spool: &mut BufWriter<File>,
+    shared: &Shared,
+    spool: &mut impl Write,
     meter: &mut LevelMeter,
     on_event: &(dyn Fn(AudioEvent) + Send + Sync),
     tap: TapRef<'_>,
@@ -663,7 +704,16 @@ fn append(
     if converted.is_empty() {
         return;
     }
-    pcm.extend_from_slice(converted);
+    {
+        let mut captured = shared
+            .pcm
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(pcm) = captured.as_mut() else {
+            return;
+        };
+        pcm.extend_from_slice(converted);
+    }
     if let Some(tap) = tap {
         tap(converted);
     }
@@ -674,7 +724,14 @@ fn append(
     if let Err(e) = spool.write_all(&bytes) {
         first_error.get_or_insert(AudioError::Io(e.to_string()));
     }
-    meter.feed(converted, |level| on_event(AudioEvent::Level(level)));
+    if shared
+        .pcm
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
+    {
+        meter.feed(converted, |level| on_event(AudioEvent::Level(level)));
+    }
 }
 
 fn to_s16(sample: f32) -> i16 {
@@ -905,6 +962,75 @@ mod tests {
             std::env::temp_dir().join(format!("murmur-audio-test-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn converter_timeout_returns_snapshot_and_fences_late_appends() {
+        struct StalledWriter {
+            file: File,
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        }
+        impl Write for StalledWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.entered.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(3)).unwrap();
+                self.file.write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.file.flush()
+            }
+        }
+        let shared = Arc::new(Shared::new());
+        let (done_tx, done) = mpsc::channel();
+        let (release_tx, release) = mpsc::channel();
+        let (entered_tx, entered) = mpsc::channel();
+        let (late_tx, late) = mpsc::channel();
+        let worker_shared = shared.clone();
+        let path = temp_dir("converter-timeout").join("rec.pcm");
+        let mut spool = StalledWriter {
+            file: File::create(&path).unwrap(),
+            entered: entered_tx,
+            release,
+        };
+        let worker = thread::spawn(move || {
+            let mut meter = LevelMeter::new();
+            let mut error = None;
+            append(
+                &[0.25; 1600],
+                &worker_shared,
+                &mut spool,
+                &mut meter,
+                &|_| late_tx.send(()).unwrap(),
+                None,
+                &mut error,
+            );
+            append(
+                &[0.5; 1600],
+                &worker_shared,
+                &mut spool,
+                &mut meter,
+                &|_| late_tx.send(()).unwrap(),
+                Some(&|_| panic!("late tap")),
+                &mut error,
+            );
+            spool.flush().unwrap();
+            done_tx.send(Ok(())).unwrap();
+        });
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        let started = Instant::now();
+        let pcm = finish_converter(&shared, &done, Duration::from_millis(20)).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(pcm, vec![0.25; 1600]);
+        assert!(shared.pcm.lock().unwrap().is_none());
+        // Cleanup can unlink the old spool safely even if the detached write returns later.
+        std::fs::remove_file(&path).unwrap();
+        release_tx.send(()).unwrap();
+        done.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+        worker.join().unwrap();
+        assert!(late.try_recv().is_err());
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

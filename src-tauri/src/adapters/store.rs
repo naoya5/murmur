@@ -179,7 +179,11 @@ impl Store {
     }
 
     pub fn insert(&self, row: &TranscriptRow) -> Result<(), StoreError> {
-        self.conn().execute(
+        Self::insert_on(&self.conn(), row)
+    }
+
+    fn insert_on(conn: &Connection, row: &TranscriptRow) -> Result<(), StoreError> {
+        conn.execute(
             &format!("INSERT INTO transcripts ({COLUMNS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"),
             params![
                 row.id,
@@ -201,9 +205,12 @@ impl Store {
         Ok(())
     }
 
-    /// Turns a failed or recovered item into an ok one. Keeps `created_at`; clears `audio_path` and `error`.
-    pub fn complete_retry(&self, id: &str, row: &TranscriptRow) -> Result<(), StoreError> {
-        let changed = self.conn().execute(
+    fn complete_retry_on(
+        conn: &Connection,
+        id: &str,
+        row: &TranscriptRow,
+    ) -> Result<(), StoreError> {
+        let changed = conn.execute(
             "UPDATE transcripts SET status = 'ok', text = ?2, raw_text = ?3, language = ?4, duration_ms = ?5,
                  latin_words = ?6, cjk_chars = ?7, model_id = ?8, latency_ms = ?9, asr_ms = ?10,
                  audio_path = NULL, error = NULL
@@ -225,6 +232,50 @@ impl Store {
             return Err(StoreError::NotFound);
         }
         Ok(())
+    }
+
+    /// Commits a delivered transcript and its day totals together.
+    pub fn insert_success(&self, row: &TranscriptRow) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        Self::insert_on(&tx, row)?;
+        Self::add_row_totals(&tx, row)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Commits the retry and totals together, retaining the audio reference on failure.
+    pub fn complete_retry(&self, id: &str, row: &TranscriptRow) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        Self::complete_retry_on(&tx, id, row)?;
+        // The original date belongs to the persisted row, not to the retry request.
+        let created: i64 = tx.query_row(
+            "SELECT created_at FROM transcripts WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        let mut saved = row.clone();
+        saved.created_at_ms = created;
+        Self::add_row_totals(&tx, &saved)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn add_row_totals(conn: &Connection, row: &TranscriptRow) -> Result<(), StoreError> {
+        let language = row
+            .language
+            .ok_or(StoreError::BadValue("transcripts.language"))?;
+        Self::add_day_totals_on(
+            conn,
+            local_day(row.created_at_ms),
+            language,
+            Counts {
+                latin_words: row.latin_words,
+                cjk_chars: row.cjk_chars,
+            },
+            row.duration_ms,
+        )
     }
 
     pub fn set_error(&self, id: &str, error: &str) -> Result<(), StoreError> {
@@ -323,15 +374,26 @@ impl Store {
         Ok(audio_paths_where(&conn, "1 = 1", [])?.into_iter().collect())
     }
 
-    /// Adds one session to the totals of `day` and `language`.
-    pub fn add_day_totals(
+    /// Adds test fixtures without inserting a history row.
+    #[cfg(test)]
+    fn add_day_totals(
         &self,
         day: i32,
         language: Language,
         counts: Counts,
         speech_ms: u64,
     ) -> Result<(), StoreError> {
-        self.conn().execute(
+        Self::add_day_totals_on(&self.conn(), day, language, counts, speech_ms)
+    }
+
+    fn add_day_totals_on(
+        conn: &Connection,
+        day: i32,
+        language: Language,
+        counts: Counts,
+        speech_ms: u64,
+    ) -> Result<(), StoreError> {
+        conn.execute(
             "INSERT INTO daily_stats (day, language, sessions, latin_words, cjk_chars, speech_ms)
              VALUES (?1, ?2, 1, ?3, ?4, ?5)
              ON CONFLICT(day, language) DO UPDATE SET
@@ -554,6 +616,50 @@ mod tests {
             error: Some("boom".into()),
             ..row(id, created, "")
         }
+    }
+
+    #[test]
+    fn success_and_retry_commit_totals_once() {
+        let store = Store::open_in_memory().unwrap();
+        let saved = row("success", 1_700_000_000_000, "three whole words");
+        store.insert_success(&saved).unwrap();
+        assert!(store.insert_success(&saved).is_err());
+        store
+            .insert(&failed("retry", saved.created_at_ms, "/spool/retry.pcm"))
+            .unwrap();
+        let mut retried = saved.clone();
+        retried.created_at_ms += 86_400_000;
+        store.complete_retry("retry", &retried).unwrap();
+        assert!(matches!(
+            store.complete_retry("retry", &retried),
+            Err(StoreError::NotFound)
+        ));
+        let totals = store.day_totals().unwrap();
+        assert_eq!(totals.len(), 1, "retry uses the original date");
+        assert_eq!(totals[0].sessions, 2);
+        assert_eq!(totals[0].latin_words, saved.latin_words * 2);
+        assert_eq!(totals[0].speech_ms, saved.duration_ms * 2);
+        let back = store.get("retry").unwrap().unwrap();
+        assert_eq!(back.status, TranscriptStatus::Ok);
+        assert_eq!(back.audio_path, None);
+    }
+
+    #[test]
+    fn totals_failure_rolls_back_insert_and_retry() {
+        let store = Store::open_in_memory().unwrap();
+        let original = failed("retry", 1_700_000_000_000, "/spool/retry.pcm");
+        store.insert(&original).unwrap();
+        store.conn().execute_batch("CREATE TRIGGER reject_totals BEFORE INSERT ON daily_stats BEGIN SELECT RAISE(ABORT, 'injected totals failure'); END;").unwrap();
+        let saved = row("success", original.created_at_ms, "three whole words");
+        assert!(store.insert_success(&saved).is_err());
+        assert!(store.get("success").unwrap().is_none());
+        assert!(store.complete_retry("retry", &saved).is_err());
+        let back = store.get("retry").unwrap().unwrap();
+        assert_eq!(back.status, TranscriptStatus::Failed);
+        assert_eq!(back.audio_path, original.audio_path);
+        assert_eq!(back.error, original.error);
+        assert_eq!(back.text, original.text);
+        assert!(store.day_totals().unwrap().is_empty());
     }
 
     #[test]

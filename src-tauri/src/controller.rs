@@ -41,6 +41,8 @@ use crate::platform::macos::{self, Permission};
 const DELIVER_TIMEOUT: Duration = Duration::from_millis(1_500);
 /// Opening the microphone (PLAN 2.13).
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
+/// Covers a pending open (3.5 s), owner close (3 s), and converter close (3 s).
+const CAPTURE_READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// The microphone permission prompt waits for the user; give them time, but not forever.
 const PERMISSION_PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -520,7 +522,8 @@ impl Controller {
             // Wait for the recorder to finish (bounded: stopping is a flush and a join).
             let captured: Option<Captured> = {
                 let ready =
-                    tokio::time::timeout(OPEN_TIMEOUT, audio_rx.wait_for(Option::is_some)).await;
+                    tokio::time::timeout(CAPTURE_READY_TIMEOUT, audio_rx.wait_for(Option::is_some))
+                        .await;
                 match ready {
                     Ok(Ok(guard)) => guard.clone(),
                     _ => None,

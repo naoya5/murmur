@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use murmur_core::Language;
-use murmur_core::metrics::{self, Counts};
+use murmur_core::metrics;
 use murmur_core::session::FailureKind;
 use murmur_core::settings::HistoryRetention;
 use murmur_core::text::{self, FormatOptions};
@@ -15,7 +15,7 @@ use tauri::AppHandle;
 use tauri_specta::Event as _;
 
 use crate::adapters::audio;
-use crate::adapters::store::{self, Store, TranscriptRow, TranscriptStatus};
+use crate::adapters::store::{Store, TranscriptRow, TranscriptStatus};
 use crate::app::App;
 use crate::controller::HistoryChanged;
 use crate::inference::{InferenceError, TranscribeRequest};
@@ -87,13 +87,9 @@ pub fn save_success(app: AppHandle, store: Arc<Store>, record: Record, spool: Pa
             error: None,
         };
         // Keep the audio if the row cannot be written: the spool recovery then brings it back.
-        match store.insert(&row) {
+        match store.insert_success(&row) {
             Ok(()) => remove_quietly(&spool),
             Err(error) => tracing::error!(%error, "could not save a transcript"),
-        }
-        let day = store::local_day(created_at_ms);
-        if let Err(error) = store.add_day_totals(day, record.language, counts, record.duration_ms) {
-            tracing::error!(%error, "could not update day totals");
         }
         notify(&app);
     });
@@ -228,18 +224,6 @@ pub async fn retry(
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         store
             .complete_retry(&id, &saved)
-            .map_err(|e| e.to_string())?;
-        let day = store::local_day(saved.created_at_ms);
-        store
-            .add_day_totals(
-                day,
-                language,
-                Counts {
-                    latin_words: saved.latin_words,
-                    cjk_chars: saved.cjk_chars,
-                },
-                saved.duration_ms,
-            )
             .map_err(|e| e.to_string())?;
         remove_quietly(Path::new(&audio_path));
         Ok(())

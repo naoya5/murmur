@@ -13,6 +13,7 @@
 //! | Recording                  | HotkeyDown (toggle) / HotkeyUp (push-to-talk) / PillClicked / max timer / MicDisconnected | Transcribing; StopCapture, Transcribe, timeout timer |
 //! | Recording                  | Esc                            | CancelPending(from Recording); PauseCapture, 3 s timer |
 //! | Recording / CancelPending(Rec) | CaptureFailed              | Idle + notice; DropAudio, SetEscCapture(false)   |
+//! | Transcribing / CancelPending(Tx) | CaptureFailed            | Idle + notice; CancelTranscription, DropAudio, SetEscCapture(false) |
 //! | CancelPending(Rec)         | Esc / PillClicked              | Recording; ResumeCapture, max timer re-armed with the time left |
 //! | CancelPending(Rec)         | HotkeyDown                     | Transcribing (audio heard during the pause is dropped) |
 //! | CancelPending(Rec)         | HotkeyUp                       | ignored: releasing a push-to-talk key after Esc is not a decision; the countdown or a press decides |
@@ -574,6 +575,12 @@ impl Machine {
             } => self.on_cancel_pending(session, timer, deadline, paused, event, now, fx),
 
             State::Transcribing(tx) => match event {
+                Event::CaptureFailed { session, error } if session == tx.session => {
+                    fx.push(Effect::CancelTranscription { session });
+                    fx.push(Effect::SetEscCapture(false));
+                    fx.push(Effect::DropAudio { session });
+                    self.idle_with(Some(Notice::CaptureFailed { error }), fx)
+                }
                 Event::Transcribed { session, outcome } if session == tx.session => {
                     self.finish_transcription(session, outcome, fx)
                 }
@@ -671,6 +678,15 @@ impl Machine {
                 }
             }
             (Paused::Recording(_), Event::CaptureFailed { session: s, error }) if same(s) => {
+                fx.push(Effect::SetEscCapture(false));
+                fx.push(Effect::DropAudio { session });
+                self.idle_with(Some(Notice::CaptureFailed { error }), fx)
+            }
+
+            (Paused::Transcribing { .. }, Event::CaptureFailed { session: s, error })
+                if same(s) =>
+            {
+                fx.push(Effect::CancelTranscription { session });
                 fx.push(Effect::SetEscCapture(false));
                 fx.push(Effect::DropAudio { session });
                 self.idle_with(Some(Notice::CaptureFailed { error }), fx)
@@ -1496,6 +1512,41 @@ mod tests {
     }
 
     #[test]
+    fn capture_failure_after_stop_preserves_cause_without_saving_history() {
+        for paused in [false, true] {
+            let mut h = transcribing(0);
+            if paused {
+                h.step(Event::Esc);
+            }
+            let fx = h.step(Event::CaptureFailed {
+                session: S1,
+                error: CaptureError::PermissionDenied,
+            });
+            assert_eq!(
+                h.view(),
+                PillView::Notice {
+                    notice: Notice::CaptureFailed {
+                        error: CaptureError::PermissionDenied
+                    }
+                }
+            );
+            assert!(fx.contains(&Effect::CancelTranscription { session: S1 }));
+            assert!(fx.contains(&Effect::DropAudio { session: S1 }));
+            assert!(
+                !fx.iter()
+                    .any(|effect| matches!(effect, Effect::SaveFailure { .. }))
+            );
+            assert!(
+                h.step(transcribed(
+                    S1,
+                    TranscribeOutcome::Failed(FailureKind::Audio)
+                ))
+                .is_empty()
+            );
+        }
+    }
+
+    #[test]
     fn transcribing_ignores_hotkeys_mic_and_delivery() {
         let mut h = transcribing(5_000);
         for e in [
@@ -1503,10 +1554,6 @@ mod tests {
             PTT,
             Event::HotkeyUp,
             Event::MicDisconnected { session: S1 },
-            Event::CaptureFailed {
-                session: S1,
-                error: CaptureError::DeviceError,
-            },
             delivered(S1, DeliveryOutcome::Pasted),
         ] {
             assert!(h.step(e.clone()).is_empty(), "{e:?}");
@@ -1713,10 +1760,6 @@ mod tests {
             PTT,
             Event::HotkeyUp,
             Event::MicDisconnected { session: S1 },
-            Event::CaptureFailed {
-                session: S1,
-                error: CaptureError::DeviceError,
-            },
             delivered(S1, DeliveryOutcome::Pasted),
         ] {
             assert!(h.step(e.clone()).is_empty(), "{e:?}");
