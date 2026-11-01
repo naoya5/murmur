@@ -383,6 +383,8 @@ impl Controller {
         // S1: transcribe closed chunks while recording, when the model and the VAD are installed.
         // The dictionary is read here, once per recording, so every chunk uses the same words.
         let stream = self.services.model_specs(language).map(|(model, vad)| {
+            // Warm before S1 starts, overlapping the cold engine work with the user's speech.
+            self.services.inference().warm(model.clone(), vad.clone());
             let id = StreamId(session.0);
             let vocabulary = settings
                 .dictionary
@@ -426,7 +428,9 @@ impl Controller {
             },
         );
         // The model may still be loading; recording starts anyway (PLAN 2.9).
-        self.services.ensure_model_loaded(language);
+        if stream.is_none() {
+            self.services.ensure_model_loaded(language);
+        }
 
         let tx = self.tx.clone();
         let app = self.app.clone();

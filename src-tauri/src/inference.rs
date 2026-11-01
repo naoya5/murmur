@@ -16,6 +16,7 @@
 //! the offline path too.
 
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -121,6 +122,10 @@ impl StreamBuffer {
 type SharedStreamBuffer = Arc<Mutex<StreamBuffer>>;
 
 enum Job {
+    Warm {
+        model: ModelSpec,
+        vad: ModelSpec,
+    },
     Preload {
         model: ModelSpec,
         vad: ModelSpec,
@@ -154,6 +159,7 @@ enum Job {
 #[derive(Clone)]
 pub struct Inference {
     tx: std::sync::mpsc::Sender<Job>,
+    warm_pending: Arc<AtomicBool>,
     loaded: Arc<Mutex<Option<&'static str>>>,
     stream_buffer: Arc<Mutex<Option<(StreamId, SharedStreamBuffer)>>>,
 }
@@ -163,6 +169,8 @@ impl Inference {
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
         let loaded = Arc::new(Mutex::new(None));
         let worker_loaded = loaded.clone();
+        let warm_pending = Arc::new(AtomicBool::new(false));
+        let worker_warm_pending = warm_pending.clone();
         let spawned = thread::Builder::new()
             .name("inference".into())
             .spawn(move || {
@@ -173,6 +181,7 @@ impl Inference {
                     vad: None,
                     stream: None,
                     loaded: worker_loaded,
+                    warm_pending: worker_warm_pending,
                 };
                 loop {
                     let poll = if worker.stream.as_ref().is_some_and(|s| !s.dead) {
@@ -204,6 +213,7 @@ impl Inference {
         }
         Inference {
             tx,
+            warm_pending,
             loaded,
             stream_buffer: Arc::new(Mutex::new(None)),
         }
@@ -212,6 +222,21 @@ impl Inference {
     /// Loads the model and the VAD in the background (no-op if already loaded).
     pub fn preload(&self, model: ModelSpec, vad: ModelSpec) {
         let _ = self.tx.send(Job::Preload { model, vad });
+    }
+
+    /// Touches the resident model and GPU while recording starts, without waiting. Coalesces
+    /// queued and running warm-ups across handle clones; a later recording can warm again.
+    pub fn warm(&self, model: ModelSpec, vad: ModelSpec) {
+        if self
+            .warm_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        if self.tx.send(Job::Warm { model, vad }).is_err() {
+            self.warm_pending.store(false, Ordering::Release);
+        }
     }
 
     pub async fn transcribe(
@@ -330,11 +355,16 @@ struct Worker {
     vad: Option<LoadedVad>,
     stream: Option<Stream>,
     loaded: Arc<Mutex<Option<&'static str>>>,
+    warm_pending: Arc<AtomicBool>,
 }
 
 impl Worker {
     fn handle(&mut self, job: Job) {
         match job {
+            Job::Warm { model, vad } => {
+                self.warm(&model, &vad);
+                self.warm_pending.store(false, Ordering::Release);
+            }
             Job::Preload { model, vad } => {
                 if let Err(error) = self.ensure_vad(&vad) {
                     tracing::warn!(%error, "VAD preload failed");
@@ -372,6 +402,35 @@ impl Worker {
     fn set_loaded(&self, id: Option<&'static str>) {
         if let Ok(mut guard) = self.loaded.lock() {
             *guard = id;
+        }
+    }
+
+    fn warm(&mut self, model: &ModelSpec, vad: &ModelSpec) {
+        if let Err(error) = self.ensure_vad(vad) {
+            tracing::warn!(%error, "VAD warm-up load failed");
+        }
+        if let Err(error) = self.ensure_model(model) {
+            tracing::warn!(%error, model = model.entry.id, "model warm-up load failed");
+            return;
+        }
+        let Some(engine) = self.engine.as_mut() else {
+            return;
+        };
+        // Bypass VAD so silence reaches every encoder layer without touching S1's detector
+        // state. Half a second also exceeds FastConformer's 20 ms minimum input length.
+        let silence = [0.0; murmur_core::SAMPLE_RATE_HZ as usize / 2];
+        let opts = TranscribeOptions {
+            language: model
+                .entry
+                .languages
+                .first()
+                .copied()
+                .unwrap_or(Language::Ja),
+            vocabulary: Vec::new(),
+            cancel: CancelToken::new(),
+        };
+        if let Err(error) = engine.engine.transcribe(&silence, &opts) {
+            tracing::warn!(%error, model = model.entry.id, "engine warm-up failed");
         }
     }
 
@@ -786,6 +845,9 @@ mod tests {
     static LOADS: AtomicUsize = AtomicUsize::new(0);
     static UNLOADS: AtomicUsize = AtomicUsize::new(0);
     static CALLS: AtomicUsize = AtomicUsize::new(0);
+    static VAD_LOADS: AtomicUsize = AtomicUsize::new(0);
+    static SILENT_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static SILENT_SAMPLES: AtomicUsize = AtomicUsize::new(0);
     type EngineGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
     static ENGINE_GATE: Mutex<Option<EngineGate>> = Mutex::new(None);
     /// The counters are global, so every test of this module runs alone.
@@ -831,6 +893,17 @@ mod tests {
                 release.recv_timeout(Duration::from_secs(10)).unwrap();
             }
             CALLS.fetch_add(1, Ordering::SeqCst);
+            if !pcm.is_empty() && pcm.iter().all(|sample| *sample == 0.0) {
+                SILENT_CALLS.fetch_add(1, Ordering::SeqCst);
+                SILENT_SAMPLES.store(pcm.len(), Ordering::SeqCst);
+                assert!(opts.vocabulary.is_empty());
+                assert!(
+                    catalog::find(self.loaded.unwrap())
+                        .unwrap()
+                        .languages
+                        .contains(&opts.language)
+                );
+            }
             if opts.cancel.is_cancelled() {
                 return Err(EngineError::Cancelled);
             }
@@ -920,6 +993,7 @@ mod tests {
     }
 
     fn vads(_: &ModelSpec) -> Result<Box<dyn VoiceDetector>, EngineError> {
+        VAD_LOADS.fetch_add(1, Ordering::SeqCst);
         Ok(Box::new(FakeVad::default()))
     }
 
@@ -977,6 +1051,146 @@ mod tests {
             }
         }
         assert!(inference.wait_idle(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn warm_loads_model_and_vad_and_recognizes_short_silence() {
+        let _serial = serial();
+        for model in [catalog::DEFAULT_JA_MODEL, catalog::DEFAULT_EN_MODEL] {
+            let inference = Inference::spawn(engines, vads);
+            let loads = LOADS.load(Ordering::SeqCst);
+            let vads = VAD_LOADS.load(Ordering::SeqCst);
+            let calls = CALLS.load(Ordering::SeqCst);
+            let silent = SILENT_CALLS.load(Ordering::SeqCst);
+            inference.warm(spec(model), spec(catalog::VAD_MODEL));
+            assert!(inference.wait_idle(Duration::from_secs(10)));
+            assert_eq!(inference.loaded_model(), Some(model));
+            assert_eq!(LOADS.load(Ordering::SeqCst) - loads, 1);
+            assert_eq!(VAD_LOADS.load(Ordering::SeqCst) - vads, 1);
+            assert_eq!(CALLS.load(Ordering::SeqCst) - calls, 1);
+            assert_eq!(SILENT_CALLS.load(Ordering::SeqCst) - silent, 1);
+            assert_eq!(SILENT_SAMPLES.load(Ordering::SeqCst), 8_000);
+            // A later recording warms the resident model without reloading either model.
+            inference.warm(spec(model), spec(catalog::VAD_MODEL));
+            assert!(inference.wait_idle(Duration::from_secs(10)));
+            assert_eq!(LOADS.load(Ordering::SeqCst) - loads, 1);
+            assert_eq!(VAD_LOADS.load(Ordering::SeqCst) - vads, 1);
+            assert_eq!(CALLS.load(Ordering::SeqCst) - calls, 2);
+            inference.shutdown(Duration::from_secs(10));
+        }
+    }
+
+    #[test]
+    fn queued_warm_calls_coalesce_across_clones() {
+        let _serial = serial();
+        let inference = Inference::spawn(engines, vads);
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release_tx, release) = std::sync::mpsc::channel();
+        *ENGINE_GATE.lock().unwrap() = Some((entered_tx, release));
+        let (reply, mut done) = oneshot::channel();
+        inference
+            .tx
+            .send(Job::Transcribe {
+                req: request(vec![0.5; 16_000], catalog::DEFAULT_JA_MODEL),
+                reply,
+            })
+            .unwrap();
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        let calls = CALLS.load(Ordering::SeqCst);
+        for _ in 0..20 {
+            inference
+                .clone()
+                .warm(spec(catalog::DEFAULT_JA_MODEL), spec(catalog::VAD_MODEL));
+        }
+        release_tx.send(()).unwrap();
+        assert!(inference.wait_idle(Duration::from_secs(10)));
+        assert_eq!(CALLS.load(Ordering::SeqCst) - calls, 2);
+        assert!(done.try_recv().unwrap().is_ok());
+        inference.shutdown(Duration::from_secs(10));
+    }
+
+    #[test]
+    fn running_warm_coalesces_and_stop_queued_behind_it_gets_only_real_text() {
+        let _serial = serial();
+        let inference = Inference::spawn(engines, vads);
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release_tx, release) = std::sync::mpsc::channel();
+        *ENGINE_GATE.lock().unwrap() = Some((entered_tx, release));
+        let calls = CALLS.load(Ordering::SeqCst);
+        inference.warm(spec(catalog::DEFAULT_JA_MODEL), spec(catalog::VAD_MODEL));
+        // warm returned while recognition is still blocked inside the engine.
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        for _ in 0..20 {
+            inference.warm(spec(catalog::DEFAULT_JA_MODEL), spec(catalog::VAD_MODEL));
+        }
+        let out = rt().block_on(async {
+            // Poll the public transcription API to queue stop before releasing warm-up.
+            let stop = inference.transcribe(request(vec![0.5; 32_000], catalog::DEFAULT_JA_MODEL));
+            tokio::pin!(stop);
+            tokio::select! {
+                biased;
+                _ = &mut stop => panic!("stop must wait for warm-up"),
+                _ = std::future::ready(()) => {}
+            }
+            release_tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(10), stop)
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(out.raw.unwrap().text, "w32000");
+        assert_eq!(CALLS.load(Ordering::SeqCst) - calls, 2);
+        inference.shutdown(Duration::from_secs(10));
+    }
+
+    #[test]
+    fn warm_and_stream_start_in_either_order_preserve_offline_text_and_work_ahead() {
+        let _serial = serial();
+        let inference = Inference::spawn(engines, vads);
+        let rt = rt();
+        let pcm = long_pcm();
+        let offline = rt
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    inference.transcribe(request(pcm.clone(), catalog::DEFAULT_JA_MODEL)),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+            })
+            .raw
+            .unwrap()
+            .text;
+        for warm_first in [true, false] {
+            let id = StreamId(80);
+            let calls = CALLS.load(Ordering::SeqCst);
+            if warm_first {
+                inference.warm(spec(catalog::DEFAULT_JA_MODEL), spec(catalog::VAD_MODEL));
+            }
+            inference.stream_start(
+                id,
+                stream_request(catalog::DEFAULT_JA_MODEL, CancelToken::new()),
+            );
+            if !warm_first {
+                inference.warm(spec(catalog::DEFAULT_JA_MODEL), spec(catalog::VAD_MODEL));
+            }
+            push_all(&inference, id, &pcm);
+            // Warm-up plus two streamed chunks, proving S1 did not fall back to offline.
+            assert_eq!(CALLS.load(Ordering::SeqCst) - calls, 3);
+            let out = rt.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    inference.stream_finish(id, request(pcm.clone(), catalog::DEFAULT_JA_MODEL)),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+            });
+            assert_eq!(out.raw.unwrap().text, offline);
+            assert_eq!(CALLS.load(Ordering::SeqCst) - calls, 4);
+        }
+        inference.shutdown(Duration::from_secs(10));
     }
 
     #[test]
