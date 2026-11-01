@@ -3,7 +3,6 @@
 //! The pill must never take focus from the app the user is typing in: it is ordered front with
 //! `orderFrontRegardless` and never made key. AppKit calls run on the main thread (`run_on_main_thread`).
 //! The app is an `Accessory` (no Dock icon, no Cmd+Tab entry) except while the main window is open.
-#![allow(dead_code)] // Wired by T2-8 (controller).
 
 use tauri::window::{Color, Effect, EffectState, EffectsBuilder};
 use tauri::{ActivationPolicy, AppHandle, Manager, WindowEvent};

@@ -1,5 +1,12 @@
 import { ChevronLeft, ChevronRight, Clock, Copy, RotateCcw, Search, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Badge, LangBadge } from "../components/Badge";
+import { Button } from "../components/Button";
+import { EmptyState } from "../components/EmptyState";
+import { Card } from "../components/Glass";
+import { ConfirmSheet } from "../components/Sheet";
+import { TextField } from "../components/TextField";
+import { useToast } from "../components/Toast";
 import { useT } from "../i18n";
 import {
   commands,
@@ -10,13 +17,6 @@ import {
   useEvent,
 } from "../ipc";
 import { formatWhen } from "../lib/format";
-import { Badge, LangBadge } from "../ui/Badge";
-import { Button } from "../ui/Button";
-import { EmptyState } from "../ui/EmptyState";
-import { Card } from "../ui/Glass";
-import { ConfirmSheet } from "../ui/Sheet";
-import { TextField } from "../ui/TextField";
-import { useToast } from "../ui/Toast";
 import { clampOffset, hasNewer, hasOlder, PAGE_SIZE, pageRange } from "./historyPaging";
 
 const FAILURES: FailureKind[] = [

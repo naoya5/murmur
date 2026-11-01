@@ -11,7 +11,6 @@ import {
 } from "../lib/hotkey";
 
 type Props = {
-  /** The current accelerator, or null when none is set. */
   value: string | null;
   /** Called with the new accelerator, or null when the user cleared it (only if `clearable`). */
   onChange: (accelerator: string | null) => void;

@@ -1,6 +1,6 @@
 //! The inference thread: one OS thread that owns the speech engine, the loaded model and the VAD.
 //!
-//! PLAN 2.6: one inference thread; jobs arrive on a channel; one request at a time. The model stays
+//! One inference thread: jobs arrive on a channel; one request at a time. The model stays
 //! loaded between recordings (speed is the first principle). This file depends only on the core
 //! ports, so any engine adapter plugs in through the two factory functions given to `spawn`.
 //!
@@ -453,7 +453,7 @@ impl Worker {
         if self.engine.as_ref().is_some_and(|e| e.id == spec.entry.id) {
             return Ok(());
         }
-        // Free the old model before loading the new one (memory, PLAN 2.7).
+        // Free the old model before loading the new one (memory).
         if let Some(mut old) = self.engine.take() {
             old.engine.unload();
         }

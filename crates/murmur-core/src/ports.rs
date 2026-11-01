@@ -108,7 +108,7 @@ pub enum EngineError {
     Other(String),
 }
 
-/// A speech recognition engine. One instance lives on the inference thread (PLAN 2.6).
+/// A speech recognition engine. One instance lives on the inference thread.
 pub trait SpeechEngine: Send {
     fn capabilities(&self) -> EngineCapabilities;
     /// The catalog id of the loaded model, if any.
@@ -126,7 +126,7 @@ pub trait SpeechEngine: Send {
 
 /// Voice activity detection over a whole buffer, and over audio that arrives while recording.
 ///
-/// The streaming methods (S1) feed the audio a piece at a time. A region is returned once it is
+/// The streaming methods feed the audio a piece at a time. A region is returned once it is
 /// final and never changes; after `stream_finish` the regions returned over the whole stream are
 /// exactly what `regions` returns for the same audio in one piece. One stream at a time: a new
 /// `stream_start` replaces the old one. Offsets are samples at `SAMPLE_RATE_HZ` from the first

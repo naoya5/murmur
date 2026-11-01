@@ -16,7 +16,6 @@ export function Badge({ tone = "default", children, title }: Props) {
   );
 }
 
-/** "あ" for Japanese, "A" for English. */
 export function LangBadge({ language, title }: { language: Language; title: string }) {
   return (
     <span className="badge badge--lang" title={title} role="img" aria-label={title}>

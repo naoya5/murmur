@@ -4,7 +4,6 @@ import { useUpdates } from "../app/updates";
 import { useT } from "../i18n";
 import { Button } from "./Button";
 
-/** A quiet strip at the top of the content column while a newer version waits. */
 export function UpdateBanner() {
   const t = useT();
   const { state, install, dismissed, dismiss } = useUpdates();

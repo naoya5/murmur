@@ -1,16 +1,16 @@
 import { BookA, Pencil, Plus, Trash2, X } from "lucide-react";
 import { useState } from "react";
 import { useSettings } from "../app/settings";
+import { Badge } from "../components/Badge";
+import { Button } from "../components/Button";
+import { EmptyState } from "../components/EmptyState";
+import { Card } from "../components/Glass";
+import { Segmented } from "../components/Segmented";
+import { ConfirmSheet } from "../components/Sheet";
+import { TextField } from "../components/TextField";
+import { useToast } from "../components/Toast";
 import { useT } from "../i18n";
 import type { DictionaryEntry, DictionaryScope } from "../ipc";
-import { Badge } from "../ui/Badge";
-import { Button } from "../ui/Button";
-import { EmptyState } from "../ui/EmptyState";
-import { Card } from "../ui/Glass";
-import { Segmented } from "../ui/Segmented";
-import { ConfirmSheet } from "../ui/Sheet";
-import { TextField } from "../ui/TextField";
-import { useToast } from "../ui/Toast";
 
 function newId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {

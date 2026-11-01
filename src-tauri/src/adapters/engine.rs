@@ -36,7 +36,7 @@ pub const ENGINE_NAME: &str = "speech.cpp 0.10.0";
 const MIN_SAMPLES: usize = SAMPLE_RATE_HZ as usize / 50;
 
 /// Silero VAD options for the whole-recording detection: the OpenAI `server_vad` values that
-/// the speech.cpp CLI uses for `--vad`, which gave sentence-sized regions in the Phase 0 probe.
+/// the speech.cpp CLI uses for `--vad`, which gave sentence-sized regions.
 const VAD_THRESHOLD: f64 = 0.5;
 const VAD_SPEECH_PAD_MS: i64 = 300;
 const VAD_MIN_SILENCE_MS: i64 = 500;
@@ -260,7 +260,7 @@ fn prompt_text(vocabulary: &[DictionaryEntry], language: Language) -> String {
 // ---------------------------------------------------------------------------------------------
 // Voice activity detection
 
-/// Silero VAD over a whole recording, or over audio that arrives while recording (S1).
+/// Silero VAD over a whole recording, or over audio that arrives while recording.
 pub struct SileroVad {
     /// Declared before `model`: Rust drops fields in order, and the C API frees a detection
     /// before its model.

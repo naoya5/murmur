@@ -34,7 +34,7 @@ use crate::controller::{ControllerHandle, Msg};
 use crate::inference::Inference;
 use crate::tray::{TrayAction, TrayModel};
 
-/// How often the idle check runs for the "unload model after N minutes" setting (S5).
+/// How often the idle check runs for the "unload model after N minutes" setting.
 const IDLE_CHECK: Duration = Duration::from_secs(60);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -81,7 +81,7 @@ pub fn run() {
     };
 
     app.run(|handle, event| match event {
-        // Closing the main window hides it; Murmur keeps running in the menu bar (M14).
+        // Closing the main window hides it; Murmur keeps running in the menu bar.
         RunEvent::ExitRequested {
             code: None, api, ..
         } => api.prevent_exit(),
@@ -167,7 +167,6 @@ fn hotkey_callback(
     })
 }
 
-/// The tray menu as it should look now.
 pub fn tray_model(services: &App) -> TrayModel {
     let settings = services.settings();
     let recent = services
@@ -272,7 +271,7 @@ fn copy_text_now(text: &str) {
     }
 }
 
-/// S5: frees the model after the configured idle time. Off by default (speed first).
+/// Frees the model after the configured idle time. Off by default (speed first).
 fn spawn_idle_unload(services: Arc<App>) {
     tauri::async_runtime::spawn(async move {
         let mut idle_minutes = 0u32;

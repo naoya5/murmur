@@ -377,7 +377,7 @@ pub fn open_privacy_pane(pane: PrivacyPane) {
     macos::open_privacy_pane(pane);
 }
 
-/// While the hotkey recorder listens, the current hotkeys must not fire (PLAN 2.9).
+/// While the hotkey recorder listens, the current hotkeys must not fire.
 #[tauri::command]
 #[specta::specta]
 pub fn suspend_hotkeys(services: Services<'_>) -> Result<(), IpcError> {

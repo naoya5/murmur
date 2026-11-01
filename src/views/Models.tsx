@@ -1,15 +1,15 @@
 import { Download, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { useSettings } from "../app/settings";
+import { Badge } from "../components/Badge";
+import { Button } from "../components/Button";
+import { Card, Group } from "../components/Glass";
+import { ProgressBar } from "../components/ProgressBar";
+import { ConfirmSheet } from "../components/Sheet";
+import { useToast } from "../components/Toast";
 import { languageName, type Strings, useT } from "../i18n";
 import { commands, type Language, type ModelInfo, useEvent } from "../ipc";
 import { formatBytes, formatPercent } from "../lib/format";
-import { Badge } from "../ui/Badge";
-import { Button } from "../ui/Button";
-import { Card, Group } from "../ui/Glass";
-import { ProgressBar } from "../ui/ProgressBar";
-import { ConfirmSheet } from "../ui/Sheet";
-import { useToast } from "../ui/Toast";
 
 export function downloadErrorText(message: string, t: Strings): string {
   const m = message.toLowerCase();

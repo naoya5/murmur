@@ -11,12 +11,10 @@ type Props<V extends string> = {
   idBase: string;
 };
 
-/** The id of the panel that a `Tabs` option controls, for `role="tabpanel"`. */
 export function tabPanelId(base: string, value: string): string {
   return `${base}-panel-${value}`;
 }
 
-/** The id of the tab button itself, for `aria-labelledby` on the panel. */
 export function tabId(base: string, value: string): string {
   return `${base}-tab-${value}`;
 }
@@ -101,7 +99,6 @@ export function Tabs<V extends string>({ value, options, onChange, label, idBase
   );
 }
 
-/** A stable id base for one `Tabs` and its panels. */
 export function useTabsId(): string {
   return useId().replace(/:/g, "");
 }

@@ -1,4 +1,4 @@
-//! Adapter: audio. See docs/tickets/phase-2-adapters.md for the public API.
+//! Adapter: audio.
 //!
 //! Microphone -> 16 kHz mono f32 PCM, level meter and a crash-safe spool file.
 //!
@@ -10,7 +10,6 @@
 //!
 //! Debug builds accept the device name `wav:<path>`: the owner thread then feeds that WAV file into the same
 //! ring buffer in real time (then silence) instead of opening a microphone.
-#![cfg_attr(not(test), allow(dead_code))] // Wired by T2-8 (controller).
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
@@ -31,7 +30,7 @@ use serde::Serialize;
 
 /// Output sample rate of every recording (what the speech engine expects).
 const TARGET_RATE: u32 = 16_000;
-/// Longest time `Recorder::start` may take (PLAN 2.13).
+/// Longest time `Recorder::start` may take.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 /// Longest time `Recorder::stop` waits for the owner thread to drop the stream.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);

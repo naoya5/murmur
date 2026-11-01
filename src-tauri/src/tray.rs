@@ -3,7 +3,6 @@
 //! `create` builds the tray once; `update` rebuilds the menu from a `TrayModel` (recording state, language,
 //! recent items). Menu clicks become `TrayAction`s for the controller. Strings are kept here, English and
 //! Japanese, short. Previews are transcript text: they are shown, never logged (G7).
-#![allow(dead_code)] // Wired by T2-8 (controller).
 
 use std::sync::Arc;
 
@@ -59,7 +58,6 @@ const ID_RECENT_PREFIX: &str = "recent:";
 const ID_UPDATES: &str = "updates";
 const ID_QUIT: &str = "quit";
 
-/// Menu item id -> action.
 fn action_from_id(id: &str) -> Option<TrayAction> {
     match id {
         ID_OPEN => Some(TrayAction::OpenMain),

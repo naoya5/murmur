@@ -4,7 +4,6 @@
 //! `Range` request from the part size, checks SHA-256 over the whole file, then renames it to `<file>` and
 //! writes `<file>.verified` (size, sha256, mtime). `path_if_installed` trusts the marker only while the file
 //! still has that size and mtime, so a cheap `stat` replaces hashing 600 MB at every start.
-#![cfg_attr(not(test), allow(dead_code))] // Wired by T3-3 / T2-8 (controller).
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -165,7 +164,6 @@ impl ModelStore {
         same.then_some(path)
     }
 
-    /// Catalog lookup plus `path_if_installed`.
     pub fn spec(&self, id: &str) -> Option<ModelSpec> {
         let entry = catalog::find(id)?;
         let path = self.path_if_installed(entry)?;

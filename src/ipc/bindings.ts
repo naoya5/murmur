@@ -108,7 +108,7 @@ async openPrivacyPane(pane: PrivacyPane) : Promise<void> {
     await TAURI_INVOKE("open_privacy_pane", { pane });
 },
 /**
- * While the hotkey recorder listens, the current hotkeys must not fire (PLAN 2.9).
+ * While the hotkey recorder listens, the current hotkeys must not fire.
  */
 async suspendHotkeys() : Promise<Result<null, IpcError>> {
     try {
@@ -290,7 +290,7 @@ export type DeliveryOutcome = { kind: "pasted" } | { kind: "copied"; reason: Cop
  */
 { kind: "unconfirmed" }
 /**
- * A custom vocabulary entry: how to write a term, and how it sounds (M11).
+ * A custom vocabulary entry: how to write a term, and how it sounds.
  */
 export type DictionaryEntry = { 
 /**
@@ -435,7 +435,7 @@ export type RecordMode =
  */
 "toggle" | 
 /**
- * Record while the hotkey is held (S2).
+ * Record while the hotkey is held.
  */
 "push_to_talk"
 export type RetryError = { kind: "not_found" } | { kind: "audio_missing" } | { kind: "model_missing" } | { kind: "no_speech" } | { kind: "failed"; message: string }
@@ -453,15 +453,15 @@ hotkey: string; record_mode: RecordMode;
  */
 microphone: string | null; language: Language; models: ModelChoice; auto_paste: boolean; restore_clipboard: boolean; remove_fillers: boolean; add_final_punctuation: boolean; dictionary: DictionaryEntry[]; typing_wpm_en: number; typing_cpm_ja: number; history_retention: HistoryRetention; launch_at_login: boolean; auto_check_updates: boolean; ui_language: UiLanguage; 
 /**
- * Start and stop sounds (S4).
+ * Start and stop sounds.
  */
 sounds: boolean; 
 /**
- * Unload the model after this many idle minutes. `None` keeps it loaded (S5).
+ * Unload the model after this many idle minutes. `None` keeps it loaded.
  */
 unload_model_after_min: number | null; 
 /**
- * Optional second hotkey that records in the other language (S7).
+ * Optional second hotkey that records in the other language.
  */
 alternate_language_hotkey: string | null; onboarding_completed: boolean }
 /**

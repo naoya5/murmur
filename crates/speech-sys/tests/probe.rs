@@ -1,4 +1,4 @@
-//! Phase 0 probe of speech.cpp through the raw bindings.
+//! Probe of speech.cpp through the raw bindings.
 //!
 //! `cargo test` runs the version test alone; the model tests are `#[ignore]` and need the models
 //! and the WAVs:

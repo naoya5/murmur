@@ -1,6 +1,4 @@
-// Hotkey combos: keyboard event -> Tauri accelerator string -> display symbols.
-// The accelerator shape matches what the Rust side expects: "Alt+Space", "Cmd+Shift+D", "F5".
-// Pure functions; the KeyRecorder component wires them to the DOM.
+// Accelerators use the shape the Rust side registers: "Alt+Space", "Cmd+Shift+D", "F5".
 
 export type Combo = {
   ctrl: boolean;

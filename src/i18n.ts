@@ -2,8 +2,8 @@
 // What: every string the UI shows, in English and Japanese, keyed by screen.
 // Why: one table keeps the two languages complete and lets `settings.ui_language` switch the
 //      whole product at once; views never embed literal copy.
-// Where: `useT()` from `src/i18n.ts` in every component; `I18nProvider` in `src/App.tsx`
-//        and `src/pill/Pill.tsx` picks the language from the settings.
+// Where: `useT()` in every component; `I18nContext` is provided by `src/App.tsx` and
+//        `src/pill/Pill.tsx`, which pick the language from the settings.
 
 import { createContext, useContext } from "react";
 import type { CaptureError, CopyReason, FailureKind, Language, UiLanguage } from "./ipc";

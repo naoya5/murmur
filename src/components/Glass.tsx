@@ -1,4 +1,3 @@
-// Glass surfaces: a card, a grouped list, and the rows inside it.
 import type { HTMLAttributes, ReactNode } from "react";
 
 type CardProps = HTMLAttributes<HTMLDivElement> & { tight?: boolean };
@@ -14,7 +13,6 @@ export function Card({ tight, className, children, ...rest }: CardProps) {
 
 type GroupProps = { title?: string; children: ReactNode; id?: string };
 
-/** A titled group of rows, as in System Settings. */
 export function Group({ title, children, id }: GroupProps) {
   return (
     <section className="settings__section" id={id}>
@@ -28,7 +26,6 @@ type RowProps = {
   label: ReactNode;
   hint?: ReactNode;
   error?: string | null;
-  /** Control on the right. */
   children?: ReactNode;
   /** Stack the control under the label (for wide controls). */
   stack?: boolean;

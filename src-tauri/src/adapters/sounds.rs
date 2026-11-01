@@ -2,7 +2,6 @@
 //!
 //! `play` never blocks and never fails loudly: the work is queued on the main thread (NSSound is an AppKit
 //! class) and every problem, such as a missing sound, is ignored. The caller checks the `sounds` setting.
-#![allow(dead_code)] // Wired by the controller.
 
 use std::ffi::c_void;
 

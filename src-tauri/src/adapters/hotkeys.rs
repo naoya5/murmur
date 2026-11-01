@@ -3,7 +3,6 @@
 //! Registers the main hotkey, an optional alternate hotkey and plain Esc. Press and release are
 //! reported separately so push-to-talk can work. The plugin itself must be added to the Tauri
 //! builder in `lib.rs`.
-#![allow(dead_code)] // Wired by T2-8 (controller); remove then.
 
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};

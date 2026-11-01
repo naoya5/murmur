@@ -2,7 +2,6 @@
 //!
 //! Guardrail G8: this file holds the ONE function per permission. The controller and the first-run
 //! guide both call these functions, right before the permission is needed.
-#![allow(dead_code)] // Wired by T2-8 (controller); remove then.
 
 use std::ffi::c_void;
 use std::sync::mpsc;

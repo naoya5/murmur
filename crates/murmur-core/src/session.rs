@@ -29,7 +29,7 @@
 //! | Delivering                 | Delivered / delivery timer     | Idle + notice; SaveSuccess (after the paste, G9) |
 //! | Idle with notice           | notice timer                   | Idle (pill hides)                                |
 //! | Idle with notice           | HotkeyDown                     | Recording (the notice is replaced by the pill)   |
-//! | Transcribing / Delivering  | HotkeyDown / HotkeyUp          | ignored (PLAN 2.4)                               |
+//! | Transcribing / Delivering  | HotkeyDown / HotkeyUp          | ignored                                          |
 //!
 //! Every other (state, event) pair is ignored. In push-to-talk, `HotkeyDown` while recording is
 //! key repeat and is ignored; after a resume with the key already up, press and release stops. A result or timer that carries an id other than
@@ -42,16 +42,15 @@ use specta::Type;
 use crate::Millis;
 use crate::settings::RecordMode;
 
-/// How long the cancel countdown lasts.
 pub const CANCEL_WINDOW_MS: Millis = 3_000;
 /// The longest recording. At this length the recording stops and is transcribed.
 pub const MAX_RECORDING_MS: Millis = 10 * 60 * 1_000;
-/// Transcription timeout = base + factor x recorded length (PLAN 2.13).
+/// Transcription timeout = base + factor x recorded length.
 pub const TRANSCRIBE_TIMEOUT_BASE_MS: Millis = 15_000;
 pub const TRANSCRIBE_TIMEOUT_PER_RECORDED_MS: f64 = 0.5;
 /// Safety net if the output adapter never reports back (its own paste timeout is 1 s).
 pub const DELIVERY_TIMEOUT_MS: Millis = 2_500;
-/// Extra budget when the model must be loaded before transcribing (PLAN 2.13: model load 60 s).
+/// Extra budget when the model must be loaded before transcribing (model load 60 s).
 pub const MODEL_LOAD_TIMEOUT_MS: Millis = 60_000;
 /// How long the pill shows a result before it hides.
 pub const NOTICE_OK_MS: Millis = 800;
@@ -1995,7 +1994,7 @@ mod tests {
         assert!(matches!(h.state(), State::Recording(_)));
     }
 
-    // --- full scenarios from IDEATION 5.1 ---
+    // --- full scenarios ---
 
     #[test]
     fn happy_path_toggle() {

@@ -1,4 +1,3 @@
-// Formatting helpers shared by the views. Pure functions, locale aware.
 import type { Locale, Strings } from "../i18n";
 
 export type DurationPart = { value: string; unit: string };

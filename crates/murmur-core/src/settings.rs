@@ -24,7 +24,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub enum RecordMode {
     /// Press to start, press again to stop.
     Toggle,
-    /// Record while the hotkey is held (S2).
+    /// Record while the hotkey is held.
     PushToTalk,
 }
 
@@ -56,7 +56,7 @@ impl DictionaryScope {
     }
 }
 
-/// A custom vocabulary entry: how to write a term, and how it sounds (M11).
+/// A custom vocabulary entry: how to write a term, and how it sounds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct DictionaryEntry {
     /// Stable id (UUID string) so the UI can edit entries in place.
@@ -115,11 +115,11 @@ pub struct Settings {
     pub launch_at_login: bool,
     pub auto_check_updates: bool,
     pub ui_language: UiLanguage,
-    /// Start and stop sounds (S4).
+    /// Start and stop sounds.
     pub sounds: bool,
-    /// Unload the model after this many idle minutes. `None` keeps it loaded (S5).
+    /// Unload the model after this many idle minutes. `None` keeps it loaded.
     pub unload_model_after_min: Option<u32>,
-    /// Optional second hotkey that records in the other language (S7).
+    /// Optional second hotkey that records in the other language.
     pub alternate_language_hotkey: Option<String>,
     pub onboarding_completed: bool,
 }

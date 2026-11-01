@@ -2,7 +2,6 @@
 //!
 //! Guardrails: the accessibility and secure-input checks come from `platform::macos` (G8). The
 //! transcript text is never logged (G7). Nothing here panics (G6).
-#![allow(dead_code)] // Wired by T2-8 (controller); remove then.
 
 use std::sync::mpsc;
 use std::time::Duration;
@@ -11,7 +10,7 @@ use murmur_core::session::{CopyReason, DeliveryOutcome};
 
 use crate::platform::macos;
 
-/// Upper bound for the whole `deliver` call (PLAN 2.13).
+/// Upper bound for the whole `deliver` call.
 const DELIVER_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long after the paste the old clipboard text comes back.
 const RESTORE_DELAY: Duration = Duration::from_millis(400);
@@ -32,7 +31,6 @@ pub enum OutputError {
     Paste,
 }
 
-/// Put `text` on the clipboard.
 pub fn copy_text(text: &str) -> Result<(), OutputError> {
     let mut clipboard =
         arboard::Clipboard::new().map_err(|e| OutputError::Clipboard(e.to_string()))?;

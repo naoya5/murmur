@@ -20,7 +20,7 @@ Read in this order. Each step names where to go next.
    - `adapters/output.rs`: clipboard and Cmd+V, with secure-input and accessibility checks.
    - `adapters/store.rs`: SQLite history and per-day totals, after delivery.
 6. `ipc.rs`: every command and event; generates `src/ipc/bindings.ts`.
-7. `src/pill/Pill.tsx` and `src/views/*`: the two windows.
+7. `src/pill/Pill.tsx` and `src/views/*`: the two windows, built from the shared parts in `src/components/*`.
 
 ## Layers and dependency direction
 

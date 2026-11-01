@@ -1,16 +1,16 @@
 import { Check, Download, Keyboard, Mic, MousePointerClick } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { useSettings } from "../app/settings";
+import { Button } from "../components/Button";
+import { Card } from "../components/Glass";
+import { Kbd } from "../components/KeyRecorder";
+import { ProgressBar } from "../components/ProgressBar";
+import { Segmented } from "../components/Segmented";
+import { TextArea } from "../components/TextField";
 import { languageName, useT } from "../i18n";
 import { commands, type Language, type ModelInfo, type Permissions, useEvent } from "../ipc";
 import { formatBytes, formatPercent } from "../lib/format";
 import { displayAccelerator } from "../lib/hotkey";
-import { Button } from "../ui/Button";
-import { Card } from "../ui/Glass";
-import { Kbd } from "../ui/KeyRecorder";
-import { ProgressBar } from "../ui/ProgressBar";
-import { Segmented } from "../ui/Segmented";
-import { TextArea } from "../ui/TextField";
 import { downloadErrorText } from "./Models";
 
 const VAD_ID = "silero-vad-v6.2";

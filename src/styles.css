@@ -11,7 +11,7 @@
          light. Only the content panel and modal sheets use a backdrop blur (the panel to
          frost what lies under it, a sheet to blur the page); cards stay plain translucent
          fills, because nested backdrop blurs repaint on every scroll.
-   Where: src/ui/* and src/views/* use the classes; src/pill/Pill.tsx uses the pill classes. */
+   Where: src/components/* and src/views/* use the classes; src/pill/Pill.tsx uses the pill classes. */
 
 :root {
   color-scheme: dark;
@@ -359,10 +359,6 @@ button {
   color: var(--icon-color);
   filter: var(--icon-glow);
   transition: color var(--dur-fast) var(--ease);
-}
-
-.sidebar__spacer {
-  flex: 1;
 }
 
 /* The content panel floats on the scene, inset from the window edges, with a lit top rim. */
@@ -1547,7 +1543,6 @@ button {
   fill: var(--ink-3);
 }
 
-/* Trend: a thin line of light over a faint amber haze, one lit point. */
 /* The trend fills its box: at least its own height, more when the hero grows. */
 .trend {
   position: relative;
@@ -2101,12 +2096,6 @@ button {
 
 .model__hint {
   padding: var(--space-3) calc(var(--u) * 18) 0;
-}
-
-.model__use {
-  display: flex;
-  gap: var(--space-2);
-  flex-wrap: wrap;
 }
 
 /* ---------- Settings ---------- */

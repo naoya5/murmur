@@ -16,7 +16,7 @@ use crate::adapters::store::Store;
 use crate::controller::{ControllerHandle, PillState};
 use crate::inference::Inference;
 
-/// Where Murmur keeps its data (PLAN 2.10).
+/// Where Murmur keeps its data.
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub data: PathBuf,
@@ -94,7 +94,7 @@ impl App {
         }
     }
 
-    /// A snapshot of the settings. Read right before use, so changes apply at once (PLAN 2.9).
+    /// A snapshot of the settings. Read right before use, so changes apply at once.
     pub fn settings(&self) -> Settings {
         match self.settings.read() {
             Ok(guard) => guard.clone(),

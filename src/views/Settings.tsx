@@ -3,6 +3,17 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigation } from "../app/navigation";
 import { useSettings } from "../app/settings";
 import { useUpdates } from "../app/updates";
+import { Dot } from "../components/Badge";
+import { Button } from "../components/Button";
+import { Group, LinkRow, Row } from "../components/Glass";
+import { KeyRecorder } from "../components/KeyRecorder";
+import { Segmented } from "../components/Segmented";
+import { Select } from "../components/Select";
+import { ConfirmSheet } from "../components/Sheet";
+import { Tabs, tabId, tabPanelId, useTabsId } from "../components/Tabs";
+import { NumberField } from "../components/TextField";
+import { useToast } from "../components/Toast";
+import { Toggle } from "../components/Toggle";
 import { type Strings, useT } from "../i18n";
 import {
   type AppInfo,
@@ -16,17 +27,6 @@ import {
   type Settings as SettingsType,
   type UiLanguage,
 } from "../ipc";
-import { Dot } from "../ui/Badge";
-import { Button } from "../ui/Button";
-import { Group, LinkRow, Row } from "../ui/Glass";
-import { KeyRecorder } from "../ui/KeyRecorder";
-import { Segmented } from "../ui/Segmented";
-import { Select } from "../ui/Select";
-import { ConfirmSheet } from "../ui/Sheet";
-import { Tabs, tabId, tabPanelId, useTabsId } from "../ui/Tabs";
-import { NumberField } from "../ui/TextField";
-import { useToast } from "../ui/Toast";
-import { Toggle } from "../ui/Toggle";
 
 type Field = keyof SettingsType | "permissions" | "stats";
 

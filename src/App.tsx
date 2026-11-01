@@ -9,10 +9,10 @@ import {
 } from "./app/navigation";
 import { SettingsProvider, useSettings } from "./app/settings";
 import { UpdateProvider } from "./app/updates";
+import { ToastProvider } from "./components/Toast";
+import { UpdateBanner } from "./components/UpdateBanner";
 import { I18nContext, resolveLocale, strings, useT } from "./i18n";
 import { useEvent } from "./ipc";
-import { ToastProvider } from "./ui/Toast";
-import { UpdateBanner } from "./ui/UpdateBanner";
 import { Dictionary } from "./views/Dictionary";
 import { History } from "./views/History";
 import { Home } from "./views/Home";

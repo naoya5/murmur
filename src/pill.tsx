@@ -1,4 +1,3 @@
-// Entry of the pill window (pill.html).
 import React from "react";
 import ReactDOM from "react-dom/client";
 import Pill from "./pill/Pill";

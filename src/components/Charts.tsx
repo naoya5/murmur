@@ -1,4 +1,4 @@
-// Hand-made SVG charts: heatmap (20 weeks) and trend line (14 days). No chart library.
+// Hand-drawn SVG; the app adds no chart library.
 import { useId, useLayoutEffect, useRef, useState } from "react";
 import type { Locale } from "../i18n";
 import type { DayPoint } from "../ipc";
@@ -80,7 +80,6 @@ export function Heatmap({ days, locale, label }: HeatmapProps) {
 
 type Size = { width: number; height: number };
 
-/** The rendered size of an element, kept current by a ResizeObserver. */
 function useMeasuredSize<T extends HTMLElement>(fallback: Size): [React.RefObject<T | null>, Size] {
   const ref = useRef<T>(null);
   const [size, setSize] = useState(fallback);

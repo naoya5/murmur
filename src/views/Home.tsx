@@ -1,14 +1,14 @@
 import { Mic } from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useState } from "react";
 import { useSettings } from "../app/settings";
+import { Badge } from "../components/Badge";
+import { Heatmap, Trend } from "../components/Charts";
+import { EmptyState } from "../components/EmptyState";
+import { Card } from "../components/Glass";
 import { useT } from "../i18n";
 import { commands, type Dashboard, useEvent } from "../ipc";
 import { durationParts, formatDuration, formatNumber } from "../lib/format";
 import { displayAccelerator } from "../lib/hotkey";
-import { Badge } from "../ui/Badge";
-import { Heatmap, Trend } from "../ui/Charts";
-import { EmptyState } from "../ui/EmptyState";
-import { Card } from "../ui/Glass";
 
 function Stat({
   label,

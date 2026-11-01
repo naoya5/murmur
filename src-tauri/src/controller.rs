@@ -39,7 +39,6 @@ use crate::platform::macos::{self, Permission};
 
 /// Paste must finish within this time; the output adapter has its own 1 s limit.
 const DELIVER_TIMEOUT: Duration = Duration::from_millis(1_500);
-/// Opening the microphone (PLAN 2.13).
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 /// Covers a pending open (3.5 s), owner close (3 s), and converter close (3 s).
 const CAPTURE_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -67,7 +66,7 @@ pub struct HistoryChanged;
 pub enum Msg {
     /// A core event from hotkeys, the pill, timers or debug triggers.
     Core(Event),
-    /// The main hotkey with a language override (S7 alternate hotkey).
+    /// The main hotkey with a language override (alternate hotkey).
     HotkeyDownWithLanguage(Language),
     CaptureOpened {
         session: SessionId,
@@ -129,7 +128,7 @@ struct SessionCtx {
     audio_rx: watch::Receiver<Option<Captured>>,
     meta: Option<CapturedMeta>,
     cancel: CancelToken,
-    /// The streaming transcription running alongside the recording (S1), when the model and
+    /// The streaming transcription running alongside the recording, when the model and
     /// the VAD are installed.
     stream: Option<StreamId>,
     raw: Option<RawTranscript>,
@@ -355,7 +354,7 @@ impl Controller {
         }
     }
 
-    /// Start and stop sounds (S4), read from settings at the moment they play.
+    /// Start and stop sounds, read from settings at the moment they play.
     fn cue(&self, effect: &Effect) {
         let cue = match effect {
             Effect::StartCapture { .. } => Cue::Start,
@@ -380,10 +379,10 @@ impl Controller {
             .join(format!("{}.pcm", uuid::Uuid::new_v4()));
         let (audio_tx, audio_rx) = watch::channel(None);
         let cancel = CancelToken::new();
-        // S1: transcribe closed chunks while recording, when the model and the VAD are installed.
+        // Transcribe closed chunks while recording, when the model and the VAD are installed.
         // The dictionary is read here, once per recording, so every chunk uses the same words.
         let stream = self.services.model_specs(language).map(|(model, vad)| {
-            // Warm before S1 starts, overlapping the cold engine work with the user's speech.
+            // Warm before the stream starts, overlapping the cold engine work with the user's speech.
             self.services.inference().warm(model.clone(), vad.clone());
             let id = StreamId(session.0);
             let vocabulary = settings
@@ -427,7 +426,7 @@ impl Controller {
                 latency_ms: None,
             },
         );
-        // The model may still be loading; recording starts anyway (PLAN 2.9).
+        // The model may still be loading; recording starts anyway.
         if stream.is_none() {
             self.services.ensure_model_loaded(language);
         }
@@ -574,7 +573,7 @@ impl Controller {
                             let inference = services.inference().clone();
                             let job = async move {
                                 match stream {
-                                    // Only the tail is left to transcribe (S1).
+                                    // Only the tail is left to transcribe.
                                     Some(id) => inference.stream_finish(id, request).await,
                                     None => inference.transcribe(request).await,
                                 }

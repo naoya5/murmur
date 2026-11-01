@@ -1,5 +1,3 @@
-// Pure timing helpers for the pill. Tested in countdown.test.ts.
-
 /** A deadline computed once from `remaining_ms`, then read locally. */
 export function deadlineFrom(remainingMs: number, now: number): number {
   return now + Math.max(0, remainingMs);

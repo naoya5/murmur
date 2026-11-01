@@ -235,7 +235,7 @@ pub async fn retry(
     Ok(updated)
 }
 
-/// On start: every spool file that no history row references becomes a "recovered" row (M8).
+/// On start: every spool file that no history row references becomes a "recovered" row.
 pub fn recover_spool(store: &Store, spool_dir: &Path) -> usize {
     let known = match store.audio_paths() {
         Ok(paths) => paths,

@@ -16,18 +16,13 @@ export function unwrap<T, E>(result: Result<T, E>): T {
 
 export type EventName = keyof typeof events;
 
-/** The payload type of a named event, derived from the generated bindings. */
 export type EventPayload<K extends EventName> = (typeof events)[K] extends {
   listen: (cb: EventCallback<infer P>) => unknown;
 }
   ? P
   : never;
 
-/**
- * Subscribe to a typed event for the lifetime of the component.
- * Usage: `useEvent("pillState", (payload) => ...)`.
- * The subscription is made once per event name; the handler may change freely.
- */
+/** Subscribes for the lifetime of the component, once per event name; the handler may change freely. */
 export function useEvent<K extends EventName>(
   name: K,
   handler: (payload: EventPayload<K>) => void,

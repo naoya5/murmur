@@ -6,7 +6,6 @@
 //!      `PRAGMA user_version`; a shipped migration never changes (a test pins migration 1).
 //! Where: the file lives at `<app data dir>/murmur.db`; the controller calls `Store` after the paste (G9);
 //!        IPC exposes history through `src-tauri/src/ipc.rs`.
-#![cfg_attr(not(test), allow(dead_code))] // Wired by T3-3 / T2-8 (controller).
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -20,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 /// Append-only. Index N holds the SQL that takes `user_version` N to N + 1. Never edit a shipped entry.
 const MIGRATIONS: &[&str] = &[
-    // Migration 1: the initial schema (PLAN 2.10, with daily_stats keyed by day number and language).
+    // Migration 1: the initial schema (with daily_stats keyed by day number and language).
     "CREATE TABLE transcripts (
         id TEXT PRIMARY KEY,
         created_at INTEGER NOT NULL,

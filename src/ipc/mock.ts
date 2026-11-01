@@ -1,4 +1,4 @@
-// Dev-only IPC mock so every view and pill state renders in a plain browser (T5-6).
+// Dev-only IPC mock so every view and pill state renders in a plain browser.
 // Loaded by main.tsx / pill.tsx only when `import.meta.env.DEV` and the app is not inside Tauri.
 // It must never reach the production bundle: `pnpm build` is checked for the sentinel below.
 //

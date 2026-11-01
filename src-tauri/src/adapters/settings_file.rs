@@ -5,7 +5,6 @@
 //! - File from a newer app: left untouched, defaults, `recovered = true`. The caller must not call `save`
 //!   until the user changes a setting, so the newer file is not overwritten by accident.
 //! - Invalid single values: only that field returns to its default.
-#![cfg_attr(not(test), allow(dead_code))] // Wired by T3-3 (settings apply).
 
 use std::fs::{self, File};
 use std::io::Write;
