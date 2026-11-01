@@ -4,7 +4,7 @@ Rules: [RULES.md](./RULES.md). Architecture: [../ARCHITECTURE.md](../ARCHITECTUR
 
 | Ticket | Owner | Status |
 |---|---|---|
-| T6-1 S1: transcribe finished speech regions while recording | core-dev | todo |
+| T6-1 S1: transcribe finished speech regions while recording | core-dev | done (77 s: 850 -> 278 ms stop to clipboard; e2e 33/33) |
 
 Status of the other Should items: S2 push-to-talk (core + hotkeys + settings: done), S3 extra models (catalog:
 done), S4 sounds (done), S5 idle unload (done), S6 copy last / recent from the tray (done), S7 (a) alternate

@@ -5,8 +5,11 @@
 //!      (PLAN 2.7). Audio without speech never reaches the model, which removes most
 //!      hallucinations.
 //! Where: the engine adapter calls `plan` after `VoiceDetector::regions` and transcribes each
-//!        range; tests at the end of this file.
+//!        range. While recording (S1), `IncrementalPlan` yields the same chunks one at a time from
+//!        the regions a streaming detector gives, so that only the tail is left at stop.
+//!        Tests at the end of this file.
 
+use std::collections::VecDeque;
 use std::ops::Range;
 
 use crate::SAMPLE_RATE_HZ;
@@ -96,6 +99,112 @@ fn split_long(region: SpeechRegion) -> Vec<Range<usize>> {
             start..(start + size).min(region.end)
         })
         .collect()
+}
+
+/// The same chunks as `plan`, built one region at a time while the audio is still arriving.
+///
+/// Feed every region the moment the streaming detector makes it final (they come in order), then
+/// ask `take_ready` for the chunks that can be transcribed with the audio heard so far. A chunk
+/// closes only when a later region does not fit after it, exactly as in `plan`, so the open chunk
+/// is never transcribed early. At stop, `finish` says whether the partial work counts at all:
+/// a recording up to `MAX_CHUNK_SAMPLES` is transcribed whole, as today, and the partial chunks
+/// are discarded.
+///
+/// Invariant (tested): `taken chunks ++ finish chunks == plan(total, regions)` for the same
+/// regions, sample for sample.
+#[derive(Debug, Clone, Default)]
+pub struct IncrementalPlan {
+    /// The chunk still growing, unpadded.
+    open: Option<Range<usize>>,
+    /// Closed, unpadded chunks not yet handed out (their padding may still be in the future).
+    closed: VecDeque<Range<usize>>,
+    /// Final regions seen, for the whole-buffer and no-speech decisions.
+    regions: usize,
+}
+
+/// What `IncrementalPlan::finish` decides for the end of the recording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Finish {
+    /// No region at all: do not call the model.
+    NoSpeech,
+    /// The recording fits in one piece: discard every partial chunk and transcribe `0..total`
+    /// whole, exactly as `plan` does for a short recording.
+    WholeBuffer,
+    /// The chunks left after the ones `take_ready` gave, padded and clamped. May be empty.
+    Tail(Vec<Range<usize>>),
+}
+
+impl IncrementalPlan {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a region that the detector made final. Regions arrive in order of their start.
+    pub fn push(&mut self, region: SpeechRegion) {
+        if region.end <= region.start {
+            return;
+        }
+        self.regions += 1;
+        for piece in split_long(region) {
+            self.open = match self.open.take() {
+                None => Some(piece),
+                Some(open)
+                    if piece.end - open.start <= MAX_CHUNK_SAMPLES - 2 * CHUNK_PAD_SAMPLES =>
+                {
+                    Some(open.start..piece.end)
+                }
+                Some(open) => {
+                    self.closed.push_back(open);
+                    Some(piece)
+                }
+            };
+        }
+    }
+
+    /// The closed chunks whose padding lies within the `available` samples heard so far, padded.
+    /// Transcribe them now; they will not change.
+    pub fn take_ready(&mut self, available: usize) -> Vec<Range<usize>> {
+        let mut ready = Vec::new();
+        while let Some(chunk) = self.closed.front() {
+            if chunk.end + CHUNK_PAD_SAMPLES > available {
+                break;
+            }
+            if let Some(chunk) = self.closed.pop_front() {
+                ready.push(pad(chunk, available));
+            }
+        }
+        ready
+    }
+
+    /// Ends the recording at `total` samples. `tail` are the regions the detector gave at the end;
+    /// the regions already pushed are kept.
+    pub fn finish(mut self, total: usize, tail: &[SpeechRegion]) -> Finish {
+        for region in tail {
+            // Reapply the filter of `plan`: the end may overshoot the audio, as a detector pads
+            // its last piece with silence.
+            if region.start < total {
+                self.push(SpeechRegion {
+                    start: region.start,
+                    end: region.end.min(total),
+                });
+            }
+        }
+        if self.regions == 0 {
+            return Finish::NoSpeech;
+        }
+        if total <= MAX_CHUNK_SAMPLES {
+            return Finish::WholeBuffer;
+        }
+        let mut chunks: Vec<Range<usize>> = self.closed.drain(..).map(|c| pad(c, total)).collect();
+        if let Some(open) = self.open.take() {
+            chunks.push(pad(open, total));
+        }
+        Finish::Tail(chunks)
+    }
+}
+
+fn pad(chunk: Range<usize>, total: usize) -> Range<usize> {
+    chunk.start.saturating_sub(CHUNK_PAD_SAMPLES)..(chunk.end + CHUNK_PAD_SAMPLES).min(total)
 }
 
 /// Joins chunk texts. Japanese text is joined without a space; other text with one space.
@@ -339,5 +448,153 @@ mod tests {
         assert_eq!(join_texts(&parts), "Hello world");
         assert_eq!(join_texts(&[]), "");
         assert_eq!(join_texts(&[String::new()]), "");
+    }
+
+    // --- IncrementalPlan ---
+
+    /// xorshift64*, as in session.rs: deterministic, no dependency.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Random in-order regions: speech of 0.2 to 40 s separated by 0.1 to 8 s of silence.
+    fn random_regions(rng: &mut Rng, total: usize) -> Vec<SpeechRegion> {
+        let mut regions = Vec::new();
+        let mut at = rng.below(secs(3.0) as u64) as usize;
+        while at < total {
+            let len = secs(0.2) + rng.below(secs(40.0) as u64) as usize;
+            let end = (at + len).min(total + secs(0.3)); // the last may overshoot, as a VAD pads
+            regions.push(SpeechRegion { start: at, end });
+            at = end + secs(0.1) + rng.below(secs(8.0) as u64) as usize;
+        }
+        regions
+    }
+
+    /// Drives the plan the way the inference thread does: every region as it becomes final,
+    /// `take_ready` after each with the audio heard so far, the last few at `finish`.
+    fn stream(total: usize, regions: &[SpeechRegion], at_end: usize) -> Plan {
+        let mut plan = IncrementalPlan::new();
+        let mut taken = Vec::new();
+        // A region is final while recording only once the silence that ends it was heard;
+        // the rest (and the last `at_end` regions) arrive with `finish`.
+        let closed_live = regions
+            .iter()
+            .take_while(|r| r.end + secs(0.5) <= total)
+            .count();
+        let live = closed_live.min(regions.len().saturating_sub(at_end));
+        for region in &regions[..live] {
+            plan.push(*region);
+            // Heard so far: the region's end plus the silence that made it final.
+            let available = (region.end + secs(0.5)).min(total);
+            taken.extend(plan.take_ready(available));
+        }
+        match plan.finish(total, &regions[live..]) {
+            Finish::NoSpeech => Plan::NoSpeech,
+            Finish::WholeBuffer => Plan::Chunks(vec![Range {
+                start: 0,
+                end: total,
+            }]),
+            Finish::Tail(tail) => {
+                taken.extend(tail);
+                Plan::Chunks(taken)
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_plan_equals_plan_for_random_long_recordings() {
+        for seed in 1..=300u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let total = MAX_CHUNK_SAMPLES + 1 + rng.below(secs(600.0) as u64) as usize;
+            let regions = random_regions(&mut rng, total);
+            let expected = plan(total, &regions);
+            for at_end in 0..=2.min(regions.len()) {
+                let got = stream(total, &regions, at_end);
+                assert_eq!(got, expected, "seed {seed}, {at_end} regions at the end");
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_plan_short_recording_is_the_whole_buffer() {
+        let total = secs(20.0);
+        let mut plan = IncrementalPlan::new();
+        plan.push(region(1.0, 5.0));
+        plan.push(region(8.0, 19.0));
+        assert!(
+            plan.take_ready(total).is_empty(),
+            "nothing closes before an overflow"
+        );
+        assert_eq!(plan.finish(total, &[]), Finish::WholeBuffer);
+        // Exactly the limit is still whole.
+        let mut plan = IncrementalPlan::new();
+        plan.push(region(0.0, 1.0));
+        assert_eq!(plan.finish(MAX_CHUNK_SAMPLES, &[]), Finish::WholeBuffer);
+    }
+
+    #[test]
+    fn incremental_plan_without_regions_is_no_speech() {
+        let plan = IncrementalPlan::new();
+        assert_eq!(plan.finish(secs(70.0), &[]), Finish::NoSpeech);
+        let plan = IncrementalPlan::new();
+        assert_eq!(
+            plan.finish(secs(70.0), &[SpeechRegion { start: 5, end: 5 }]),
+            Finish::NoSpeech
+        );
+        // A tail region starting past the end, as the offline filter drops it.
+        let plan = IncrementalPlan::new();
+        assert_eq!(
+            plan.finish(secs(70.0), &[region(70.0, 71.0)]),
+            Finish::NoSpeech
+        );
+    }
+
+    #[test]
+    fn incremental_plan_releases_a_chunk_only_when_its_padding_is_heard() {
+        let mut plan = IncrementalPlan::new();
+        plan.push(region(0.0, 20.0));
+        // 25-45 does not fit after 0-20 (45 s > 29.6 s): 0-20 closes.
+        plan.push(region(25.0, 45.0));
+        assert!(
+            plan.take_ready(secs(20.0)).is_empty(),
+            "the 200 ms pad is not heard yet"
+        );
+        assert_eq!(
+            plan.take_ready(secs(20.0) + CHUNK_PAD_SAMPLES),
+            vec![0..secs(20.0) + CHUNK_PAD_SAMPLES]
+        );
+        assert!(
+            plan.take_ready(secs(60.0)).is_empty(),
+            "the open chunk never closes early"
+        );
+        let total = secs(70.0);
+        assert_eq!(
+            plan.finish(total, &[region(50.0, 70.0)]),
+            Finish::Tail(vec![
+                secs(25.0) - CHUNK_PAD_SAMPLES..secs(45.0) + CHUNK_PAD_SAMPLES,
+                secs(50.0) - CHUNK_PAD_SAMPLES..total,
+            ])
+        );
+    }
+
+    #[test]
+    fn incremental_plan_tail_overshoot_is_clamped_like_plan() {
+        let total = secs(70.0);
+        let regions = [region(0.0, 20.0), region(25.0, 45.0), region(50.0, 70.3)];
+        assert_eq!(stream(total, &regions, 1), plan(total, &regions));
+        assert_eq!(stream(total, &regions, 0), plan(total, &regions));
     }
 }

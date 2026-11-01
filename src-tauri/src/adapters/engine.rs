@@ -76,7 +76,10 @@ pub fn create_vad(spec: &ModelSpec) -> Result<Box<dyn VoiceDetector>, EngineErro
         load_ms = started.elapsed().as_millis() as u64,
         "voice detector loaded"
     );
-    Ok(Box::new(SileroVad { model }))
+    Ok(Box::new(SileroVad {
+        stream: None,
+        model,
+    }))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -257,9 +260,25 @@ fn prompt_text(vocabulary: &[DictionaryEntry], language: Language) -> String {
 // ---------------------------------------------------------------------------------------------
 // Voice activity detection
 
-/// Silero VAD over a whole recording.
+/// Silero VAD over a whole recording, or over audio that arrives while recording (S1).
 pub struct SileroVad {
+    /// Declared before `model`: Rust drops fields in order, and the C API frees a detection
+    /// before its model.
+    stream: Option<Detection>,
     model: Model,
+}
+
+impl SileroVad {
+    /// A request with the detection options; `speech_detect` and `speech_detection_start` read
+    /// the same four.
+    fn vad_request(&self) -> Result<Request, EngineError> {
+        let request = Request::new(&self.model)?;
+        request.set_float(ffi::SPEECH_OPT_THRESHOLD, VAD_THRESHOLD)?;
+        request.set_int(ffi::SPEECH_OPT_SPEECH_PAD_MS, VAD_SPEECH_PAD_MS)?;
+        request.set_int(ffi::SPEECH_OPT_MIN_SILENCE_DURATION_MS, VAD_MIN_SILENCE_MS)?;
+        request.set_float(ffi::SPEECH_OPT_MAX_SPEECH_DURATION_S, VAD_MAX_SPEECH_S)?;
+        Ok(request)
+    }
 }
 
 impl VoiceDetector for SileroVad {
@@ -267,12 +286,8 @@ impl VoiceDetector for SileroVad {
         if pcm.is_empty() {
             return Ok(Vec::new());
         }
-        let request = Request::new(&self.model)?;
+        let request = self.vad_request()?;
         request.set_audio(pcm)?;
-        request.set_float(ffi::SPEECH_OPT_THRESHOLD, VAD_THRESHOLD)?;
-        request.set_int(ffi::SPEECH_OPT_SPEECH_PAD_MS, VAD_SPEECH_PAD_MS)?;
-        request.set_int(ffi::SPEECH_OPT_MIN_SILENCE_DURATION_MS, VAD_MIN_SILENCE_MS)?;
-        request.set_float(ffi::SPEECH_OPT_MAX_SPEECH_DURATION_S, VAD_MAX_SPEECH_S)?;
         // SAFETY: a valid request owned by this thread.
         let status = unsafe { ffi::speech_detect(request.as_ptr()) };
         if status == ffi::SPEECH_CANCELLED {
@@ -280,6 +295,95 @@ impl VoiceDetector for SileroVad {
         }
         check("detect", status)?;
         request.regions(pcm.len())
+    }
+
+    fn stream_start(&mut self) -> Result<(), EngineError> {
+        self.stream = None;
+        let request = self.vad_request()?;
+        let rate = c_int::try_from(SAMPLE_RATE_HZ)
+            .map_err(|_| EngineError::Other("sample rate out of range".into()))?;
+        let mut raw = ptr::null_mut();
+        // SAFETY: a valid request without audio (its options are copied) and a valid out pointer.
+        check("detection start", unsafe {
+            ffi::speech_detection_start(request.as_ptr().cast_const(), rate, &mut raw)
+        })?;
+        let raw = NonNull::new(raw)
+            .ok_or_else(|| EngineError::Other("detection start returned nothing".into()))?;
+        self.stream = Some(Detection { raw, given: 0 });
+        Ok(())
+    }
+
+    fn stream_push(&mut self, pcm: &[f32]) -> Result<Vec<SpeechRegion>, EngineError> {
+        let Some(stream) = self.stream.as_mut() else {
+            return Err(EngineError::Other("no detection stream".into()));
+        };
+        // SAFETY: a valid detection owned by this thread; the samples are copied by the library.
+        let status =
+            unsafe { ffi::speech_detection_push(stream.raw.as_ptr(), pcm.as_ptr(), pcm.len()) };
+        if let Err(error) = check("detection push", status) {
+            // The library takes no more audio after a failed push.
+            self.stream = None;
+            return Err(error);
+        }
+        stream.new_regions()
+    }
+
+    fn stream_finish(&mut self) -> Result<Vec<SpeechRegion>, EngineError> {
+        let Some(mut stream) = self.stream.take() else {
+            return Err(EngineError::Other("no detection stream".into()));
+        };
+        // SAFETY: a valid detection owned by this thread.
+        check("detection end", unsafe {
+            ffi::speech_detection_end(stream.raw.as_ptr())
+        })?;
+        stream.new_regions()
+    }
+
+    fn stream_cancel(&mut self) {
+        self.stream = None;
+    }
+}
+
+/// One streaming detection. Freed on drop, before the model it was made for.
+struct Detection {
+    raw: NonNull<ffi::speech_detection>,
+    /// Regions already handed out.
+    given: usize,
+}
+
+// SAFETY: a detection is heap state owned by the library and tied to no thread; the C API allows
+// its use from one thread at a time, and it lives on the inference thread with its model.
+unsafe impl Send for Detection {}
+
+impl Drop for Detection {
+    fn drop(&mut self) {
+        // SAFETY: the pointer came from speech_detection_start and is freed once.
+        unsafe { ffi::speech_detection_free(self.raw.as_ptr()) };
+    }
+}
+
+impl Detection {
+    /// The regions given since the last call, as sample ranges from the first sample pushed.
+    /// Not clamped: the caller knows the audio length (`IncrementalPlan::finish`).
+    fn new_regions(&mut self) -> Result<Vec<SpeechRegion>, EngineError> {
+        let rate = f64::from(SAMPLE_RATE_HZ);
+        // SAFETY: a valid detection owned by this thread; every index is below the count.
+        let count = unsafe { ffi::speech_detection_region_count(self.raw.as_ptr()) };
+        let mut regions = Vec::with_capacity(count.saturating_sub(self.given));
+        for index in self.given..count {
+            let (mut start, mut end) = (0.0_f64, 0.0_f64);
+            // SAFETY: as above.
+            check("detection region", unsafe {
+                ffi::speech_detection_region(self.raw.as_ptr(), index, &mut start, &mut end)
+            })?;
+            let start = (start * rate).round().max(0.0) as usize;
+            let end = (end * rate).round().max(0.0) as usize;
+            if end > start {
+                regions.push(SpeechRegion { start, end });
+            }
+        }
+        self.given = count;
+        Ok(regions)
     }
 }
 
@@ -885,6 +989,58 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(text, self::text(&again));
+            });
+        }
+
+        /// S1: the stream must give the offline text, and the tail must cost far less than the
+        /// whole. Prints both times.
+        #[test]
+        #[ignore]
+        fn stream_matches_offline_on_a_long_recording() {
+            use crate::inference::{StreamId, StreamRequest};
+            with_inference(|inference| {
+                let pcm = fixture("ja60.wav");
+                // Warm the model, then the steady-state offline time.
+                run(inference, request(pcm.clone(), Language::Ja, vec![])).unwrap();
+                let started = Instant::now();
+                let offline = run(inference, request(pcm.clone(), Language::Ja, vec![])).unwrap();
+                let offline_ms = started.elapsed().as_millis();
+
+                let id = StreamId(1);
+                inference.stream_start(
+                    id,
+                    StreamRequest {
+                        language: Language::Ja,
+                        model: spec(catalog::DEFAULT_JA_MODEL),
+                        vad: spec(catalog::VAD_MODEL),
+                        vocabulary: vec![],
+                        cancel: CancelToken::new(),
+                    },
+                );
+                let tap = inference.stream_tap(id);
+                // 100 ms pieces, as the converter thread delivers them.
+                for piece in pcm.chunks(SAMPLE_RATE_HZ as usize / 10) {
+                    tap(piece);
+                }
+                assert!(inference.wait_idle(Duration::from_secs(120)));
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let started = Instant::now();
+                let streamed = runtime
+                    .block_on(inference.stream_finish(id, request(pcm, Language::Ja, vec![])))
+                    .unwrap();
+                let stream_ms = started.elapsed().as_millis();
+                println!(
+                    "[engine] stream finish {stream_ms} ms (asr {} ms) vs offline {offline_ms} ms (asr {} ms)",
+                    streamed.asr_ms, offline.asr_ms
+                );
+                assert_eq!(text(&streamed), text(&offline));
+                assert!(
+                    stream_ms < offline_ms,
+                    "the tail must be cheaper than the whole"
+                );
             });
         }
 

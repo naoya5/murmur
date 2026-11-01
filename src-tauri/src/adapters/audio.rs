@@ -49,9 +49,18 @@ const RESAMPLE_CHUNK: usize = 1024;
 const LEVEL_FLOOR_DB: f32 = -55.0;
 const LEVEL_CEIL_DB: f32 = -5.0;
 
+/// Receives the samples appended to the recording, on the converter thread.
+pub type PcmTap = Box<dyn Fn(&[f32]) + Send + Sync>;
+/// A borrowed tap, as the converter thread holds it.
+type TapRef<'a> = Option<&'a (dyn Fn(&[f32]) + Send + Sync)>;
+
 pub struct AudioConfig {
     pub device: Option<String>,
     pub spool_path: PathBuf,
+    /// Called with exactly the 16 kHz samples appended to `CapturedAudio::pcm` (and the spool),
+    /// in order, as they are appended; paused audio never reaches it. An offset in the stream of
+    /// calls equals the same offset in the final buffer (S1 streaming transcription).
+    pub tap: Option<PcmTap>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -158,10 +167,15 @@ impl Recorder {
         on_event: Box<dyn Fn(AudioEvent) + Send + Sync>,
     ) -> Result<Recorder, AudioError> {
         let started = Instant::now();
-        if let Some(parent) = cfg.spool_path.parent() {
+        let AudioConfig {
+            device,
+            spool_path,
+            tap,
+        } = cfg;
+        if let Some(parent) = spool_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| AudioError::Io(e.to_string()))?;
         }
-        let spool = File::create(&cfg.spool_path).map_err(|e| AudioError::Io(e.to_string()))?;
+        let spool = File::create(&spool_path).map_err(|e| AudioError::Io(e.to_string()))?;
 
         let shared = Arc::new(Shared::new());
         let (open_tx, open_rx) = mpsc::channel::<Result<Opened, AudioError>>();
@@ -169,7 +183,7 @@ impl Recorder {
 
         let owner = {
             let shared = Arc::clone(&shared);
-            let device = cfg.device.clone();
+            let device = device.clone();
             thread::Builder::new()
                 .name("murmur-audio-owner".into())
                 .spawn(move || {
@@ -182,18 +196,18 @@ impl Recorder {
         let opened = match open_rx.recv_timeout(OPEN_TIMEOUT) {
             Ok(Ok(opened)) => opened,
             Ok(Err(e)) => {
-                let _ = std::fs::remove_file(&cfg.spool_path);
+                let _ = std::fs::remove_file(&spool_path);
                 return Err(e);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // The owner thread may still be inside the OS call. Tell it to quit when it returns.
                 shared.stop_owner.store(true, Ordering::Release);
                 owner.thread().unpark();
-                let _ = std::fs::remove_file(&cfg.spool_path);
+                let _ = std::fs::remove_file(&spool_path);
                 return Err(AudioError::OpenTimeout);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = std::fs::remove_file(&cfg.spool_path);
+                let _ = std::fs::remove_file(&spool_path);
                 return Err(AudioError::Device("audio thread ended during open".into()));
             }
         };
@@ -202,7 +216,9 @@ impl Recorder {
             let shared = Arc::clone(&shared);
             thread::Builder::new()
                 .name("murmur-audio-converter".into())
-                .spawn(move || converter_main(opened, &shared, spool, on_event.as_ref()))
+                .spawn(move || {
+                    converter_main(opened, &shared, spool, on_event.as_ref(), tap.as_deref())
+                })
                 .map_err(|e| AudioError::Device(e.to_string()))?
         };
 
@@ -211,7 +227,7 @@ impl Recorder {
             owner: Some(owner),
             owner_done: done_rx,
             converter: Some(converter),
-            spool_path: cfg.spool_path,
+            spool_path,
         })
     }
 
@@ -551,6 +567,7 @@ fn converter_main(
     shared: &Shared,
     spool: File,
     on_event: &(dyn Fn(AudioEvent) + Send + Sync),
+    tap: TapRef<'_>,
 ) -> Result<Vec<f32>, AudioError> {
     let Opened {
         mut cons,
@@ -588,6 +605,7 @@ fn converter_main(
                 &mut spool,
                 &mut meter,
                 on_event,
+                tap,
                 &mut first_error,
             );
         }
@@ -617,6 +635,7 @@ fn converter_main(
         &mut spool,
         &mut meter,
         on_event,
+        tap,
         &mut first_error,
     );
     if let Err(e) = spool.flush() {
@@ -629,19 +648,25 @@ fn converter_main(
     }
 }
 
-/// Appends converted 16 kHz samples to the PCM buffer and the spool, and feeds the level meter.
+/// Appends converted 16 kHz samples to the PCM buffer and the spool, feeds the level meter and
+/// the tap.
+#[allow(clippy::too_many_arguments)]
 fn append(
     converted: &[f32],
     pcm: &mut Vec<f32>,
     spool: &mut BufWriter<File>,
     meter: &mut LevelMeter,
     on_event: &(dyn Fn(AudioEvent) + Send + Sync),
+    tap: TapRef<'_>,
     first_error: &mut Option<AudioError>,
 ) {
     if converted.is_empty() {
         return;
     }
     pcm.extend_from_slice(converted);
+    if let Some(tap) = tap {
+        tap(converted);
+    }
     let bytes: Vec<u8> = converted
         .iter()
         .flat_map(|&s| to_s16(s).to_le_bytes())
@@ -1006,6 +1031,7 @@ mod tests {
             AudioConfig {
                 device: Some(format!("wav:{}", wav.display())),
                 spool_path: spool.to_path_buf(),
+                tap: None,
             },
             Box::new(move |e| sink.lock().unwrap().push(e)),
         )
@@ -1104,6 +1130,7 @@ mod tests {
             AudioConfig {
                 device: Some(format!("wav:{}", wav.display())),
                 spool_path: dir.join("rec.pcm"),
+                tap: None,
             },
             Box::new(|_| {}),
         )
@@ -1122,6 +1149,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// S1: the tap receives exactly the samples of the final buffer, paused audio excluded.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn tap_sees_exactly_the_final_pcm() {
+        let dir = temp_dir("tap");
+        let wav = dir.join("in.wav");
+        write_wav(&wav, 16_000, 1, &sine(16_000, 440.0, 2.0, 0.6));
+        let tapped: Arc<std::sync::Mutex<Vec<f32>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&tapped);
+        let rec = Recorder::start(
+            AudioConfig {
+                device: Some(format!("wav:{}", wav.display())),
+                spool_path: dir.join("rec.pcm"),
+                tap: Some(Box::new(move |pcm| {
+                    sink.lock().unwrap().extend_from_slice(pcm)
+                })),
+            },
+            Box::new(|_| {}),
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(300));
+        rec.set_paused(true);
+        thread::sleep(Duration::from_millis(400));
+        rec.set_paused(false);
+        thread::sleep(Duration::from_millis(300));
+        let audio = rec.stop().unwrap();
+        let tapped = tapped.lock().unwrap();
+        assert!(!audio.pcm.is_empty());
+        assert_eq!(*tapped, audio.pcm, "tap and buffer differ");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[cfg(debug_assertions)]
     #[test]
     fn unreadable_wav_is_an_io_error() {
@@ -1130,6 +1189,7 @@ mod tests {
             AudioConfig {
                 device: Some("wav:/nonexistent/file.wav".into()),
                 spool_path: dir.join("rec.pcm"),
+                tap: None,
             },
             Box::new(|_| {}),
         );
@@ -1149,6 +1209,7 @@ mod tests {
                 AudioConfig {
                     device: None,
                     spool_path: dir.join("mic.pcm"),
+                    tap: None,
                 },
                 Box::new(|_| {}),
             )

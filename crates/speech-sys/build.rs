@@ -236,7 +236,9 @@ fn link_clang_runtime() {
     let dir = match output {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_owned(),
         _ => {
-            println!("cargo:warning=speech-sys: clang --print-runtime-dir failed; not linking clang_rt.osx");
+            println!(
+                "cargo:warning=speech-sys: clang --print-runtime-dir failed; not linking clang_rt.osx"
+            );
             return;
         }
     };

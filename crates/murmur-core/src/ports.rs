@@ -5,7 +5,10 @@
 //!      key later). The app depends on these traits, never on an SDK (guardrail G2).
 //! Where: `src-tauri/src/adapters/engine.rs` implements `SpeechEngine` and `VoiceDetector` with
 //!        speech.cpp. To add an engine: implement the traits in a new adapter, add its models to
-//!        `catalog.rs`, add one arm to the engine factory.
+//!        `catalog.rs`, add one arm to the engine factory. `src-tauri/src/inference.rs` drives
+//!        the streaming detection (S1) while recording; the dictionary is read once when the
+//!        stream starts, so every chunk of one recording uses the same vocabulary (a PLAN 2.9
+//!        deviation: a dictionary edit applies from the next recording).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -121,9 +124,23 @@ pub trait SpeechEngine: Send {
     ) -> Result<RawTranscript, EngineError>;
 }
 
-/// Voice activity detection over a whole buffer.
+/// Voice activity detection over a whole buffer, and over audio that arrives while recording.
+///
+/// The streaming methods (S1) feed the audio a piece at a time. A region is returned once it is
+/// final and never changes; after `stream_finish` the regions returned over the whole stream are
+/// exactly what `regions` returns for the same audio in one piece. One stream at a time: a new
+/// `stream_start` replaces the old one. Offsets are samples at `SAMPLE_RATE_HZ` from the first
+/// sample pushed.
 pub trait VoiceDetector: Send {
     fn regions(&mut self, pcm: &[f32]) -> Result<Vec<SpeechRegion>, EngineError>;
+    /// Starts a stream with the same options as `regions`.
+    fn stream_start(&mut self) -> Result<(), EngineError>;
+    /// Feeds the next samples; returns the regions that became final with them, in order.
+    fn stream_push(&mut self, pcm: &[f32]) -> Result<Vec<SpeechRegion>, EngineError>;
+    /// Ends the audio; returns the regions left. The stream is gone afterwards.
+    fn stream_finish(&mut self) -> Result<Vec<SpeechRegion>, EngineError>;
+    /// Drops the stream without a result. A no-op when none is active.
+    fn stream_cancel(&mut self);
 }
 
 /// Context for a text refiner.

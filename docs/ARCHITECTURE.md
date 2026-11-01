@@ -81,3 +81,8 @@ Each session records `latency_ms` (stop -> clipboard) and `asr_ms` (engine time)
   that a typing-speed change applies to the whole history.
 - Debug builds accept a device name `wav:<path>` that plays a WAV file as the microphone, and SIGUSR1 / SIGUSR2
   as hotkey / Esc, for end-to-end tests without real keys or a real voice.
+- S1 (stream transcription): for recordings over 30 s, closed speech regions are transcribed while recording;
+  at stop only the tail is processed. Recordings up to 30 s keep the whole-buffer path. Any streaming error
+  falls back to the offline path. The dictionary is read once at the start of a recording, so an edit applies
+  from the next recording.
+

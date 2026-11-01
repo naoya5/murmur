@@ -32,7 +32,9 @@ use crate::adapters::output::{self, DeliverOptions};
 use crate::adapters::sounds::{self, Cue};
 use crate::app::App;
 use crate::history::{self, Record};
-use crate::inference::{InferenceError, InferenceOutput, TranscribeRequest};
+use crate::inference::{
+    InferenceError, InferenceOutput, StreamId, StreamRequest, TranscribeRequest,
+};
 use crate::platform::macos::{self, Permission};
 
 /// Paste must finish within this time; the output adapter has its own 1 s limit.
@@ -125,6 +127,9 @@ struct SessionCtx {
     audio_rx: watch::Receiver<Option<Captured>>,
     meta: Option<CapturedMeta>,
     cancel: CancelToken,
+    /// The streaming transcription running alongside the recording (S1), when the model and
+    /// the VAD are installed.
+    stream: Option<StreamId>,
     raw: Option<RawTranscript>,
     text: Option<String>,
     asr_ms: Option<u64>,
@@ -326,6 +331,7 @@ impl Controller {
             Effect::CancelTranscription { session } => {
                 if let Some(ctx) = self.sessions.get(&session) {
                     ctx.cancel.cancel();
+                    self.cancel_stream(ctx);
                 }
             }
             Effect::Deliver { session, text } => self.deliver(session, text),
@@ -371,6 +377,30 @@ impl Controller {
             .spool
             .join(format!("{}.pcm", uuid::Uuid::new_v4()));
         let (audio_tx, audio_rx) = watch::channel(None);
+        let cancel = CancelToken::new();
+        // S1: transcribe closed chunks while recording, when the model and the VAD are installed.
+        // The dictionary is read here, once per recording, so every chunk uses the same words.
+        let stream = self.services.model_specs(language).map(|(model, vad)| {
+            let id = StreamId(session.0);
+            let vocabulary = settings
+                .dictionary
+                .iter()
+                .filter(|e| e.scope.includes(language))
+                .cloned()
+                .collect();
+            self.services.inference().stream_start(
+                id,
+                StreamRequest {
+                    language,
+                    model,
+                    vad,
+                    vocabulary,
+                    cancel: cancel.clone(),
+                },
+            );
+            id
+        });
+        let tap = stream.map(|id| self.services.inference().stream_tap(id));
         self.sessions.insert(
             session,
             SessionCtx {
@@ -384,7 +414,8 @@ impl Controller {
                 audio_tx: Some(audio_tx),
                 audio_rx,
                 meta: None,
-                cancel: CancelToken::new(),
+                cancel,
+                stream,
                 raw: None,
                 text: None,
                 asr_ms: None,
@@ -399,9 +430,16 @@ impl Controller {
         let app = self.app.clone();
         let device = settings.microphone.clone();
         tauri::async_runtime::spawn(async move {
-            let result = open_microphone(app, tx.clone(), session, device, spool_path).await;
+            let result = open_microphone(app, tx.clone(), session, device, spool_path, tap).await;
             let _ = tx.send(Msg::CaptureOpened { session, result });
         });
+    }
+
+    /// Drops the partial work of the session's stream, if it has one.
+    fn cancel_stream(&self, ctx: &SessionCtx) {
+        if let Some(id) = ctx.stream {
+            self.services.inference().stream_cancel(id);
+        }
     }
 
     fn set_paused(&mut self, session: SessionId, paused: bool) {
@@ -475,6 +513,7 @@ impl Controller {
         let mut audio_rx = ctx.audio_rx.clone();
         let language = ctx.language;
         let cancel = ctx.cancel.clone();
+        let stream = ctx.stream;
         let services = self.services.clone();
         let tx = self.tx.clone();
         tauri::async_runtime::spawn(async move {
@@ -525,7 +564,14 @@ impl Controller {
                                 vocabulary,
                                 cancel: cancel.clone(),
                             };
-                            let job = services.inference().transcribe(request);
+                            let inference = services.inference().clone();
+                            let job = async move {
+                                match stream {
+                                    // Only the tail is left to transcribe (S1).
+                                    Some(id) => inference.stream_finish(id, request).await,
+                                    None => inference.transcribe(request).await,
+                                }
+                            };
                             match tokio::time::timeout(budget, job).await {
                                 Ok(result) => result,
                                 Err(_) => {
@@ -608,6 +654,7 @@ impl Controller {
         let Some(ctx) = self.sessions.remove(&session) else {
             return;
         };
+        self.cancel_stream(&ctx);
         let record = Self::record(&ctx, Some(failure));
         let app = self.app.clone();
         let store = self.services.store().clone();
@@ -624,6 +671,7 @@ impl Controller {
         let Some(mut ctx) = self.sessions.remove(&session) else {
             return;
         };
+        self.cancel_stream(&ctx);
         if ctx.recorder.is_some() || ctx.audio_tx.is_some() {
             Self::stop_recorder(&mut ctx, self.tx.clone(), session);
         }
@@ -661,6 +709,9 @@ impl Controller {
     fn shutdown(&mut self) {
         for (_, ctx) in self.sessions.drain() {
             ctx.cancel.cancel();
+            if let Some(id) = ctx.stream {
+                self.services.inference().stream_cancel(id);
+            }
             if let Some(recorder) = ctx.recorder {
                 // Keep the spool: recovery picks it up on the next start.
                 let _ = recorder.stop();
@@ -687,6 +738,7 @@ async fn open_microphone(
     session: SessionId,
     device: Option<String>,
     spool_path: PathBuf,
+    tap: Option<audio::PcmTap>,
 ) -> Result<Recorder, CaptureError> {
     // The debug WAV device is a file, not the microphone: no permission is involved.
     let wav_device =
@@ -711,7 +763,11 @@ async fn open_microphone(
             let _ = tx.send(Msg::Core(Event::MicDisconnected { session }));
         }
     });
-    let cfg = AudioConfig { device, spool_path };
+    let cfg = AudioConfig {
+        device,
+        spool_path,
+        tap,
+    };
     let job = tauri::async_runtime::spawn_blocking(move || Recorder::start(cfg, on_event));
     match tokio::time::timeout(OPEN_TIMEOUT + Duration::from_millis(500), job).await {
         Ok(Ok(Ok(recorder))) => Ok(recorder),
