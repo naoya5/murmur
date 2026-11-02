@@ -66,46 +66,55 @@ Each session records `latency_ms` (stop -> clipboard) and `asr_ms` (engine time)
 (no transcript text).
 
 Annotations (experimental) add an `annotations` table in `murmur.db` (counts and times, no words) and the folder
-`annotations/<YYYYMMDD-HHMMSS-xxxx>/` with `summary.md`, `annotation.json`, `contact-sheet.png` and
-`frames/<n>.png`. The folder is private (0700, files 0600). It is created by the first bundle, never at start-up.
+`annotations/<YYYYMMDD-HHMMSS-xxxx>/` with `frames/<n>.png` (one per drawn screen, absent when nothing was
+drawn), `summary.md` (the pasted text) and `annotation.json` (version 2: pictures, ink groups, spoken segments,
+the target app's bundle id). The folder is private (0700, files 0600). It is created by the first bundle, never at
+start-up.
 Retention is a number of days (1 to 90, default 7) plus a 1 GiB cap on the whole folder; the cleanup runs on
 blocking threads after a paste and when the setting changes.
 
 ## Annotations (experimental)
 
 Off by default (`annotations_enabled`). While it is off nothing of it runs: no hotkey, no overlay window, no
-Screen Recording check, no folder. One hotkey (default Option+Shift+S) records the voice and the screen together
-and pastes a few pictures plus the words into the app in front.
+Screen Recording check, no folder. One hotkey (default Option+Shift+S) records the voice and the screen together.
+Holding Shift and dragging draws on the screen. At the stop, every screen that was drawn on becomes one picture
+with the lines on it, and the words are pasted with a mark such as `[画像 1 ①]` in front of the sentence spoken
+while drawing. Nothing drawn: the words alone, as a dictation. The bundle goes to the app that was in front when
+the hotkey was pressed, not to whatever is in front at the stop.
 
 New parts:
 
 | Where | Role |
 |---|---|
-| `crates/murmur-core/src/annotations.rs` | Pure rules: keyframe choice from the signals, marks, the summary text (ja/en), path spelling, terminal bundle ids, all tuning constants. |
-| `crates/murmur-core/src/{session,pipeline,settings}.rs` | The annotation rows of the state machine (`Composing`, the new events and effects), speech segments grouped by keyframe (never cut inside a speech region), the three `Annotations*` settings. |
-| `src-tauri/src/annotation_session.rs` | Per-session work beside the controller: signals in recording time, candidate pictures, the plan at stop, the compose step, the bundle folder. |
+| `crates/murmur-core/src/annotations.rs` | Pure rules: strokes into groups (1.5 s apart, same screen), one picture per group (the screen right before the first stroke; a group on an unchanged screen joins the previous picture; at most 6), marks numbered in order, the pasted text (ja/en, with absolute picture paths for a terminal), terminal bundle ids, all tuning constants. |
+| `crates/murmur-core/src/{session,pipeline,settings}.rs` | The annotation rows of the state machine (`Composing`, words-only delivery, the longer bundle delivery timer), speech segments grouped by picture (never cut inside a speech region; everything before the first picture belongs to it, so no word is lost), the three `Annotations*` settings. |
+| `src-tauri/src/annotation_session.rs` | Per-session work beside the controller: screen samples and strokes in recording time, which pictures to keep (the newest one when Shift goes down, the one before each group), the plan at stop, the compose step, the bundle folder. |
 | `src-tauri/src/bundles.rs` | Folder and file modes, recording clock, `summary.md` / `annotation.json`, retention and the size cap. |
-| `adapters/screen.rs` | ScreenCaptureKit (the only file that uses it): 2 fps, long edge 1568 px, Murmur's windows excluded. |
-| `adapters/pointer.rs` | Clicks (global `NSEvent` monitor, no event tap), cursor and Shift (CoreGraphics), frontmost app name. |
-| `adapters/sheet.rs`, `adapters/image.rs` | Draws each keyframe with its marks and the contact sheet (CoreGraphics, ImageIO). |
-| `adapters/output.rs` | `deliver_bundle`: picture first (PNG on the pasteboard, Cmd+V), then the text; or the text alone. |
+| `adapters/screen.rs` | ScreenCaptureKit (the only file that uses it): 2 fps, long edge 1568 px, Murmur's windows excluded; the last four pictures stay in memory for `keep_frame`. |
+| `adapters/pointer.rs` | The Shift key (CoreGraphics, 30 Hz) and the cursor position at the start (which display). No clicks, no tracking, no app names. |
+| `adapters/frontmost.rs` | The app in front at the hotkey (pid, bundle id, its focused element through accessibility), brought back before the paste; checked again right before every Cmd+V. |
+| `adapters/draw.rs`, `adapters/image.rs` | Draws each picture at its captured size with its ink groups and number badges (CoreGraphics, CoreText, ImageIO). |
+| `adapters/output.rs` | `deliver_bundle`: each picture (PNG on the pasteboard, Cmd+V, 160 ms), then the text; a terminal gets the text alone. |
 | `windows.rs`, `capabilities/overlay.json` | The `overlay` panel: transparent, no focus, all Spaces, click-through until Shift is held, never captured. Its capability allows `submit_ink_stroke` only. |
 | `src/overlay/` | The drawing layer (`overlay.html`): strokes, 0.65 s hold, 0.85 s fade, sent as 0..1 points. |
 
 Flow at a glance:
 
 ```
-annotations hotkey -> Screen Recording check -> StartCapture (mic) + StartScreen + overlay shown
-  ... speech, clicks, Shift+drag strokes ; candidate pictures written to the bundle folder ...
-hotkey -> StopCapture + StopScreen + overlay hidden -> PlanKeyframes (core: keyframes, marks)
-  -> speech regions grouped by keyframe -> one transcription per group (inference thread)
-  -> Composing (<= 5 s): draw frames + contact sheet, build the summary
-  -> Deliver bundle: picture, then text (terminals get the path text instead)
-  -> Delivered -> SaveAnnotation: folder + row + cleanup                       (after the paste, G9)
+annotations hotkey -> remember the app in front -> Screen Recording check
+  -> StartCapture (mic) + StartScreen + overlay shown
+  ... speech, Shift+drag strokes ; the pictures before each stroke group kept in the bundle folder ...
+hotkey -> StopCapture + StopScreen + overlay hidden -> PlanKeyframes (core: pictures, marks)
+  -> speech regions grouped by picture -> one transcription per group (inference thread)
+  -> Composing (<= 5 s): draw the pictures, write summary.md and annotation.json
+  -> Deliver: bring the app back, pictures one by one, then the text (a terminal: the text with paths)
+  -> Delivered -> SaveAnnotation: row + cleanup                                  (after the paste, G9)
 ```
 
 Esc during recording or processing behaves like dictation (3 s undo, nothing is saved on cancel). If the screen
-capture fails the recording goes on with the pictures taken so far; with no pictures the words are pasted alone.
+capture fails nothing can be drawn, so the words go out alone. If a picture was drawn on but could not be made,
+the words go out alone with a notice. If the remembered app cannot be brought back to the front, nothing is
+pasted anywhere: the text goes to the clipboard and the pill says why.
 
 ## How to extend
 
@@ -126,7 +135,7 @@ capture fails the recording goes on with the pictures taken so far; with no pict
   as hotkey / Esc, for end-to-end tests without real keys or a real voice.
 - Debug builds also read the annotation inputs in `debug.rs`: `MURMUR_DEBUG_HOTKEY=annotations` makes SIGUSR1
   the annotations hotkey; `MURMUR_DEBUG_SCREEN=png-dir:<dir>` plays PNGs as the screen; `MURMUR_DEBUG_POINTER=<json>`
-  plays clicks, cursor, app names and strokes from a script instead of the real pointer;
+  plays Shift presses and strokes from a script instead of the real keys;
   `MURMUR_DEBUG_COMPOSE_DELAY_MS=<n>` delays the compose step to hit its timeout; SIGINFO flips the
   `annotations_enabled` setting. Release builds ignore all of them.
 - S1 (stream transcription): for recordings over 30 s, closed speech regions are transcribed while recording;
