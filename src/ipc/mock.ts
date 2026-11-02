@@ -720,9 +720,13 @@ mockIPC(
         );
         return null;
       case "set_pill_width": {
+        // Like the native window, which keeps one size: the widest capsule (PILL_MAX_WIDTH in
+        // windows.rs) plus the page's margin on every side. The page centers the capsule in it.
         const root = document.getElementById("root");
         if (root) {
-          root.style.width = `${Number(args.width)}px`;
+          const margin = Number.parseFloat(getComputedStyle(root).paddingLeft) || 0;
+          root.style.width = `${480 + 2 * margin}px`;
+          root.style.height = `${40 + 2 * margin}px`;
         }
         return null;
       }

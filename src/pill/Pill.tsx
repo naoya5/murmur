@@ -1,5 +1,5 @@
 import { AlertTriangle, Camera, Check, MicOff } from "lucide-react";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { I18nContext, resolveLocale, type Strings, strings } from "../i18n";
 import {
   type AnnotationPill,
@@ -14,6 +14,8 @@ import { formatClock } from "../lib/format";
 import { deadlineFrom, elapsedAt, fractionLeft, smoothLevel, startFrom } from "./countdown";
 
 const BAR_COUNT = 16;
+/** Transcribing: the wave also takes the clock's place (see `.pill__wave--breathe`), with more bars. */
+const BREATHE_BARS = Array.from({ length: 28 }, (_, i) => i);
 const CANCEL_TOTAL_MS = 3000;
 /** How long the drawing hint shows at the start of an annotation recording. */
 const HINT_MS = 3000;
@@ -67,9 +69,12 @@ function useWaveform(active: boolean, reducedMotion: boolean): number[] {
     return () => window.clearInterval(id);
   }, [active, reducedMotion]);
 
+  // The next recording starts flat, not with the last one's levels.
   useEffect(() => {
     if (!active) {
       smoothed.current = 0;
+      pending.current = new Array<number>(BAR_COUNT).fill(0);
+      setBars(pending.current);
     }
     return () => {
       if (frame.current) {
@@ -82,9 +87,20 @@ function useWaveform(active: boolean, reducedMotion: boolean): number[] {
   return bars;
 }
 
-function Waveform({ bars, shimmer }: { bars: number[]; shimmer: boolean }) {
+/** Recording: the live levels. Transcribing: every bar breathes, one step behind its left neighbour
+ *  (the bar index `--i` sets the phase in styles.css). */
+function Waveform({ bars, breathe }: { bars: number[]; breathe: boolean }) {
+  if (breathe) {
+    return (
+      <span className="pill__wave pill__wave--breathe" aria-hidden="true">
+        {BREATHE_BARS.map((i) => (
+          <span key={i} className="pill__bar" style={{ "--i": i } as CSSProperties} />
+        ))}
+      </span>
+    );
+  }
   return (
-    <span className={shimmer ? "pill__wave pill__wave--shimmer" : "pill__wave"} aria-hidden="true">
+    <span className="pill__wave" aria-hidden="true">
       {bars.map((level, i) => (
         <span
           // The ring has a fixed length; index is the identity of a slot.
@@ -93,6 +109,25 @@ function Waveform({ bars, shimmer }: { bars: number[]; shimmer: boolean }) {
           style={{ height: `${Math.round(3 + level * 17)}px` }}
         />
       ))}
+    </span>
+  );
+}
+
+/** The light that circles the capsule while it transcribes: a soft glow outside, a bright rim on the
+ *  edge. The halo goes under the capsule, the rim over it. */
+function Glow({ layer }: { layer: "halo" | "rim" }) {
+  if (layer === "halo") {
+    return (
+      <span className="pill-glow" aria-hidden="true">
+        <span className="pill-glow__band">
+          <span className="pill-glow__orbit" />
+        </span>
+      </span>
+    );
+  }
+  return (
+    <span className="pill-rim" aria-hidden="true">
+      <span className="pill-rim__orbit" />
     </span>
   );
 }
@@ -225,10 +260,11 @@ export default function Pill() {
   const busy = view.kind === "transcribing" || view.kind === "delivering";
   const bars = useWaveform(recording, reducedMotion);
 
-  // Elapsed time: resynced on every recording event, ticked locally.
+  // Elapsed time: resynced on every recording event, ticked locally. Synced before paint, so a new
+  // recording never shows the last one's time for a frame.
   const startRef = useRef(performance.now());
   const [elapsedMs, setElapsedMs] = useState(0);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (view.kind !== "recording") {
       return;
     }
@@ -270,23 +306,42 @@ export default function Pill() {
     return `${view.kind}:${state.language}:${annotation ? `shot${annotation.images}${annotation.screen_lost}${showHint}` : ""}`;
   }, [view, notice, state.language, t, annotation, showHint]);
 
-  // Width: measured from the content and sent to the native window on every layout change.
+  // Width: measured from the content on every layout change and sent to the native side, which cuts
+  // the glass to it. The page's capsule changes at the next paint, the glass at once. The glass must
+  // never stand out past the capsule (a bare gray slab), while the capsule's fill past the glass for
+  // a frame is hard to see: a narrower capsule is sent now, a wider one (the first one of a showing
+  // included: the glass waits at zero width) after the next paint.
   const contentRef = useRef<HTMLSpanElement>(null);
-  const lastWidth = useRef(0);
+  const sentWidth = useRef(0);
   // biome-ignore lint/correctness/useExhaustiveDependencies: layoutKey names every change that moves the content width
   useLayoutEffect(() => {
     if (view.kind === "hidden") {
-      lastWidth.current = 0;
+      sentWidth.current = 0;
       return;
     }
     if (!contentRef.current) {
       return;
     }
     const width = Math.ceil(contentRef.current.getBoundingClientRect().width);
-    if (width > 0 && width !== lastWidth.current) {
-      lastWidth.current = width;
-      commands.setPillWidth(width).catch(() => undefined);
+    if (width <= 0 || width === sentWidth.current) {
+      return;
     }
+    const send = () => {
+      sentWidth.current = width;
+      commands.setPillWidth(width).catch(() => undefined);
+    };
+    if (width < sentWidth.current) {
+      send();
+      return;
+    }
+    let afterPaint = 0;
+    const beforePaint = window.requestAnimationFrame(() => {
+      afterPaint = window.requestAnimationFrame(send);
+    });
+    return () => {
+      window.cancelAnimationFrame(beforePaint);
+      window.cancelAnimationFrame(afterPaint);
+    };
   }, [layoutKey]);
 
   if (view.kind === "hidden") {
@@ -295,53 +350,68 @@ export default function Pill() {
 
   const langTitle = state.language === "ja" ? t.common.japanese : t.common.english;
 
+  const contentClass =
+    recording || busy ? "pill pill--wave" : notice ? "pill pill--notice" : "pill";
+
   return (
     <I18nContext.Provider value={t}>
-      <button
-        type="button"
-        className="pill-capsule"
-        onClick={() => commands.pillClicked().catch(() => undefined)}
-        aria-label={
-          recording
-            ? `${t.pill.recording} ${formatClock(elapsedMs)}`
-            : view.kind === "cancel_pending"
-              ? t.pill.escToUndo
-              : busy
-                ? t.pill.transcribing
-                : (notice?.text ?? "")
-        }
-      >
-        <span ref={contentRef} className="pill">
-          {(recording || busy) && (
-            <>
-              <span className="pill__dot" style={busy ? { visibility: "hidden" } : undefined} />
-              {annotation && <ScreenMark annotation={annotation} t={t} />}
-              <Waveform bars={bars} shimmer={busy} />
-              <span className="pill__time">{formatClock(elapsedMs)}</span>
-              <span className="pill__lang" title={langTitle}>
-                {state.language === "ja" ? "あ" : "A"}
-              </span>
-              {recording && annotation?.screen_lost && (
-                <span className="pill__hint pill__hint--warn">{t.pill.annotation.screenLost}</span>
-              )}
-              {showHint && <span className="pill__hint">{t.pill.annotation.hint}</span>}
-            </>
-          )}
-          {view.kind === "cancel_pending" && (
-            <>
-              <Ring fraction={fraction} />
-              <span className="pill__text">{t.pill.escToUndo}</span>
-            </>
-          )}
-          {notice && (
-            <span className="pill__text">
-              <NoticeIcon tone={notice.icon} />
-              <span>{notice.text}</span>
-              {notice.sub && <span className="pill__sub">{notice.sub}</span>}
-            </span>
-          )}
-        </span>
-      </button>
+      <div className={busy ? "pill-frame pill-frame--glow" : "pill-frame"}>
+        {busy && <Glow layer="halo" />}
+        <button
+          type="button"
+          className="pill-capsule"
+          onClick={() => commands.pillClicked().catch(() => undefined)}
+          aria-label={
+            recording
+              ? `${t.pill.recording} ${formatClock(elapsedMs)}`
+              : view.kind === "cancel_pending"
+                ? t.pill.escToUndo
+                : busy
+                  ? t.pill.transcribing
+                  : (notice?.text ?? "")
+          }
+        >
+          <span ref={contentRef} className={contentClass}>
+            {(recording || busy) && (
+              <>
+                <span className="pill__well">
+                  {recording && <span className="pill__dot" />}
+                  <Waveform bars={bars} breathe={busy} />
+                </span>
+                {annotation && <ScreenMark annotation={annotation} t={t} />}
+                {recording && <span className="pill__time">{formatClock(elapsedMs)}</span>}
+                <span className="pill__lang" title={langTitle}>
+                  {state.language === "ja" ? "あ" : "A"}
+                </span>
+                {recording && annotation?.screen_lost && (
+                  <span className="pill__hint pill__hint--warn">
+                    {t.pill.annotation.screenLost}
+                  </span>
+                )}
+                {showHint && <span className="pill__hint">{t.pill.annotation.hint}</span>}
+              </>
+            )}
+            {view.kind === "cancel_pending" && (
+              <>
+                <Ring fraction={fraction} />
+                <span className="pill__text">{t.pill.escToUndo}</span>
+              </>
+            )}
+            {notice && (
+              <>
+                <span className="pill__well pill__well--icon">
+                  <NoticeIcon tone={notice.icon} />
+                </span>
+                <span className="pill__text">
+                  <span>{notice.text}</span>
+                  {notice.sub && <span className="pill__sub">{notice.sub}</span>}
+                </span>
+              </>
+            )}
+          </span>
+        </button>
+        {busy && <Glow layer="rim" />}
+      </div>
     </I18nContext.Provider>
   );
 }
