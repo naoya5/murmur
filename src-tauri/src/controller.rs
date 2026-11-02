@@ -15,10 +15,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use murmur_core::Language;
+use murmur_core::annotations as ann;
 use murmur_core::ports::{CancelToken, RawTranscript};
 use murmur_core::session::{
-    self, AnnotationsRefusal, CaptureError, DeliveryOutcome, Effect, Event, FailureKind, Machine,
-    PillView, SessionId, SessionKind, TranscribeOutcome, TranscriptText,
+    self, AnnotationsRefusal, CaptureError, ComposeOutcome, ComposeWords, DeliveryOutcome, Effect,
+    Event, FailureKind, Machine, Notice, PillView, PlanCounts, SessionId, SessionKind, State,
+    TranscribeOutcome, TranscriptText,
 };
 use murmur_core::text::{self, FormatOptions};
 use serde::Serialize;
@@ -29,16 +31,31 @@ use tokio::sync::{mpsc, watch};
 
 use crate::adapters::audio::{self, AudioConfig, AudioError, AudioEvent, CapturedAudio, Recorder};
 use crate::adapters::output::{self, DeliverOptions};
+use crate::adapters::pointer::{self, PointerEvent};
+use crate::adapters::screen::{self, DisplayInfo, ScreenCapture, ScreenConfig, ScreenEvent};
 use crate::adapters::sounds::{self, Cue};
+use crate::adapters::store::AnnotationRow;
+use crate::annotation_session::{self as ann_session, AnnotationCtx, PlanInput, Planned};
 use crate::app::App;
+use crate::bundles::{self, RecordingClock};
 use crate::history::{self, Record};
 use crate::inference::{
-    InferenceError, InferenceOutput, StreamId, StreamRequest, TranscribeRequest,
+    InferenceError, InferenceOutput, RangesRequest, RegionsRequest, StreamId, StreamRequest,
+    TranscribeRequest,
 };
-use crate::platform::macos::{self, Permission};
+use crate::ipc::{InkPoint, OverlayState};
+use crate::platform::macos::{self, Permission, PrivacyPane};
+
+type ScreenDone = Option<Arc<screen::Stopped>>;
 
 /// Paste must finish within this time; the output adapter has its own 1 s limit.
 const DELIVER_TIMEOUT: Duration = Duration::from_millis(1_500);
+/// A bundle paste (picture, gap, text) must finish within this; the adapter stops at 2.0 s and
+/// the machine's delivery timer at 2.5 s.
+const BUNDLE_DELIVER_TIMEOUT: Duration = Duration::from_millis(2_300);
+/// Stopping the screen capture (stream stop plus candidate writes) is bounded by the adapter at
+/// 6 s; the plan waits a little longer for it.
+const SCREEN_STOP_TIMEOUT: Duration = Duration::from_secs(8);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 /// Covers a pending open (3.5 s), owner close (3 s), and converter close (3 s).
 const CAPTURE_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -96,7 +113,50 @@ pub enum Msg {
         session: SessionId,
         result: Result<InferenceOutput, InferenceError>,
     },
+    /// A stroke from the drawing layer (epoch milliseconds).
+    InkStroke {
+        points: Vec<InkPoint>,
+        started_ms: f64,
+        ended_ms: f64,
+    },
+    ScreenStarted {
+        session: SessionId,
+        result: Result<(ScreenCapture, DisplayInfo), String>,
+    },
+    Screen {
+        session: SessionId,
+        event: ScreenEvent,
+    },
+    Pointer {
+        session: SessionId,
+        event: PointerEvent,
+    },
+    /// The keyframes are chosen (the stop pipeline, first half).
+    Planned {
+        session: SessionId,
+        planned: Planned,
+    },
+    /// The segments are transcribed (the stop pipeline, second half).
+    Segments {
+        session: SessionId,
+        result: Result<SegmentsOutcome, InferenceError>,
+    },
+    /// The pictures and the summary are written (or not).
+    Composed {
+        session: SessionId,
+        result: Result<(crate::adapters::sheet::Rendered, u64), String>,
+    },
     Shutdown,
+}
+
+/// What the segment transcription produced.
+pub enum SegmentsOutcome {
+    NoSpeech,
+    Chunks {
+        chunks: Vec<ann::Chunk>,
+        asr_ms: u64,
+        model_id: &'static str,
+    },
 }
 
 /// Facts about the captured audio that the history row needs.
@@ -152,6 +212,10 @@ struct SessionCtx {
     asr_ms: Option<u64>,
     model_id: Option<&'static str>,
     latency_ms: Option<u64>,
+    /// Annotation sessions only.
+    annotation: Option<AnnotationCtx>,
+    /// Resolves once the screen capture has stopped (an empty result when there was none).
+    screen_done: Option<(watch::Sender<ScreenDone>, watch::Receiver<ScreenDone>)>,
 }
 
 pub struct Controller {
@@ -212,7 +276,19 @@ impl Controller {
     /// Turns a message into a core event, updating session context on the way.
     fn translate(&mut self, msg: Msg) -> Option<Event> {
         match msg {
-            Msg::Core(event) => Some(event),
+            Msg::Core(event) => {
+                // A click on the "Screen Recording is needed" notice opens the settings pane.
+                // This lives here, not in the core: it is a window action, not a transition.
+                if event == Event::PillClicked
+                    && let State::Idle {
+                        notice: Some((Notice::AnnotationsRefused { reason }, _)),
+                    } = self.machine.state()
+                    && *reason == AnnotationsRefusal::ScreenRecordingDenied
+                {
+                    macos::open_privacy_pane(PrivacyPane::ScreenCapture);
+                }
+                Some(event)
+            }
             Msg::HotkeyDownWithLanguage(language) => {
                 self.language_override = Some(language);
                 Some(Event::HotkeyDown {
@@ -230,6 +306,35 @@ impl Controller {
                 None
             }
             Msg::Inferred { session, result } => self.on_inferred(session, result),
+            Msg::InkStroke {
+                points,
+                started_ms,
+                ended_ms,
+            } => {
+                let session = self.machine.active_session()?;
+                let ann = self.sessions.get_mut(&session)?.annotation.as_mut()?;
+                if ann.on_stroke(points, started_ms, ended_ms) {
+                    self.publish();
+                }
+                None
+            }
+            Msg::ScreenStarted { session, result } => self.on_screen_started(session, result),
+            Msg::Screen { session, event } => self.on_screen_event(session, event),
+            Msg::Pointer { session, event } => {
+                let ann = self.sessions.get_mut(&session)?.annotation.as_mut()?;
+                let shift_before = ann.shift_held;
+                let changed = ann.on_pointer(event);
+                if ann.shift_held != shift_before {
+                    crate::windows::set_overlay_interactive(&self.app, ann.shift_held);
+                }
+                if changed {
+                    self.publish();
+                }
+                None
+            }
+            Msg::Planned { session, planned } => self.on_planned(session, planned),
+            Msg::Segments { session, result } => self.on_segments(session, result),
+            Msg::Composed { session, result } => self.on_composed(session, result),
             Msg::Shutdown => None,
         }
     }
@@ -392,21 +497,22 @@ impl Controller {
                     let _ = tx.send(Msg::Core(Event::TimerFired(id)));
                 });
             }
-            // Annotation effects: nothing sends `Event::AnnotationsHotkey` yet, so these arms
-            // are never reached. The platform ticket gives them their adapters.
-            Effect::StartScreen { .. }
-            | Effect::PauseScreen { .. }
-            | Effect::ResumeScreen { .. }
-            | Effect::StopScreen { .. }
-            | Effect::ShowOverlay
-            | Effect::HideOverlay
-            | Effect::PlanKeyframes { .. }
-            | Effect::TranscribeSegments { .. }
-            | Effect::Compose { .. }
-            | Effect::DeliverBundle { .. }
-            | Effect::DeliverText { .. }
-            | Effect::SaveAnnotation { .. }
-            | Effect::DropAll { .. } => {}
+            // --- annotation sessions ---
+            Effect::StartScreen { session } => self.start_screen(session),
+            Effect::PauseScreen { session } => self.set_screen_paused(session, true),
+            Effect::ResumeScreen { session } => self.set_screen_paused(session, false),
+            Effect::StopScreen { session } => self.stop_screen(session),
+            Effect::ShowOverlay => self.show_overlay(),
+            Effect::HideOverlay => self.hide_overlay(),
+            Effect::PlanKeyframes { session } => self.plan_keyframes(session),
+            // The plan task carries on into the segment transcription: both wait for the same
+            // audio, and the segments need the plan first.
+            Effect::TranscribeSegments { .. } => {}
+            Effect::Compose { session, words } => self.compose(session, words),
+            Effect::DeliverBundle { session } => self.deliver_annotation(session, true),
+            Effect::DeliverText { session } => self.deliver_annotation(session, false),
+            Effect::SaveAnnotation { session, outcome } => self.save_annotation(session, outcome),
+            Effect::DropAll { session } => self.drop_all(session),
         }
     }
 
@@ -414,8 +520,8 @@ impl Controller {
     fn cue(&self, effect: &Effect) {
         let cue = match effect {
             Effect::StartCapture { .. } => Cue::Start,
-            Effect::Transcribe { .. } => Cue::Stop,
-            Effect::DropAudio { .. } => Cue::Cancel,
+            Effect::Transcribe { .. } | Effect::TranscribeSegments { .. } => Cue::Stop,
+            Effect::DropAudio { .. } | Effect::DropAll { .. } => Cue::Cancel,
             Effect::SaveFailure { .. } => Cue::Error,
             _ => return,
         };
@@ -437,7 +543,16 @@ impl Controller {
         let cancel = CancelToken::new();
         // Transcribe closed chunks while recording, when the model and the VAD are installed.
         // The dictionary is read here, once per recording, so every chunk uses the same words.
-        let stream = self.services.model_specs(language).map(|(model, vad)| {
+        // An annotation session is transcribed per segment at stop instead; it only warms the
+        // model here.
+        let annotation = self.machine.active_kind() == Some(SessionKind::Annotation);
+        if annotation && let Some((model, vad)) = self.services.model_specs(language) {
+            self.services.inference().warm(model, vad);
+        }
+        let specs = (!annotation)
+            .then(|| self.services.model_specs(language))
+            .flatten();
+        let stream = specs.map(|(model, vad)| {
             // Warm before the stream starts, overlapping the cold engine work with the user's speech.
             self.services.inference().warm(model.clone(), vad.clone());
             let id = StreamId(session.0);
@@ -480,6 +595,8 @@ impl Controller {
                 asr_ms: None,
                 model_id: None,
                 latency_ms: None,
+                annotation: None,
+                screen_done: None,
             },
         );
         // The model may still be loading; recording starts anyway.
@@ -750,13 +867,703 @@ impl Controller {
         });
     }
 
+    // --- annotation sessions ---
+
+    fn start_screen(&mut self, session: SessionId) {
+        let Some(ctx) = self.sessions.get_mut(&session) else {
+            return;
+        };
+        let now_epoch = chrono::Utc::now().timestamp_millis();
+        let origin_epoch = now_epoch as f64 - ctx.t_hotkey.elapsed().as_millis() as f64;
+        let clock = RecordingClock::new(ctx.t_hotkey, origin_epoch);
+        let root = self.services.paths().annotations.clone();
+        let annotation = match AnnotationCtx::new(&root, now_epoch, session.0, clock) {
+            Ok(annotation) => annotation,
+            Err(error) => {
+                tracing::warn!(session = session.0, %error, "bundle folder not created");
+                let _ = self.tx.send(Msg::Core(Event::ScreenFailed { session }));
+                return;
+            }
+        };
+        let config = ScreenConfig {
+            exclude_bundle_id: Some(self.app.config().identifier.clone()),
+            cursor: pointer::cursor_position().unwrap_or((0.0, 0.0)),
+            candidates_dir: annotation.candidates_dir.clone(),
+            origin: ctx.t_hotkey,
+        };
+        ctx.annotation = Some(annotation);
+        ctx.screen_done = Some(watch::channel(None));
+        let tx = self.tx.clone();
+        let events = self.tx.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let on_event: Arc<dyn Fn(ScreenEvent) + Send + Sync> = Arc::new(move |event| {
+                let _ = events.send(Msg::Screen { session, event });
+            });
+            let result = screen::start(config, on_event).map_err(|e| e.to_string());
+            let _ = tx.send(Msg::ScreenStarted { session, result });
+        });
+    }
+
+    fn on_screen_started(
+        &mut self,
+        session: SessionId,
+        result: Result<(ScreenCapture, DisplayInfo), String>,
+    ) -> Option<Event> {
+        let Some(ctx) = self.sessions.get_mut(&session) else {
+            // The session ended while the capture was starting: release it.
+            if let Ok((capture, _)) = result {
+                tauri::async_runtime::spawn_blocking(move || {
+                    let _ = capture.stop();
+                });
+            }
+            return None;
+        };
+        let annotation = ctx.annotation.as_mut()?;
+        match result {
+            Ok((capture, display)) => {
+                annotation.signals.display_pt =
+                    (display.rect.width as f32, display.rect.height as f32);
+                let tx = self.tx.clone();
+                let on_event: Arc<dyn Fn(PointerEvent) + Send + Sync> = Arc::new(move |event| {
+                    let _ = tx.send(Msg::Pointer { session, event });
+                });
+                annotation.pointer = Some(pointer::start(
+                    &self.app,
+                    display.rect,
+                    annotation.clock.origin(),
+                    on_event,
+                ));
+                annotation.screen = Some(capture);
+                annotation.display = Some(display);
+                None
+            }
+            Err(error) => {
+                tracing::warn!(session = session.0, %error, "screen capture did not start");
+                annotation.screen_failed = true;
+                Some(Event::ScreenFailed { session })
+            }
+        }
+    }
+
+    fn on_screen_event(&mut self, session: SessionId, event: ScreenEvent) -> Option<Event> {
+        let annotation = self.sessions.get_mut(&session)?.annotation.as_mut()?;
+        match event {
+            ScreenEvent::Frame(frame) => {
+                if annotation.on_frame(frame) {
+                    self.publish();
+                }
+                None
+            }
+            ScreenEvent::Failed(error) => {
+                tracing::warn!(session = session.0, %error, "screen capture stopped on its own");
+                annotation.screen_failed = true;
+                Some(Event::ScreenFailed { session })
+            }
+        }
+    }
+
+    fn set_screen_paused(&mut self, session: SessionId, paused: bool) {
+        let Some(annotation) = self
+            .sessions
+            .get_mut(&session)
+            .and_then(|c| c.annotation.as_mut())
+        else {
+            return;
+        };
+        let wall = annotation.clock.wall_now();
+        if paused {
+            annotation.clock.pause_at(wall);
+        } else {
+            annotation.clock.resume_at(wall);
+        }
+        if let Some(screen) = &annotation.screen {
+            screen.set_paused(paused);
+        }
+    }
+
+    /// Stops the pointer and the screen on a blocking thread; the plan waits for the result.
+    fn stop_screen(&mut self, session: SessionId) {
+        let Some(ctx) = self.sessions.get_mut(&session) else {
+            return;
+        };
+        let Some(annotation) = ctx.annotation.as_mut() else {
+            return;
+        };
+        annotation.target_bundle_id = pointer::frontmost_bundle_id();
+        let pointer = annotation.pointer.take();
+        let capture = annotation.screen.take();
+        let done = ctx.screen_done.as_ref().map(|(tx, _)| tx.clone());
+        tauri::async_runtime::spawn_blocking(move || {
+            if let Some(pointer) = pointer {
+                pointer.stop();
+            }
+            let stopped = match capture.map(ScreenCapture::stop) {
+                Some(Ok(stopped)) => stopped,
+                Some(Err(error)) => {
+                    tracing::warn!(session = session.0, %error, "screen capture stop failed");
+                    empty_stopped()
+                }
+                None => empty_stopped(),
+            };
+            if let Some(done) = done {
+                let _ = done.send(Some(Arc::new(stopped)));
+            }
+        });
+    }
+
+    fn show_overlay(&mut self) {
+        crate::windows::show_overlay(&self.app);
+        let started = self
+            .machine
+            .active_session()
+            .and_then(|s| self.sessions.get(&s))
+            .and_then(|c| c.annotation.as_ref())
+            .map_or_else(
+                || chrono::Utc::now().timestamp_millis() as f64,
+                |a| a.clock.origin_epoch_ms(),
+            );
+        if let Err(error) = (OverlayState::Shown {
+            recording_started_ms: started,
+        })
+        .emit(&self.app)
+        {
+            tracing::warn!(%error, "overlay state emit failed");
+        }
+    }
+
+    fn hide_overlay(&mut self) {
+        crate::windows::set_overlay_interactive(&self.app, false);
+        crate::windows::hide_overlay(&self.app);
+        if let Err(error) = OverlayState::Hidden.emit(&self.app) {
+            tracing::warn!(%error, "overlay state emit failed");
+        }
+    }
+
+    /// The stop pipeline: audio and screen done, VAD, keyframes (`Msg::Planned`), segments,
+    /// transcription (`Msg::Segments`). One task, because every step needs the previous one.
+    fn plan_keyframes(&mut self, session: SessionId) {
+        let Some(ctx) = self.sessions.get_mut(&session) else {
+            return;
+        };
+        let Some(annotation) = ctx.annotation.as_mut() else {
+            return;
+        };
+        let input = PlanInput {
+            signals: annotation.signals.clone(),
+            frame_of_sample: annotation.frame_of_sample.clone(),
+            apps: annotation.apps.clone(),
+            kept: annotation.kept.clone(),
+            candidates_dir: annotation.candidates_dir.clone(),
+            stopped_ms: annotation.clock.recording_now(),
+        };
+        let mut audio_rx = ctx.audio_rx.clone();
+        let screen_rx = ctx.screen_done.as_ref().map(|(_, rx)| rx.clone());
+        let language = ctx.language;
+        let cancel = ctx.cancel.clone();
+        let services = self.services.clone();
+        let tx = self.tx.clone();
+        tauri::async_runtime::spawn(async move {
+            let captured: Option<Captured> = {
+                let ready =
+                    tokio::time::timeout(CAPTURE_READY_TIMEOUT, audio_rx.wait_for(Option::is_some))
+                        .await;
+                match ready {
+                    Ok(Ok(guard)) => guard.clone(),
+                    _ => None,
+                }
+            };
+            let pcm = match captured {
+                Some(Captured { pcm: Some(pcm), .. }) => Some(pcm),
+                Some(Captured { pcm: None, meta }) => {
+                    let path = meta.spool_path.clone();
+                    tauri::async_runtime::spawn_blocking(move || audio::read_spool(&path))
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .map(Arc::new)
+                }
+                None => None,
+            };
+            let stopped = match screen_rx {
+                Some(mut rx) => {
+                    match tokio::time::timeout(SCREEN_STOP_TIMEOUT, rx.wait_for(Option::is_some))
+                        .await
+                    {
+                        Ok(Ok(guard)) => guard.clone(),
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+            let specs = services.model_specs(language);
+            let regions = match (&pcm, &specs) {
+                (Some(pcm), Some((_, vad))) if !pcm.is_empty() => {
+                    match services
+                        .inference()
+                        .detect_regions(RegionsRequest {
+                            pcm: pcm.clone(),
+                            vad: vad.clone(),
+                            cancel: cancel.clone(),
+                        })
+                        .await
+                    {
+                        Ok(regions) => regions,
+                        Err(error) => {
+                            tracing::warn!(session = session.0, %error, "VAD failed; no speech spans");
+                            Vec::new()
+                        }
+                    }
+                }
+                _ => Vec::new(),
+            };
+            // The adapter's list of written candidates is the truth: a write may have failed.
+            let mut input = input;
+            if let Some(stopped) = &stopped {
+                input.kept = stopped.kept.iter().map(|(index, _)| *index).collect();
+            }
+            let recent = stopped.map(|s| s.recent.clone()).unwrap_or_default();
+            let total = pcm.as_ref().map_or(0, |p| p.len());
+            let regions_for_plan = regions.clone();
+            let planned = tauri::async_runtime::spawn_blocking(move || {
+                ann_session::plan(input, &regions_for_plan, total, &recent)
+            })
+            .await;
+            let planned = match planned {
+                Ok(planned) => planned,
+                Err(error) => {
+                    tracing::warn!(session = session.0, %error, "the plan task failed");
+                    let _ = tx.send(Msg::Segments {
+                        session,
+                        result: Err(InferenceError::Audio("plan failed".into())),
+                    });
+                    return;
+                }
+            };
+            let segments = ann_session::segments(&planned);
+            let _ = tx.send(Msg::Planned {
+                session,
+                planned: planned.clone(),
+            });
+            // The pictures are planned either way; the words need the audio and the model.
+            let Some(pcm) = pcm else {
+                let _ = tx.send(Msg::Segments {
+                    session,
+                    result: Err(InferenceError::Audio("captured audio unavailable".into())),
+                });
+                return;
+            };
+            let Some((model, _)) = specs else {
+                let _ = tx.send(Msg::Segments {
+                    session,
+                    result: Err(InferenceError::ModelMissing),
+                });
+                return;
+            };
+            if segments.is_empty() {
+                let _ = tx.send(Msg::Segments {
+                    session,
+                    result: Ok(SegmentsOutcome::NoSpeech),
+                });
+                return;
+            }
+            let settings = services.settings();
+            let vocabulary = settings
+                .dictionary
+                .iter()
+                .filter(|e| e.scope.includes(language))
+                .cloned()
+                .collect();
+            let loading = services.inference().loaded_model() != Some(model.entry.id);
+            if loading {
+                let _ = tx.send(Msg::Core(Event::ModelLoading { session }));
+            }
+            let budget = backstop_timeout(pcm.len(), loading);
+            let request = RangesRequest {
+                pcm,
+                ranges: segments.iter().map(|s| s.audio.clone()).collect(),
+                language,
+                model,
+                vocabulary,
+                cancel: cancel.clone(),
+            };
+            let inference = services.inference().clone();
+            let result =
+                match tokio::time::timeout(budget, inference.transcribe_ranges(request)).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        cancel.cancel();
+                        Err(InferenceError::Cancelled)
+                    }
+                };
+            let result = result.map(|output| {
+                let opts = FormatOptions {
+                    remove_fillers: settings.remove_fillers,
+                    add_final_punctuation: settings.add_final_punctuation,
+                    apply_dictionary: !output.custom_vocabulary,
+                };
+                let chunks = segments
+                    .iter()
+                    .zip(output.texts)
+                    .filter_map(|(segment, raw)| {
+                        let formatted =
+                            text::format(&raw.text, language, &opts, &settings.dictionary);
+                        (!formatted.is_empty()).then(|| ann_session::chunk_of(segment, formatted))
+                    })
+                    .collect();
+                SegmentsOutcome::Chunks {
+                    chunks,
+                    asr_ms: output.asr_ms,
+                    model_id: output.model_id,
+                }
+            });
+            let _ = tx.send(Msg::Segments { session, result });
+        });
+    }
+
+    fn on_planned(&mut self, session: SessionId, planned: Planned) -> Option<Event> {
+        let annotation = self.sessions.get_mut(&session)?.annotation.as_mut()?;
+        let counts = PlanCounts {
+            keyframes: planned.selection.keyframes.len() as u32,
+            marks: planned.selection.marks.len() as u32,
+        };
+        tracing::info!(
+            session = session.0,
+            keyframes = counts.keyframes,
+            marks = counts.marks,
+            candidates = annotation.kept.len(),
+            "keyframes planned"
+        );
+        annotation.plan = Some(planned);
+        Some(Event::Planned { session, counts })
+    }
+
+    fn on_segments(
+        &mut self,
+        session: SessionId,
+        result: Result<SegmentsOutcome, InferenceError>,
+    ) -> Option<Event> {
+        let ctx = self.sessions.get_mut(&session)?;
+        let outcome = match result {
+            Ok(SegmentsOutcome::NoSpeech) => TranscribeOutcome::NoSpeech,
+            Ok(SegmentsOutcome::Chunks {
+                chunks,
+                asr_ms,
+                model_id,
+            }) => {
+                ctx.asr_ms = Some(asr_ms);
+                ctx.model_id = Some(model_id);
+                if chunks.is_empty() {
+                    TranscribeOutcome::NoSpeech
+                } else {
+                    let joined: Vec<String> = chunks.iter().map(|c| c.text.0.clone()).collect();
+                    let joined = murmur_core::pipeline::join_texts(&joined);
+                    if let Some(annotation) = ctx.annotation.as_mut() {
+                        annotation.chunks = chunks;
+                    }
+                    ctx.text = Some(joined.clone());
+                    TranscribeOutcome::Text(TranscriptText(joined))
+                }
+            }
+            Err(InferenceError::Cancelled) => return None,
+            Err(error) => {
+                let failure = match &error {
+                    InferenceError::ModelMissing => FailureKind::ModelMissing,
+                    InferenceError::ModelLoad(_) => FailureKind::ModelLoadFailed,
+                    InferenceError::Audio(_) => FailureKind::Audio,
+                    _ => FailureKind::Engine,
+                };
+                tracing::warn!(session = session.0, %error, "segment transcription failed");
+                if let Some(annotation) = ctx.annotation.as_mut() {
+                    annotation.failure = Some(failure);
+                }
+                TranscribeOutcome::Failed(failure)
+            }
+        };
+        Some(Event::Transcribed { session, outcome })
+    }
+
+    fn compose(&mut self, session: SessionId, words: ComposeWords) {
+        let Some(ctx) = self.sessions.get_mut(&session) else {
+            return;
+        };
+        let Some(annotation) = ctx.annotation.as_mut() else {
+            return;
+        };
+        annotation.words = Some(words);
+        let tx = self.tx.clone();
+        let Some(planned) = annotation.plan.clone() else {
+            let _ = tx.send(Msg::Composed {
+                session,
+                result: Err("no plan".into()),
+            });
+            return;
+        };
+        if planned.selection.keyframes.is_empty() {
+            let _ = tx.send(Msg::Composed {
+                session,
+                result: Err("no keyframe".into()),
+            });
+            return;
+        }
+        let chunks = annotation.chunks.clone();
+        let language = ctx.language;
+        let duration_ms = ctx
+            .meta
+            .as_ref()
+            .map_or_else(|| annotation.clock.recording_now(), |m| m.duration_ms);
+        let created_at_ms = annotation.created_at_ms;
+        let model_id = ctx.model_id.map(str::to_owned);
+        let display = ann_session::display_facts(annotation.display.as_ref());
+        let bundle_dir = annotation.bundle_dir.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let started = Instant::now();
+            let result = ann_session::compose(
+                &bundle_dir,
+                &planned,
+                &chunks,
+                words,
+                language,
+                duration_ms,
+                created_at_ms,
+                model_id.as_deref(),
+                display,
+            )
+            .map(|c| (c.rendered, started.elapsed().as_millis() as u64));
+            let _ = tx.send(Msg::Composed { session, result });
+        });
+    }
+
+    fn on_composed(
+        &mut self,
+        session: SessionId,
+        result: Result<(crate::adapters::sheet::Rendered, u64), String>,
+    ) -> Option<Event> {
+        let annotation = self.sessions.get_mut(&session)?.annotation.as_mut()?;
+        let outcome = match result {
+            Ok((rendered, compose_ms)) => {
+                tracing::info!(
+                    session = session.0,
+                    images = rendered.frames.len(),
+                    compose_ms,
+                    draw_ms = rendered.draw_ms,
+                    encode_ms = rendered.encode_ms,
+                    "bundle composed"
+                );
+                let images = rendered.frames.len() as u32;
+                annotation.compose_ms = Some(compose_ms);
+                annotation.rendered = Some(rendered);
+                ComposeOutcome::Bundle { images }
+            }
+            Err(error) => {
+                tracing::warn!(session = session.0, %error, "compose failed; words only");
+                ComposeOutcome::Failed
+            }
+        };
+        Some(Event::Composed { session, outcome })
+    }
+
+    /// Pastes the bundle (`with_pictures`) or the words alone, then reports `Delivered`.
+    fn deliver_annotation(&mut self, session: SessionId, with_pictures: bool) {
+        let settings = self.services.settings();
+        let opts = DeliverOptions {
+            auto_paste: settings.auto_paste,
+            restore_clipboard: settings.restore_clipboard,
+        };
+        let Some(ctx) = self.sessions.get_mut(&session) else {
+            return;
+        };
+        let Some(annotation) = ctx.annotation.as_mut() else {
+            return;
+        };
+        let target = ann::paste_target(annotation.target_bundle_id.as_deref());
+        let sheet = with_pictures
+            .then(|| annotation.rendered.as_ref().map(|r| r.sheet.clone()))
+            .flatten();
+        let planned = annotation.plan.clone().unwrap_or_else(|| Planned {
+            selection: ann::Selection::default(),
+            pictures: Vec::new(),
+            regions: Vec::new(),
+            total_samples: 0,
+        });
+        let duration_ms = ctx
+            .meta
+            .as_ref()
+            .map_or_else(|| annotation.clock.recording_now(), |m| m.duration_ms);
+        let words = annotation.words.unwrap_or(ComposeWords::Transcribed);
+        let sheet_text = sheet.as_ref().map(|p| p.to_string_lossy().into_owned());
+        let text = ann_session::summary_text(
+            ctx.language,
+            duration_ms,
+            sheet_text.as_deref(),
+            target,
+            &planned,
+            &annotation.chunks,
+            words,
+        );
+        ctx.text = Some(text.clone());
+        let t_stop = ctx.t_stop;
+        let tx = self.tx.clone();
+        tauri::async_runtime::spawn(async move {
+            let job = tauri::async_runtime::spawn_blocking(move || {
+                output::deliver_bundle(sheet.as_deref(), &text, opts, target)
+            });
+            let outcome = match tokio::time::timeout(BUNDLE_DELIVER_TIMEOUT, job).await {
+                Ok(Ok(outcome)) => outcome,
+                _ => DeliveryOutcome::Unconfirmed,
+            };
+            if let Some(t_stop) = t_stop {
+                tracing::info!(
+                    session = session.0,
+                    latency_ms = t_stop.elapsed().as_millis() as u64,
+                    ?outcome,
+                    ?target,
+                    with_pictures,
+                    "bundle delivered"
+                );
+            }
+            let _ = tx.send(Msg::Core(Event::Delivered { session, outcome }));
+        });
+        if let Some(t_stop) = t_stop {
+            ctx.latency_ms = Some(t_stop.elapsed().as_millis() as u64);
+        }
+    }
+
+    /// After the paste (G9): the row, the candidate cleanup, the retention cleanup, the spool.
+    fn save_annotation(&mut self, session: SessionId, outcome: DeliveryOutcome) {
+        let Some(mut ctx) = self.sessions.remove(&session) else {
+            return;
+        };
+        let Some(annotation) = ctx.annotation.take() else {
+            return;
+        };
+        if let Some(text) = &ctx.text {
+            self.services.remember_last(text.clone());
+        }
+        let words = annotation.words.unwrap_or(ComposeWords::Transcribed);
+        let status = ann_session::status_of(words, annotation.rendered.is_some());
+        let (keyframes, marks) = annotation.plan.as_ref().map_or((0, 0), |p| {
+            (
+                p.selection.keyframes.len() as u32,
+                p.selection.marks.len() as u32,
+            )
+        });
+        tracing::info!(
+            session = session.0,
+            ?outcome,
+            ?status,
+            keyframes,
+            marks,
+            latency_ms = ctx.latency_ms,
+            asr_ms = ctx.asr_ms,
+            compose_ms = annotation.compose_ms,
+            "annotation saved"
+        );
+        let failure = annotation.failure.or(match words {
+            ComposeWords::Failed => Some(FailureKind::Timeout),
+            _ => None,
+        });
+        let row = AnnotationRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            created_at_ms: annotation.created_at_ms,
+            status,
+            folder: annotation.folder.clone(),
+            duration_ms: ctx.meta.as_ref().map_or(0, |m| m.duration_ms),
+            keyframes,
+            marks,
+            language: Some(ctx.language),
+            model_id: ctx.model_id.map(str::to_owned),
+            latency_ms: ctx.latency_ms,
+            asr_ms: ctx.asr_ms,
+            compose_ms: annotation.compose_ms,
+            error: failure.map(|f| history::failure_text(f).to_owned()),
+        };
+        let failed_record = failure.map(|f| Self::record(&ctx, Some(f)));
+        let app = self.app.clone();
+        let store = self.services.store().clone();
+        let root = self.services.paths().annotations.clone();
+        let retention = self.services.settings().annotations_retention_days;
+        let candidates_dir = annotation.candidates_dir;
+        let spool = ctx.spool_path;
+        let mut rx = ctx.audio_rx;
+        tauri::async_runtime::spawn(async move {
+            // The audio must be complete on disk before a failed row points at it.
+            let _ = tokio::time::timeout(OPEN_TIMEOUT, rx.wait_for(Option::is_some)).await;
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(error) = store.insert_annotation(&row) {
+                    tracing::error!(%error, "could not save the annotation row");
+                }
+                ann_session::remove_candidates(&candidates_dir);
+                let now = chrono::Utc::now().timestamp_millis();
+                bundles::cleanup(&store, &root, retention, now);
+                match failed_record {
+                    // The words failed: the audio stays, with a history row that can retry it.
+                    Some(record) => history::save_failure(app, store, record, spool),
+                    None => {
+                        if let Err(error) = std::fs::remove_file(&spool)
+                            && error.kind() != std::io::ErrorKind::NotFound
+                        {
+                            tracing::warn!(%error, "could not delete spool file");
+                        }
+                    }
+                }
+            });
+        });
+    }
+
+    /// Ends an annotation session without a trace: screen, pointer, engine, audio, folder.
+    fn drop_all(&mut self, session: SessionId) {
+        let Some(mut ctx) = self.sessions.remove(&session) else {
+            return;
+        };
+        self.cancel_stream(&ctx);
+        ctx.cancel.cancel();
+        if ctx.recorder.is_some() || ctx.audio_tx.is_some() {
+            Self::stop_recorder(&mut ctx, self.tx.clone(), session);
+        }
+        let root = self.services.paths().annotations.clone();
+        let annotation = ctx.annotation.take();
+        let screen_rx = ctx.screen_done.as_ref().map(|(_, rx)| rx.clone());
+        let mut rx = ctx.audio_rx;
+        let spool = ctx.spool_path;
+        tauri::async_runtime::spawn(async move {
+            let _ = tokio::time::timeout(OPEN_TIMEOUT, rx.wait_for(Option::is_some)).await;
+            // The screen stop (and its candidate writes) must be over before the folder goes.
+            if let Some(mut screen_rx) = screen_rx {
+                let _ =
+                    tokio::time::timeout(SCREEN_STOP_TIMEOUT, screen_rx.wait_for(Option::is_some))
+                        .await;
+            }
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Some(annotation) = annotation {
+                    if let Some(pointer) = annotation.pointer {
+                        pointer.stop();
+                    }
+                    if let Some(screen) = annotation.screen {
+                        let _ = screen.stop();
+                    }
+                    ann_session::remove_bundle(&root, &annotation.folder);
+                }
+                if let Err(error) = std::fs::remove_file(&spool)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(%error, "could not delete spool file");
+                }
+            });
+        });
+    }
+
     /// Emits the pill state and shows or hides the pill window.
     fn publish(&mut self) {
         let view = self.machine.view(self.now());
         let annotation = (self.machine.active_kind() == Some(SessionKind::Annotation)).then(|| {
+            let images = self
+                .machine
+                .active_session()
+                .and_then(|s| self.sessions.get(&s))
+                .and_then(|c| c.annotation.as_ref())
+                .map_or(0, AnnotationCtx::images);
             AnnotationPill {
-                // The picture count arrives with the screen adapter (M3).
-                images: 0,
+                images,
                 screen_lost: self.machine.screen_lost(),
             }
         });
@@ -779,6 +1586,14 @@ impl Controller {
     fn shutdown(&mut self) {
         for (_, ctx) in self.sessions.drain() {
             ctx.cancel.cancel();
+            if let Some(annotation) = ctx.annotation {
+                if let Some(pointer) = annotation.pointer {
+                    pointer.stop();
+                }
+                if let Some(screen) = annotation.screen {
+                    let _ = screen.stop();
+                }
+            }
             if let Some(id) = ctx.stream {
                 self.services.inference().stream_cancel(id);
             }
@@ -787,6 +1602,15 @@ impl Controller {
                 let _ = recorder.stop();
             }
         }
+    }
+}
+
+/// What the plan sees when there was no screen capture at all.
+fn empty_stopped() -> screen::Stopped {
+    screen::Stopped {
+        frames: Vec::new(),
+        kept: Vec::new(),
+        recent: Vec::new(),
     }
 }
 

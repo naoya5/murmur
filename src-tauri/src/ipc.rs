@@ -521,7 +521,6 @@ pub struct InkPoint {
 /// the one clock the webview and the backend share; the backend converts them to recording time.
 #[derive(Debug, Clone, Copy, Serialize, Type, tauri_specta::Event)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-#[allow(dead_code)] // emitted by the controller from the platform milestone on
 pub enum OverlayState {
     /// An annotation recording runs: show the hint, draw strokes, send each one when it ends.
     Shown { recording_started_ms: f64 },
@@ -533,9 +532,19 @@ pub enum OverlayState {
 /// milliseconds, as in `OverlayState::Shown`. Only the overlay window may call this.
 #[tauri::command]
 #[specta::specta]
-pub fn submit_ink_stroke(points: Vec<InkPoint>, started_ms: f64, ended_ms: f64) {
-    // Wired to the controller with the platform milestone; until then strokes are dropped.
-    let _ = (points, started_ms, ended_ms);
+pub fn submit_ink_stroke(
+    services: Services<'_>,
+    points: Vec<InkPoint>,
+    started_ms: f64,
+    ended_ms: f64,
+) {
+    if let Some(controller) = services.controller() {
+        controller.send(crate::controller::Msg::InkStroke {
+            points,
+            started_ms,
+            ended_ms,
+        });
+    }
 }
 
 /// Opens the annotations folder in the Finder. The folder is created by the first bundle, never

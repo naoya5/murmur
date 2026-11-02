@@ -3,7 +3,6 @@
 //!
 //! Not an adapter of its own: `screen.rs` writes candidate pictures through it and `sheet.rs`
 //! draws the keyframes and the contact sheet with it. Pictures never reach the log (G7).
-#![allow(dead_code)] // the readers are used by the controller from the next milestone on
 
 use std::ffi::c_void;
 use std::os::unix::fs::PermissionsExt;
@@ -128,14 +127,6 @@ impl Canvas {
 
     pub fn ctx(&self) -> &CGContext {
         &self.ctx
-    }
-
-    pub fn width(&self) -> usize {
-        self.bitmap.width
-    }
-
-    pub fn height(&self) -> usize {
-        self.bitmap.height
     }
 
     /// Fills the whole canvas with an opaque colour (components 0 to 1).

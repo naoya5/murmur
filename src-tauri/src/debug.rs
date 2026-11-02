@@ -1,8 +1,9 @@
 //! Debug-build-only triggers for end-to-end tests without real keys (ARCHITECTURE, deviations):
 //! SIGUSR1 acts as the main hotkey (toggle), SIGUSR2 as Esc. Combined with the `wav:<path>`
 //! microphone, a test drives a full dictation: `kill -USR1 <pid>`, wait, `kill -USR1 <pid>`.
-//! SIGINFO flips the experimental annotations switch (the setting), SIGWINCH acts as the
-//! annotations hotkey.
+//! SIGINFO flips the experimental annotations switch (the setting). With
+//! `MURMUR_DEBUG_HOTKEY=annotations` in the environment, SIGUSR1 acts as the annotations hotkey
+//! instead of the dictation one (SIGWINCH is not used: terminals send it on every resize).
 
 use std::sync::Arc;
 
@@ -15,24 +16,31 @@ use crate::controller::{ControllerHandle, Msg};
 
 pub fn install(app: tauri::AppHandle, services: Arc<App>, controller: ControllerHandle) {
     tauri::async_runtime::spawn(async move {
-        let (Ok(mut hotkey), Ok(mut esc), Ok(mut toggle), Ok(mut annotations)) = (
+        let (Ok(mut hotkey), Ok(mut esc), Ok(mut toggle)) = (
             signal(SignalKind::user_defined1()),
             signal(SignalKind::user_defined2()),
             signal(SignalKind::info()),
-            signal(SignalKind::window_change()),
         ) else {
             tracing::warn!("debug signal triggers unavailable");
             return;
         };
+        let annotations_hotkey =
+            std::env::var("MURMUR_DEBUG_HOTKEY").is_ok_and(|v| v == "annotations");
         tracing::info!(
             pid = std::process::id(),
-            "debug triggers: SIGUSR1 = hotkey, SIGUSR2 = Esc, SIGINFO = annotations on/off, SIGWINCH = annotations hotkey"
+            annotations_hotkey,
+            "debug triggers: SIGUSR1 = hotkey, SIGUSR2 = Esc, SIGINFO = annotations on/off"
         );
         loop {
             tokio::select! {
-                Some(()) = hotkey.recv() => controller.event(Event::HotkeyDown { mode: RecordMode::Toggle }),
+                Some(()) = hotkey.recv() => {
+                    if annotations_hotkey {
+                        controller.send(Msg::AnnotationsHotkey);
+                    } else {
+                        controller.event(Event::HotkeyDown { mode: RecordMode::Toggle });
+                    }
+                }
                 Some(()) = esc.recv() => controller.event(Event::Esc),
-                Some(()) = annotations.recv() => controller.send(Msg::AnnotationsHotkey),
                 Some(()) = toggle.recv() => {
                     let (app, services) = (app.clone(), services.clone());
                     tauri::async_runtime::spawn_blocking(move || {

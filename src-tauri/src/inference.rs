@@ -25,8 +25,8 @@ use murmur_core::Language;
 use murmur_core::catalog::Family;
 use murmur_core::pipeline::{self, Finish, IncrementalPlan, Plan};
 use murmur_core::ports::{
-    CancelToken, EngineError, ModelSpec, RawTranscript, SpeechEngine, TranscribeOptions,
-    VoiceDetector,
+    CancelToken, EngineError, ModelSpec, RawTranscript, SpeechEngine, SpeechRegion,
+    TranscribeOptions, VoiceDetector,
 };
 use murmur_core::settings::DictionaryEntry;
 use murmur_core::text;
@@ -44,6 +44,32 @@ pub struct TranscribeRequest {
     pub vad: ModelSpec,
     pub vocabulary: Vec<DictionaryEntry>,
     pub cancel: CancelToken,
+}
+
+/// Voice activity over a finished recording (annotations: the plan needs the speech spans first).
+pub struct RegionsRequest {
+    pub pcm: Arc<Vec<f32>>,
+    pub vad: ModelSpec,
+    pub cancel: CancelToken,
+}
+
+/// Transcription of given sample ranges, one text each (annotations: one range per segment).
+pub struct RangesRequest {
+    pub pcm: Arc<Vec<f32>>,
+    pub ranges: Vec<Range<usize>>,
+    pub language: Language,
+    pub model: ModelSpec,
+    pub vocabulary: Vec<DictionaryEntry>,
+    pub cancel: CancelToken,
+}
+
+/// One raw text per requested range (empty when the model heard nothing there).
+#[derive(Debug)]
+pub struct RangesOutput {
+    pub texts: Vec<RawTranscript>,
+    pub asr_ms: u64,
+    pub model_id: &'static str,
+    pub custom_vocabulary: bool,
 }
 
 /// One streaming transcription (S1); the controller uses the session id.
@@ -91,6 +117,8 @@ pub enum InferenceError {
 }
 
 type Reply = oneshot::Sender<Result<InferenceOutput, InferenceError>>;
+type RegionsReply = oneshot::Sender<Result<Vec<SpeechRegion>, InferenceError>>;
+type RangesReply = oneshot::Sender<Result<RangesOutput, InferenceError>>;
 
 /// Audio that may wait while the worker is busy (an engine call, or a cold model load at the
 /// start of a recording, which can take several seconds). 30 s is about 1.9 MB, so memory stays
@@ -133,6 +161,14 @@ enum Job {
     Transcribe {
         req: TranscribeRequest,
         reply: Reply,
+    },
+    DetectRegions {
+        req: RegionsRequest,
+        reply: RegionsReply,
+    },
+    TranscribeRanges {
+        req: RangesRequest,
+        reply: RangesReply,
     },
     StreamStart {
         id: StreamId,
@@ -246,6 +282,30 @@ impl Inference {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Job::Transcribe { req, reply })
+            .map_err(|_| InferenceError::Shutdown)?;
+        rx.await.map_err(|_| InferenceError::Shutdown)?
+    }
+
+    /// The speech regions of a finished recording (annotations).
+    pub async fn detect_regions(
+        &self,
+        req: RegionsRequest,
+    ) -> Result<Vec<SpeechRegion>, InferenceError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Job::DetectRegions { req, reply })
+            .map_err(|_| InferenceError::Shutdown)?;
+        rx.await.map_err(|_| InferenceError::Shutdown)?
+    }
+
+    /// Transcribes each range on its own, in order (annotations: one per segment).
+    pub async fn transcribe_ranges(
+        &self,
+        req: RangesRequest,
+    ) -> Result<RangesOutput, InferenceError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Job::TranscribeRanges { req, reply })
             .map_err(|_| InferenceError::Shutdown)?;
         rx.await.map_err(|_| InferenceError::Shutdown)?
     }
@@ -375,6 +435,14 @@ impl Worker {
             }
             Job::Transcribe { req, reply } => {
                 let result = self.transcribe(req);
+                let _ = reply.send(result);
+            }
+            Job::DetectRegions { req, reply } => {
+                let result = self.detect_regions(req);
+                let _ = reply.send(result);
+            }
+            Job::TranscribeRanges { req, reply } => {
+                let result = self.transcribe_ranges(req);
                 let _ = reply.send(result);
             }
             Job::StreamStart { id, req, buffer } => self.stream_start(id, req, buffer),
@@ -621,6 +689,74 @@ impl Worker {
             languages,
             started.elapsed().as_millis() as u64,
         ))
+    }
+
+    // --- annotations ---
+
+    fn detect_regions(&mut self, req: RegionsRequest) -> Result<Vec<SpeechRegion>, InferenceError> {
+        if req.cancel.is_cancelled() {
+            return Err(InferenceError::Cancelled);
+        }
+        self.ensure_vad(&req.vad).map_err(InferenceError::Engine)?;
+        let Some(vad) = self.vad.as_mut() else {
+            return Err(InferenceError::Engine(EngineError::NotLoaded));
+        };
+        vad.detector
+            .regions(&req.pcm)
+            .map_err(InferenceError::Engine)
+    }
+
+    fn transcribe_ranges(&mut self, req: RangesRequest) -> Result<RangesOutput, InferenceError> {
+        if req.cancel.is_cancelled() {
+            return Err(InferenceError::Cancelled);
+        }
+        self.ensure_model(&req.model)
+            .map_err(InferenceError::ModelLoad)?;
+        let Some(engine) = self.engine.as_mut() else {
+            return Err(InferenceError::ModelLoad(EngineError::NotLoaded));
+        };
+        let started = Instant::now();
+        let opts = TranscribeOptions {
+            language: req.language,
+            vocabulary: req.vocabulary,
+            cancel: req.cancel.clone(),
+        };
+        let mut texts = Vec::with_capacity(req.ranges.len());
+        for range in &req.ranges {
+            if opts.cancel.is_cancelled() {
+                return Err(InferenceError::Cancelled);
+            }
+            let text = match req.pcm.get(range.clone()) {
+                Some(slice) if !slice.is_empty() => {
+                    let raw = engine
+                        .engine
+                        .transcribe(slice, &opts)
+                        .map_err(|e| match e {
+                            EngineError::Cancelled => InferenceError::Cancelled,
+                            other => InferenceError::Engine(other),
+                        })?;
+                    if text::is_hallucination(&raw.text) {
+                        RawTranscript {
+                            text: String::new(),
+                            languages: raw.languages,
+                        }
+                    } else {
+                        raw
+                    }
+                }
+                _ => RawTranscript {
+                    text: String::new(),
+                    languages: Vec::new(),
+                },
+            };
+            texts.push(text);
+        }
+        Ok(RangesOutput {
+            texts,
+            asr_ms: started.elapsed().as_millis() as u64,
+            model_id: engine.id,
+            custom_vocabulary: engine.custom_vocabulary,
+        })
     }
 
     // --- streaming (S1) ---

@@ -7,7 +7,6 @@
 //! controller can keep one as a candidate PNG when the core asks for it (`keep_frame`). The
 //! screen sends no picture while nothing changes, so every frame carries its arrival time.
 //! Pictures never reach the log (G7). Every wait has a timeout (G5). Nothing panics (G6).
-#![allow(dead_code)] // wired into the controller by the next milestone
 
 use std::collections::VecDeque;
 use std::os::unix::fs::DirBuilderExt;
@@ -292,7 +291,7 @@ unsafe impl<T: ?Sized> Send for Shareable<T> {}
 unsafe impl<T: ?Sized> Sync for Shareable<T> {}
 
 /// The dispatch queue the pictures arrive on, kept alive with the stream.
-struct SharedQueue(dispatch2::DispatchRetained<DispatchQueue>);
+struct SharedQueue(#[allow(dead_code)] dispatch2::DispatchRetained<DispatchQueue>);
 
 // SAFETY: a dispatch queue is thread-safe by design; the handle is only kept alive here.
 unsafe impl Send for SharedQueue {}
@@ -300,7 +299,10 @@ unsafe impl Sync for SharedQueue {}
 
 pub struct ScreenCapture {
     stream: Shareable<SCStream>,
+    /// Kept alive for the stream: SCK holds them weakly.
+    #[allow(dead_code)]
     output: Shareable<Output>,
+    #[allow(dead_code)]
     queue: SharedQueue,
     shared: Arc<Shared>,
 }

@@ -5,7 +5,6 @@
 //! The layout rules (grid by count, gutters, chip size) live here with pure helpers that tests
 //! cover; the drawing itself is smoke-tested with synthetic pictures. Pictures and the words
 //! they go with never reach the log (G7). Nothing here panics (G6).
-#![allow(dead_code)] // wired into the controller by the next milestone
 
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};

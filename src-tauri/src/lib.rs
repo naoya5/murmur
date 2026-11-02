@@ -6,6 +6,7 @@
 //! frees the model before the process ends (Metal aborts if a model is still loaded).
 
 mod adapters;
+mod annotation_session;
 mod app;
 mod bundles;
 mod controller;

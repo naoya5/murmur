@@ -7,7 +7,6 @@
 //! A `CGEventTap` would need the Input Monitoring permission, so it is not used (stage 0, 7).
 //! Positions are reported as shares of the recorded display (0 to 1); times as milliseconds
 //! since the `origin` the caller passes. Names never reach the log (G7). Nothing panics (G6).
-#![allow(dead_code)] // wired into the controller by the next milestone
 
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -221,6 +220,13 @@ fn frontmost_app_name() -> Option<String> {
     app.localizedName().map(|n| n.to_string())
 }
 
+/// The bundle id of the frontmost app (which app receives the paste).
+pub fn frontmost_bundle_id() -> Option<String> {
+    let workspace = NSWorkspace::sharedWorkspace();
+    let app = workspace.frontmostApplication()?;
+    app.bundleIdentifier().map(|n| n.to_string())
+}
+
 /// AppKit global coordinates (origin bottom left of the main display) to CoreGraphics global
 /// coordinates (origin top left of the main display).
 pub fn appkit_to_cg(point: (f64, f64), main_display_height: f64) -> (f64, f64) {
@@ -289,5 +295,6 @@ mod tests {
         let _ = shift_held();
         let _ = cursor_position();
         let _ = frontmost_app_name();
+        let _ = frontmost_bundle_id();
     }
 }
