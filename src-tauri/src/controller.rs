@@ -56,7 +56,7 @@ type ScreenDone = Option<Arc<screen::Stopped>>;
 const DELIVER_TIMEOUT: Duration = Duration::from_millis(1_500);
 /// A bundle paste (picture, gap, text) must finish within this; the adapter stops at 2.0 s and
 /// the machine's delivery timer at 2.5 s.
-const BUNDLE_DELIVER_TIMEOUT: Duration = Duration::from_millis(2_300);
+const BUNDLE_DELIVER_TIMEOUT: Duration = Duration::from_millis(4_500);
 /// Stopping the screen capture (stream stop plus candidate writes) is bounded by the adapter at
 /// 6 s; the plan waits a little longer for it.
 const SCREEN_STOP_TIMEOUT: Duration = Duration::from_secs(8);
@@ -96,6 +96,16 @@ pub struct AudioLevel {
 /// The history changed (insert, update, delete). The UI reloads what it shows.
 #[derive(Debug, Clone, Copy, Serialize, Type, tauri_specta::Event)]
 pub struct HistoryChanged;
+
+/// What the compose step came back with.
+pub enum ComposeResult {
+    /// The pictures are drawn and the files written; the time it took.
+    Rendered(crate::adapters::draw::Rendered, u64),
+    /// Nothing was drawn: no picture was wanted, the words go out alone.
+    WordsOnly,
+    /// A picture was wanted but could not be made.
+    Failed(String),
+}
 
 /// Messages into the controller loop.
 pub enum Msg {
@@ -148,7 +158,7 @@ pub enum Msg {
     /// The pictures and the summary are written (or not).
     Composed {
         session: SessionId,
-        result: Result<(crate::adapters::sheet::Rendered, u64), String>,
+        result: ComposeResult,
     },
     /// The drawing layer's page has mounted and wants the current state.
     OverlayReady,
@@ -939,8 +949,6 @@ impl Controller {
         let annotation = ctx.annotation.as_mut()?;
         match result {
             Ok((capture, display)) => {
-                annotation.signals.display_pt =
-                    (display.rect.width as f32, display.rect.height as f32);
                 let tx = self.tx.clone();
                 let on_event: Arc<dyn Fn(PointerEvent) + Send + Sync> = Arc::new(move |event| {
                     let _ = tx.send(Msg::Pointer { session, event });
@@ -971,12 +979,7 @@ impl Controller {
                             }
                         }
                     }
-                    None => Some(Box::new(pointer::start(
-                        &self.app,
-                        display.rect,
-                        annotation.clock.origin(),
-                        on_event,
-                    ))),
+                    None => Some(Box::new(pointer::start(on_event))),
                 };
                 annotation.screen = Some(capture);
                 annotation.display = Some(display);
@@ -1111,7 +1114,6 @@ impl Controller {
         let input = PlanInput {
             signals: annotation.signals.clone(),
             frame_of_sample: annotation.frame_of_sample.clone(),
-            apps: annotation.apps.clone(),
             kept: annotation.kept.clone(),
             candidates_dir: annotation.candidates_dir.clone(),
             stopped_ms: annotation.clock.recording_now(),
@@ -1370,15 +1372,18 @@ impl Controller {
         let Some(planned) = annotation.plan.clone() else {
             let _ = tx.send(Msg::Composed {
                 session,
-                result: Err("no plan".into()),
+                result: ComposeResult::Failed("no plan".into()),
             });
             return;
         };
         if planned.selection.keyframes.is_empty() {
-            let _ = tx.send(Msg::Composed {
-                session,
-                result: Err("no keyframe".into()),
-            });
+            // Nothing drawn: the words go out as a dictation. Drawn but no picture: a failure.
+            let result = if planned.pictures_wanted() {
+                ComposeResult::Failed("no picture for the ink".into())
+            } else {
+                ComposeResult::WordsOnly
+            };
+            let _ = tx.send(Msg::Composed { session, result });
             return;
         }
         let chunks = annotation.chunks.clone();
@@ -1410,16 +1415,14 @@ impl Controller {
                 display,
                 target_bundle_id.as_deref(),
             )
-            .map(|c| (c.rendered, started.elapsed().as_millis() as u64));
+            .map_or_else(ComposeResult::Failed, |c| {
+                ComposeResult::Rendered(c.rendered, started.elapsed().as_millis() as u64)
+            });
             let _ = tx.send(Msg::Composed { session, result });
         });
     }
 
-    fn on_composed(
-        &mut self,
-        session: SessionId,
-        result: Result<(crate::adapters::sheet::Rendered, u64), String>,
-    ) -> Option<Event> {
+    fn on_composed(&mut self, session: SessionId, result: ComposeResult) -> Option<Event> {
         // After the compose timer the words went out alone; a late result must not turn the
         // saved row into "ok".
         let composing = match self.machine.state() {
@@ -1437,7 +1440,7 @@ impl Controller {
         }
         let annotation = self.sessions.get_mut(&session)?.annotation.as_mut()?;
         let outcome = match result {
-            Ok((rendered, compose_ms)) => {
+            ComposeResult::Rendered(rendered, compose_ms) => {
                 tracing::info!(
                     session = session.0,
                     images = rendered.frames.len(),
@@ -1451,7 +1454,11 @@ impl Controller {
                 annotation.rendered = Some(rendered);
                 ComposeOutcome::Bundle { images }
             }
-            Err(error) => {
+            ComposeResult::WordsOnly => {
+                tracing::info!(session = session.0, "nothing drawn: words only");
+                ComposeOutcome::WordsOnly
+            }
+            ComposeResult::Failed(error) => {
                 tracing::warn!(session = session.0, %error, "compose failed; words only");
                 ComposeOutcome::Failed
             }
@@ -1473,32 +1480,25 @@ impl Controller {
             return;
         };
         let target = ann::paste_target(annotation.target_bundle_id.as_deref());
-        let sheet = with_pictures
-            .then(|| annotation.rendered.as_ref().map(|r| r.sheet.clone()))
-            .flatten();
-        let planned = annotation.plan.clone().unwrap_or_else(|| Planned {
-            selection: ann::Selection::default(),
-            pictures: Vec::new(),
-            regions: Vec::new(),
-            total_samples: 0,
-        });
-        let duration_ms = ctx
-            .meta
-            .as_ref()
-            .map_or_else(|| annotation.clock.recording_now(), |m| m.duration_ms);
+        let pictures: Vec<PathBuf> = with_pictures
+            .then(|| annotation.rendered.as_ref().map(|r| r.frames.clone()))
+            .flatten()
+            .unwrap_or_default();
+        // Without pictures the text carries no marks: they would name files that do not exist.
+        let planned = with_pictures
+            .then(|| annotation.plan.clone())
+            .flatten()
+            .unwrap_or_else(|| Planned {
+                selection: ann::Selection::default(),
+                pictures: Vec::new(),
+                regions: Vec::new(),
+                total_samples: 0,
+            });
         let words = annotation.words.unwrap_or(ComposeWords::Transcribed);
-        let sheet_text = sheet.as_ref().map(|p| p.to_string_lossy().into_owned());
-        let frame_count = if sheet.is_some() {
-            annotation.rendered.as_ref().map_or(0, |r| r.frames.len())
-        } else {
-            0
-        };
         let text = ann_session::summary_text(
             ctx.language,
-            duration_ms,
-            sheet_text.as_deref(),
-            frame_count,
             target,
+            &annotation.bundle_dir,
             &planned,
             &annotation.chunks,
             words,
@@ -1509,7 +1509,7 @@ impl Controller {
         let tx = self.tx.clone();
         tauri::async_runtime::spawn(async move {
             let job = tauri::async_runtime::spawn_blocking(move || {
-                output::deliver_bundle(sheet.as_deref(), &text, opts, target, front)
+                output::deliver_bundle(&pictures, &text, opts, target, front)
             });
             let outcome = match tokio::time::timeout(BUNDLE_DELIVER_TIMEOUT, job).await {
                 Ok(Ok(outcome)) => outcome,
@@ -1544,13 +1544,19 @@ impl Controller {
             self.services.remember_last(text.clone());
         }
         let words = annotation.words.unwrap_or(ComposeWords::Transcribed);
-        let status = ann_session::status_of(words, annotation.rendered.is_some());
-        let (keyframes, marks) = annotation.plan.as_ref().map_or((0, 0), |p| {
-            (
-                p.selection.keyframes.len() as u32,
-                p.selection.marks.len() as u32,
-            )
-        });
+        let pictures_wanted = annotation
+            .plan
+            .as_ref()
+            .is_some_and(Planned::pictures_wanted);
+        let status = ann_session::status_of(words, pictures_wanted, annotation.rendered.is_some());
+        // The row counts what went out: nothing when the pictures could not be made.
+        let (keyframes, marks) = match (&annotation.rendered, &annotation.plan) {
+            (Some(rendered), Some(plan)) => (
+                rendered.frames.len() as u32,
+                plan.selection.marks.len() as u32,
+            ),
+            _ => (0, 0),
+        };
         tracing::info!(
             session = session.0,
             ?outcome,
@@ -1583,19 +1589,18 @@ impl Controller {
         };
         // A bundle without pictures still gets its summary and record on disk.
         let text_only_files = if annotation.rendered.is_none() {
-            let planned = annotation.plan.clone().unwrap_or_else(|| Planned {
+            // No pictures on disk, so no picture and no mark in the record either.
+            let planned = Planned {
                 selection: ann::Selection::default(),
                 pictures: Vec::new(),
                 regions: Vec::new(),
                 total_samples: 0,
-            });
+            };
             let duration_ms = ctx.meta.as_ref().map_or(0, |m| m.duration_ms);
             let summary = ann_session::summary_text(
                 ctx.language,
-                duration_ms,
-                None,
-                0,
                 ann::PasteTarget::Other,
+                &annotation.bundle_dir,
                 &planned,
                 &annotation.chunks,
                 words,

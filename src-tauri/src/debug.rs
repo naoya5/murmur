@@ -7,9 +7,9 @@
 //!
 //! Annotation inputs, read by the controller through the functions below (release builds get
 //! `None`): `MURMUR_DEBUG_SCREEN=png-dir:<dir>` plays a PNG sequence as the screen at 2 fps;
-//! `MURMUR_DEBUG_POINTER=<script.json>` plays clicks, cursor positions, app names and strokes
-//! from a script instead of watching the real pointer (so a person's clicks never leak into a
-//! test); `MURMUR_DEBUG_COMPOSE_DELAY_MS=<n>` delays the compose step to force its timeout.
+//! `MURMUR_DEBUG_POINTER=<script.json>` plays Shift presses and strokes from a script instead
+//! of watching the real keys (so a person at the Mac never changes a test);
+//! `MURMUR_DEBUG_COMPOSE_DELAY_MS=<n>` delays the compose step to force its timeout.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -46,10 +46,10 @@ pub fn compose_delay() -> Option<Duration> {
         .map(Duration::from_millis)
 }
 
-/// Plays a pointer script: `{"events": [...]}` with `kind` one of `click` (`t_ms`, `at`),
-/// `cursor` (`t_ms`, `at`), `app` (`t_ms`, `name`), `shift` (`t_ms`, `held`) or `stroke`
-/// (`t0_ms`, `t1_ms`, `points`). Times are recording milliseconds; positions are shares of the
-/// display. Strokes are reported like the drawing layer does, in epoch milliseconds.
+/// Plays a pointer script: `{"events": [...]}` with `kind` one of `shift` (`t_ms`, `held`) or
+/// `stroke` (`t0_ms`, `t1_ms`, `points`). Times are recording milliseconds; positions are
+/// shares of the display. Strokes are reported like the drawing layer does, in epoch
+/// milliseconds. Any other kind is ignored.
 pub struct ScriptPlayer {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -97,24 +97,6 @@ pub fn play_pointer_script(
                     Some((v.get(0)?.as_f64()? as f32, v.get(1)?.as_f64()? as f32))
                 };
                 match event["kind"].as_str().unwrap_or("") {
-                    "click" => {
-                        if let Some(at) = at(&event["at"]) {
-                            on_pointer(PointerEvent::Click { t_ms: t, at });
-                        }
-                    }
-                    "cursor" => {
-                        if let Some(at) = at(&event["at"]) {
-                            on_pointer(PointerEvent::Cursor { t_ms: t, at });
-                        }
-                    }
-                    "app" => {
-                        if let Some(name) = event["name"].as_str() {
-                            on_pointer(PointerEvent::App {
-                                t_ms: t,
-                                name: name.to_owned(),
-                            });
-                        }
-                    }
                     "shift" => on_pointer(PointerEvent::Shift(
                         event["held"].as_bool().unwrap_or(false),
                     )),

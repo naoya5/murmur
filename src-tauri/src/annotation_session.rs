@@ -1,36 +1,35 @@
 //! The per-session work of an annotation recording, beside the controller: the signals the
-//! adapters report (pictures, clicks, strokes, cursor, app names) in recording time, which
-//! candidate pictures to keep, the plan at stop (VAD, keyframes, segments), the compose step
-//! (pictures and summary) and the bundle folder. The controller owns one `AnnotationCtx` per
-//! annotation session and calls into here from its effect handlers; nothing here steps the
-//! state machine.
+//! adapters report (pictures, Shift, strokes) in recording time, which pictures to keep, the
+//! plan at stop (VAD, pictures, segments), the compose step (pictures and the pasted text) and
+//! the bundle folder. The controller owns one `AnnotationCtx` per annotation session and calls
+//! into here from its effect handlers; nothing here steps the state machine.
 //!
-//! Rules kept here: times are recording time with pauses removed (`RecordingClock`); the words,
-//! app names and pictures never reach the log (G7); every wait has a timeout (G5); the bundle
-//! folder is private (0700 / 0600).
+//! Rules kept here: times are recording time with pauses removed (`RecordingClock`); the words
+//! and pictures never reach the log (G7); every wait has a timeout (G5); the bundle folder is
+//! private (0700 / 0600).
 
 use std::collections::BTreeSet;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use murmur_core::annotations::{
-    self as ann, AppName, Chunk, Click, CursorSample, InkStroke, PasteTarget, ScreenSample,
-    Selection, Signals, SpeechSpan, Summary,
+    self as ann, Chunk, InkStroke, PasteTarget, ScreenSample, Selection, Signals, SpeechSpan,
+    Summary,
 };
 use murmur_core::ports::SpeechRegion;
 use murmur_core::session::{ComposeWords, TranscriptText};
 use murmur_core::{Language, pipeline};
 
+use crate::adapters::draw::{self, FrameInput, Rendered};
 use crate::adapters::frontmost::FrontApp;
 use crate::adapters::image::{self, Bitmap};
 use crate::adapters::pointer::{PointerEvent, PointerFeed};
 use crate::adapters::screen::{DisplayInfo, Frame, ScreenCapture};
-use crate::adapters::sheet::{self, FrameInput, Rendered};
 use crate::adapters::store::AnnotationStatus;
 use crate::bundles::{self, DisplayFacts, RecordingClock};
 use crate::ipc::InkPoint;
 
-/// What the live recording has gathered, plus what the stop pipeline adds.
+/// The state of one annotation session, from the hotkey to the save.
 pub struct AnnotationCtx {
     pub clock: RecordingClock,
     pub created_at_ms: i64,
@@ -40,12 +39,10 @@ pub struct AnnotationCtx {
     pub screen: Option<ScreenCapture>,
     pub display: Option<DisplayInfo>,
     pub pointer: Option<Box<dyn PointerFeed>>,
-    /// Signals in recording time. App names are filled in at plan time from `apps`.
+    /// Signals in recording time.
     pub signals: Signals,
     /// Frame index of each screen sample (the candidate file name), in sample order.
     pub frame_of_sample: Vec<usize>,
-    /// App name changes in recording time.
-    pub apps: Vec<(u64, String)>,
     /// Frame indices written to `candidates/`.
     pub kept: BTreeSet<usize>,
     pub shift_held: bool,
@@ -67,10 +64,17 @@ pub struct AnnotationCtx {
 #[derive(Debug, Clone)]
 pub struct Planned {
     pub selection: Selection,
-    /// `candidates/<frame>.png` for each keyframe, in keyframe order.
+    /// `candidates/<frame>.png` for each picture, in picture order.
     pub pictures: Vec<PathBuf>,
     pub regions: Vec<SpeechRegion>,
     pub total_samples: usize,
+}
+
+impl Planned {
+    /// Whether the user drew anything: a picture is wanted, even when none could be made.
+    pub fn pictures_wanted(&self) -> bool {
+        !self.selection.keyframes.is_empty() || self.selection.dropped_groups > 0
+    }
 }
 
 impl AnnotationCtx {
@@ -99,7 +103,6 @@ impl AnnotationCtx {
             pointer: None,
             signals: Signals::default(),
             frame_of_sample: Vec::new(),
-            apps: Vec::new(),
             kept: BTreeSet::new(),
             shift_held: false,
             screen_failed: false,
@@ -114,15 +117,15 @@ impl AnnotationCtx {
         })
     }
 
-    /// Pictures the pill shows: the keyframes once chosen, else the candidates kept so far.
+    /// Pictures the pill shows: the pictures once chosen, else the ink groups so far.
     pub fn images(&self) -> u32 {
         match &self.plan {
             Some(plan) => plan.selection.keyframes.len() as u32,
-            None => self.kept.len() as u32,
+            None => ann::ink_groups(&self.signals).len() as u32,
         }
     }
 
-    /// A picture arrived. Returns true when the kept set changed (the pill shows the count).
+    /// A picture arrived. Returns true when the pill should refresh.
     pub fn on_frame(&mut self, frame: Frame) -> bool {
         let Some(t_ms) = self.clock.recording_from_wall(frame.t_ms) else {
             return false;
@@ -130,42 +133,28 @@ impl AnnotationCtx {
         self.signals.samples.push(ScreenSample {
             t_ms,
             cells: frame.cells,
-            app: AppName::default(),
         });
         self.frame_of_sample.push(frame.index);
-        self.keep_candidates()
+        false
     }
 
+    /// Shift went down or up. Shift down means a stroke may follow: the newest picture is
+    /// kept now, so the picture right before the drawing is there even when the stroke takes
+    /// longer than the screen adapter's memory. Returns true when the pill should refresh.
     pub fn on_pointer(&mut self, event: PointerEvent) -> bool {
         match event {
-            PointerEvent::Click { t_ms, at } => {
-                let Some(t_ms) = self.clock.recording_from_wall(t_ms) else {
-                    return false;
-                };
-                self.signals.clicks.push(Click { t_ms, at });
-                self.keep_candidates()
-            }
-            PointerEvent::Cursor { t_ms, at } => {
-                if let Some(t_ms) = self.clock.recording_from_wall(t_ms) {
-                    self.signals.cursor.push(CursorSample { t_ms, at });
-                    return self.keep_candidates();
-                }
-                false
-            }
             PointerEvent::Shift(held) => {
                 self.shift_held = held;
-                false
-            }
-            PointerEvent::App { t_ms, name } => {
-                if let Some(t_ms) = self.clock.recording_from_wall(t_ms) {
-                    self.apps.push((t_ms, name));
+                if held && let Some(frame) = self.frame_of_sample.last().copied() {
+                    self.keep(frame);
                 }
                 false
             }
         }
     }
 
-    /// A stroke from the drawing layer (epoch milliseconds).
+    /// A stroke from the drawing layer (epoch milliseconds). The picture before its group's
+    /// first stroke is kept. Returns true when the pill should refresh.
     pub fn on_stroke(&mut self, points: Vec<InkPoint>, started_ms: f64, ended_ms: f64) -> bool {
         let (Some(t0_ms), Some(t1_ms)) = (
             self.clock.recording_from_epoch(started_ms),
@@ -176,72 +165,47 @@ impl AnnotationCtx {
         if points.is_empty() {
             return false;
         }
+        let groups_before = ann::ink_groups(&self.signals).len();
         self.signals.strokes.push(InkStroke {
             t0_ms,
             t1_ms: t1_ms.max(t0_ms),
             points: points.into_iter().map(|p| (p.x, p.y)).collect(),
         });
-        self.keep_candidates()
-    }
-
-    /// Runs the core candidate rules on the signals so far and asks the screen adapter to keep
-    /// every picture that is new. Dwells cannot be judged live (they need the speech spans), so
-    /// one span over the whole recording stands in; the plan at stop decides for real.
-    fn keep_candidates(&mut self) -> bool {
-        let Some(screen) = &self.screen else {
-            return false;
-        };
-        let mut live = self.signals.clone();
-        live.stopped_ms = self.clock.recording_now();
-        live.speech = vec![SpeechSpan {
-            start_ms: 0,
-            end_ms: live.stopped_ms.saturating_add(1),
-        }];
-        let mut candidates = ann::candidates(&live);
-        ann::prune_candidates(&mut candidates);
-        let mut changed = false;
-        for candidate in candidates {
-            let Some(frame) = self.frame_of_sample.get(candidate.sample).copied() else {
-                continue;
-            };
-            if self.kept.contains(&frame) {
-                continue;
-            }
-            match screen.keep_frame(frame) {
-                Ok(()) => {
-                    self.kept.insert(frame);
-                    changed = true;
-                }
-                Err(error) => tracing::debug!(%error, "candidate picture not kept"),
+        for sample in ann::ink_samples(&self.signals) {
+            if let Some(frame) = self.frame_of_sample.get(sample).copied() {
+                self.keep(frame);
             }
         }
-        changed
+        ann::ink_groups(&self.signals).len() != groups_before
     }
 
-    /// The app in front at each sample, from the names the pointer adapter reported.
-    fn app_at(apps: &[(u64, String)], t_ms: u64) -> AppName {
-        AppName(
-            apps.iter()
-                .rev()
-                .find(|(t, _)| *t <= t_ms)
-                .or_else(|| apps.first())
-                .map(|(_, name)| name.clone())
-                .unwrap_or_default(),
-        )
+    /// Asks the screen adapter to keep a picture as a candidate PNG, once.
+    fn keep(&mut self, frame: usize) {
+        if self.kept.contains(&frame) {
+            return;
+        }
+        let Some(screen) = &self.screen else {
+            return;
+        };
+        match screen.keep_frame(frame) {
+            Ok(()) => {
+                self.kept.insert(frame);
+            }
+            Err(error) => tracing::debug!(%error, "candidate picture not kept"),
+        }
     }
 }
 
-/// Everything the stop pipeline needs, moved out of the controller task.
+/// What the controller hands to `plan` (its own copies: the plan runs on another thread).
 pub struct PlanInput {
     pub signals: Signals,
     pub frame_of_sample: Vec<usize>,
-    pub apps: Vec<(u64, String)>,
     pub kept: BTreeSet<usize>,
     pub candidates_dir: PathBuf,
     pub stopped_ms: u64,
 }
 
-/// Chooses the keyframes and makes sure each has a picture on disk. Pure work plus a few PNG
+/// Chooses the pictures and makes sure each has a file on disk. Pure work plus a few PNG
 /// writes from the pictures still in memory; blocking, call it off the controller loop.
 pub fn plan(
     mut input: PlanInput,
@@ -257,16 +221,13 @@ pub fn plan(
             end_ms: ann::samples_to_ms(r.end),
         })
         .collect();
-    for sample in &mut input.signals.samples {
-        sample.app = AnnotationCtx::app_at(&input.apps, sample.t_ms);
-    }
     let mut selection = ann::select_keyframes(&input.signals);
 
-    // A picture for every keyframe: kept already, still in memory, or the nearest kept one.
+    // A file for every picture: kept already, still in memory, or the nearest kept one.
     let mut kept: Vec<usize> = input.kept.iter().copied().collect();
     let mut pictures = Vec::with_capacity(selection.keyframes.len());
     let mut missing = Vec::new();
-    for (i, keyframe) in selection.keyframes.iter_mut().enumerate() {
+    for (i, keyframe) in selection.keyframes.iter().enumerate() {
         let frame = input.frame_of_sample.get(keyframe.sample).copied();
         let path_of = |frame: usize| input.candidates_dir.join(format!("{frame}.png"));
         let chosen = match frame {
@@ -278,7 +239,7 @@ pub fn plan(
                         Some(frame)
                     }
                     Err(error) => {
-                        tracing::warn!(%error, "end picture not written");
+                        tracing::warn!(%error, "picture not written");
                         bundles::nearest_kept(frame, &kept)
                     }
                 },
@@ -291,22 +252,16 @@ pub fn plan(
             None => missing.push(i),
         }
     }
-    // A keyframe without any picture cannot be drawn: drop it and renumber.
+    // A picture without any file cannot be drawn: its groups are dropped and the rest renumbered.
     if !missing.is_empty() {
-        tracing::warn!(
-            dropped = missing.len(),
-            "keyframes without a picture dropped"
-        );
-        let keep: Vec<bool> = (0..selection.keyframes.len())
-            .map(|i| !missing.contains(&i))
-            .collect();
-        let mut n = 0;
+        tracing::warn!(dropped = missing.len(), "pictures without a file dropped");
         let mut renumber = vec![0usize; selection.keyframes.len() + 1];
+        let mut n = 0;
         selection.keyframes = selection
             .keyframes
             .into_iter()
             .enumerate()
-            .filter(|(i, _)| keep[*i])
+            .filter(|(i, _)| !missing.contains(i))
             .map(|(i, mut k)| {
                 n += 1;
                 renumber[i + 1] = n;
@@ -314,15 +269,19 @@ pub fn plan(
                 k
             })
             .collect();
-        selection.marks.retain(|m| renumber[m.keyframe()] != 0);
-        for mark in &mut selection.marks {
-            let to = renumber[mark.keyframe()];
-            match mark {
-                ann::Mark::Ink { keyframe, .. }
-                | ann::Mark::Click { keyframe, .. }
-                | ann::Mark::Dwell { keyframe, .. } => *keyframe = to,
-            }
+        let before = selection.marks.len();
+        selection.marks.retain(|m| renumber[m.keyframe] != 0);
+        selection.dropped_groups += before - selection.marks.len();
+        for (label, mark) in selection.marks.iter_mut().enumerate() {
+            mark.keyframe = renumber[mark.keyframe];
+            mark.label = label as u32 + 1;
         }
+    }
+    if selection.dropped_groups > 0 {
+        tracing::info!(
+            dropped = selection.dropped_groups,
+            "ink groups without a picture"
+        );
     }
     Planned {
         selection,
@@ -332,7 +291,7 @@ pub fn plan(
     }
 }
 
-/// The audio ranges to transcribe, one keyframe each, and the chunk each becomes.
+/// The audio ranges to transcribe, one picture each, and the chunk each becomes.
 pub fn segments(planned: &Planned) -> Vec<pipeline::Segment> {
     let starts = ann::keyframe_starts_in_samples(&planned.selection.keyframes);
     pipeline::segment_by_keyframes(
@@ -343,7 +302,7 @@ pub fn segments(planned: &Planned) -> Vec<pipeline::Segment> {
     )
 }
 
-/// The chunk of a transcribed segment (keyframe index to the 1-based picture number).
+/// The chunk of a transcribed segment (picture index to the 1-based picture number).
 pub fn chunk_of(segment: &pipeline::Segment, text: String) -> Chunk {
     Chunk {
         start_ms: ann::samples_to_ms(segment.speech.start),
@@ -353,12 +312,12 @@ pub fn chunk_of(segment: &pipeline::Segment, text: String) -> Chunk {
     }
 }
 
-/// What the compose step produced besides the pictures.
+/// What the compose step produced besides the files.
 pub struct Composed {
     pub rendered: Rendered,
 }
 
-/// Draws the frames and the sheet and writes `summary.md` and `annotation.json`. Blocking.
+/// Draws the pictures and writes `summary.md` and `annotation.json`. Blocking.
 #[allow(clippy::too_many_arguments)]
 pub fn compose(
     bundle_dir: &Path,
@@ -376,18 +335,7 @@ pub fn compose(
     for path in &planned.pictures {
         pictures.push(image::read_png(path).map_err(|e| e.to_string())?);
     }
-    let frames: Vec<FrameInput<'_>> = planned
-        .selection
-        .keyframes
-        .iter()
-        .zip(&pictures)
-        .map(|(k, picture)| FrameInput {
-            n: k.n,
-            picture,
-            marks: &[],
-        })
-        .collect();
-    // Marks per keyframe (borrowed slices need the per-keyframe vectors to live here).
+    // Marks per picture (borrowed slices need the per-picture vectors to live here).
     let per_keyframe: Vec<Vec<ann::Mark>> = planned
         .selection
         .keyframes
@@ -397,24 +345,30 @@ pub fn compose(
                 .selection
                 .marks
                 .iter()
-                .filter(|m| m.keyframe() == k.n)
+                .filter(|m| m.keyframe == k.n)
                 .cloned()
                 .collect()
         })
         .collect();
-    let frames: Vec<FrameInput<'_>> = frames
-        .into_iter()
+    let frames: Vec<FrameInput<'_>> = planned
+        .selection
+        .keyframes
+        .iter()
+        .zip(&pictures)
         .zip(&per_keyframe)
-        .map(|(f, marks)| FrameInput { marks, ..f })
+        .map(|((k, picture), marks)| FrameInput {
+            n: k.n,
+            picture,
+            marks,
+        })
         .collect();
-    let rendered = sheet::render(&frames, bundle_dir).map_err(|e| e.to_string())?;
-    let status = status_of(words, true);
+    let rendered = draw::render(&frames, bundle_dir).map_err(|e| e.to_string())?;
+    let status = status_of(words, true, true);
+    // The saved text is the one an ordinary app receives (no paths).
     let summary = summary_text(
         language,
-        duration_ms,
-        Some(&rendered.sheet.to_string_lossy()),
-        rendered.frames.len(),
         PasteTarget::Other,
+        bundle_dir,
         planned,
         chunks,
         words,
@@ -435,36 +389,31 @@ pub fn compose(
     Ok(Composed { rendered })
 }
 
-/// The text to paste: with the sheet path (plain or `\ ` form) or words only.
-#[allow(clippy::too_many_arguments)]
+/// The text to paste: the words with the marks of the pictures (and their paths for a
+/// terminal), or the words alone.
 pub fn summary_text(
     language: Language,
-    duration_ms: u64,
-    sheet_path: Option<&str>,
-    frame_count: usize,
     target: PasteTarget,
+    bundle_dir: &Path,
     planned: &Planned,
     chunks: &[Chunk],
     words: ComposeWords,
 ) -> String {
     ann::summary_text(&Summary {
         language,
-        duration_ms,
-        sheet_path,
-        frame_count,
         target,
-        keyframes: &planned.selection.keyframes,
+        bundle_dir: &bundle_dir.to_string_lossy(),
         marks: &planned.selection.marks,
         chunks,
         transcription_failed: words == ComposeWords::Failed,
     })
 }
 
-/// The row status: failed words win, then a bundle without pictures, else ok.
-pub fn status_of(words: ComposeWords, pictures: bool) -> AnnotationStatus {
-    match (words, pictures) {
-        (ComposeWords::Failed, _) => AnnotationStatus::Failed,
-        (_, false) => AnnotationStatus::TextOnly,
+/// The row status: failed words win, then pictures wanted but not made, else ok.
+pub fn status_of(words: ComposeWords, pictures_wanted: bool, rendered: bool) -> AnnotationStatus {
+    match (words, pictures_wanted, rendered) {
+        (ComposeWords::Failed, _, _) => AnnotationStatus::Failed,
+        (_, true, false) => AnnotationStatus::TextOnly,
         _ => AnnotationStatus::Ok,
     }
 }
@@ -478,7 +427,7 @@ pub fn display_facts(display: Option<&DisplayInfo>) -> Option<DisplayFacts> {
     })
 }
 
-/// Removes the candidate pictures after the save (the keyframes are in `frames/`).
+/// Removes the candidate pictures after the save (the chosen ones are in `frames/`).
 pub fn remove_candidates(candidates_dir: &Path) {
     if let Err(error) = std::fs::remove_dir_all(candidates_dir)
         && error.kind() != std::io::ErrorKind::NotFound
@@ -502,134 +451,146 @@ pub fn remove_bundle(root: &Path, folder: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use murmur_core::annotations::{Keyframe, KeyframeReason, Mark};
+    use murmur_core::annotations::{GRID_CELLS, Keyframe};
 
-    fn planned_with(keyframes: Vec<Keyframe>, marks: Vec<Mark>) -> Planned {
-        Planned {
-            selection: Selection { keyframes, marks },
-            pictures: Vec::new(),
-            regions: vec![SpeechRegion {
-                start: 0,
-                end: 16_000 * 5,
-            }],
-            total_samples: 16_000 * 10,
-        }
+    fn scratch() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("murmur-plan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
-    fn keyframe(n: usize, t_ms: u64) -> Keyframe {
-        Keyframe {
-            n,
+    fn sample(t_ms: u64) -> ScreenSample {
+        ScreenSample {
             t_ms,
-            sample: n - 1,
-            reasons: vec![KeyframeReason::Click],
-            app: AppName::default(),
+            cells: vec![0.3; GRID_CELLS],
+        }
+    }
+
+    fn stroke(t0_ms: u64, t1_ms: u64) -> InkStroke {
+        InkStroke {
+            t0_ms,
+            t1_ms,
+            points: vec![(0.1, 0.1), (0.2, 0.2)],
+        }
+    }
+
+    fn region(start_s: f64, end_s: f64) -> SpeechRegion {
+        let sr = murmur_core::SAMPLE_RATE_HZ as f64;
+        SpeechRegion {
+            start: (start_s * sr) as usize,
+            end: (end_s * sr) as usize,
         }
     }
 
     #[test]
-    fn chunks_use_one_based_picture_numbers() {
-        let planned = planned_with(vec![keyframe(1, 0), keyframe(2, 3_000)], Vec::new());
-        let segs = segments(&planned);
-        assert_eq!(segs.len(), 1);
-        let chunk = chunk_of(&segs[0], "hi".into());
-        assert_eq!(chunk.keyframe, 1);
-        assert_eq!(chunk.start_ms, 0);
-        assert_eq!(chunk.end_ms, 5_000);
-        // A segment of the second keyframe becomes chunk keyframe 2.
-        let planned = Planned {
-            regions: vec![SpeechRegion {
-                start: 16_000 * 4,
-                end: 16_000 * 6,
-            }],
-            ..planned
+    fn plan_uses_the_kept_picture_before_the_stroke_and_drops_groups_without_one() {
+        let dir = scratch();
+        let candidates_dir = dir.join("candidates");
+        std::fs::create_dir_all(&candidates_dir).unwrap();
+        // Frames 0..=5 at 500 ms steps; only frame 3 (1.5 s) was kept on disk.
+        std::fs::write(candidates_dir.join("3.png"), b"png").unwrap();
+        let signals = Signals {
+            stopped_ms: 4_000,
+            samples: (0..6).map(|i| sample(i * 500)).collect(),
+            strokes: vec![stroke(2_100, 2_400)],
+            speech: Vec::new(),
         };
-        let segs = segments(&planned);
-        assert_eq!(segs[0].keyframe, 1);
-        assert_eq!(chunk_of(&segs[0], String::new()).keyframe, 2);
+        let input = PlanInput {
+            signals,
+            frame_of_sample: (0..6).collect(),
+            kept: [3].into_iter().collect(),
+            candidates_dir: candidates_dir.clone(),
+            stopped_ms: 4_000,
+        };
+        let planned = plan(input, &[region(0.0, 3.0)], 64_000, &[]);
+        assert_eq!(planned.selection.keyframes.len(), 1);
+        // The sample before 2.1 s is frame 4 (2.0 s); it is not kept, the nearest kept is 3.
+        assert_eq!(planned.pictures, vec![candidates_dir.join("3.png")]);
+        assert_eq!(planned.selection.marks.len(), 1);
+        assert!(planned.pictures_wanted());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn status_follows_words_then_pictures() {
+    fn plan_without_any_kept_picture_drops_the_group_and_still_wants_pictures() {
+        let dir = scratch();
+        let candidates_dir = dir.join("candidates");
+        let signals = Signals {
+            stopped_ms: 4_000,
+            samples: (0..6).map(|i| sample(i * 500)).collect(),
+            strokes: vec![stroke(2_100, 2_400)],
+            speech: Vec::new(),
+        };
+        let input = PlanInput {
+            signals,
+            frame_of_sample: (0..6).collect(),
+            kept: BTreeSet::new(),
+            candidates_dir,
+            stopped_ms: 4_000,
+        };
+        let planned = plan(input, &[], 64_000, &[]);
+        assert!(planned.selection.keyframes.is_empty());
+        assert!(planned.selection.marks.is_empty());
+        assert_eq!(planned.selection.dropped_groups, 1);
+        assert!(planned.pictures_wanted());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn words_before_the_first_picture_are_in_the_first_segment() {
+        let planned = Planned {
+            selection: Selection {
+                keyframes: vec![Keyframe {
+                    n: 1,
+                    t_ms: 10_000,
+                    sample: 20,
+                }],
+                marks: Vec::new(),
+                dropped_groups: 0,
+            },
+            pictures: vec![PathBuf::from("x")],
+            regions: vec![region(0.5, 5.0), region(11.0, 14.0)],
+            total_samples: 16_000 * 20,
+        };
+        // Both regions belong to the only picture, so they pack into one segment.
+        let segments = segments(&planned);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].keyframe, 0);
+        let chunk = chunk_of(&segments[0], "words".into());
         assert_eq!(
-            status_of(ComposeWords::Transcribed, true),
-            AnnotationStatus::Ok
+            (chunk.start_ms, chunk.end_ms, chunk.keyframe),
+            (500, 14_000, 1)
         );
-        assert_eq!(status_of(ComposeWords::None, true), AnnotationStatus::Ok);
+    }
+
+    #[test]
+    fn status_rules() {
         assert_eq!(
-            status_of(ComposeWords::Transcribed, false),
+            status_of(ComposeWords::Failed, true, true),
+            AnnotationStatus::Failed
+        );
+        assert_eq!(
+            status_of(ComposeWords::Transcribed, true, false),
             AnnotationStatus::TextOnly
         );
         assert_eq!(
-            status_of(ComposeWords::Failed, true),
-            AnnotationStatus::Failed
+            status_of(ComposeWords::Transcribed, false, false),
+            AnnotationStatus::Ok
         );
         assert_eq!(
-            status_of(ComposeWords::Failed, false),
-            AnnotationStatus::Failed
+            status_of(ComposeWords::None, true, true),
+            AnnotationStatus::Ok
         );
     }
 
     #[test]
-    fn app_names_attach_to_samples_by_time() {
-        let apps = vec![(0u64, "Safari".to_owned()), (5_000, "Notes".to_owned())];
-        assert_eq!(AnnotationCtx::app_at(&apps, 100).0, "Safari");
-        assert_eq!(AnnotationCtx::app_at(&apps, 5_000).0, "Notes");
-        assert_eq!(AnnotationCtx::app_at(&apps, 9_000).0, "Notes");
-        // Before the first report: the first known app; nothing known: empty.
-        let late = vec![(2_000u64, "Mail".to_owned())];
-        assert_eq!(AnnotationCtx::app_at(&late, 100).0, "Mail");
-        assert_eq!(AnnotationCtx::app_at(&[], 100).0, "");
-    }
-
-    #[test]
-    fn plan_drops_keyframes_without_any_picture_and_renumbers() {
-        let dir = std::env::temp_dir().join(format!("murmur-plan-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        // Three steady pictures; a click at 1.2 s makes the picture before it a candidate.
-        let mut signals = Signals {
-            stopped_ms: 4_000,
-            display_pt: (1512.0, 982.0),
-            ..Signals::default()
+    fn no_plan_means_no_pictures_wanted() {
+        let planned = Planned {
+            selection: Selection::default(),
+            pictures: Vec::new(),
+            regions: Vec::new(),
+            total_samples: 0,
         };
-        for i in 0..8u64 {
-            signals.samples.push(ScreenSample {
-                t_ms: i * 500,
-                cells: vec![0.5; ann::GRID_CELLS],
-                app: AppName::default(),
-            });
-        }
-        signals.clicks.push(Click {
-            t_ms: 1_200,
-            at: (0.5, 0.5),
-        });
-        let frame_of_sample: Vec<usize> = (0..8).collect();
-        // Only the click's picture (sample 2) was kept; the start picture (0) was not.
-        let picture = Bitmap::new(4, 4).unwrap();
-        image::write_png(&picture, &dir.join("2.png")).unwrap();
-        let input = PlanInput {
-            signals,
-            frame_of_sample,
-            apps: vec![(0, "Safari".into())],
-            kept: [2usize].into_iter().collect(),
-            candidates_dir: dir.clone(),
-            stopped_ms: 4_000,
-        };
-        let planned = plan(
-            input,
-            &[SpeechRegion {
-                start: 0,
-                end: 16_000 * 4,
-            }],
-            16_000 * 4,
-            &[],
-        );
-        // Start and click merge (within 1 s)? No: 0 and 1.2 s are 1.2 s apart, so two keyframes;
-        // the start has no picture of its own and falls back to the nearest kept one.
-        assert_eq!(planned.selection.keyframes.len(), 2);
-        assert!(planned.pictures.iter().all(|p| p.ends_with("2.png")));
-        let numbers: Vec<usize> = planned.selection.keyframes.iter().map(|k| k.n).collect();
-        assert_eq!(numbers, vec![1, 2]);
-        assert_eq!(planned.selection.keyframes[0].app.0, "Safari");
-        std::fs::remove_dir_all(dir).unwrap();
+        assert!(!planned.pictures_wanted());
     }
 }

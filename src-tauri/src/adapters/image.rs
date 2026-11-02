@@ -129,44 +129,6 @@ impl Canvas {
         &self.ctx
     }
 
-    /// Fills the whole canvas with an opaque colour (components 0 to 1).
-    pub fn fill(&self, r: f64, g: f64, b: f64) {
-        CGContext::set_rgb_fill_color(Some(&self.ctx), r, g, b, 1.0);
-        CGContext::fill_rect(
-            Some(&self.ctx),
-            CGRect::new(
-                CGPoint::new(0.0, 0.0),
-                CGSize::new(self.bitmap.width as f64, self.bitmap.height as f64),
-            ),
-        );
-    }
-
-    /// Draws `source` scaled into `rect` (top-left origin). A 1:1 blit is not resampled.
-    pub fn draw_bitmap(&self, source: &Bitmap, rect: CGRect) -> Result<(), ImageError> {
-        let image = cg_image(source)?;
-        let ctx = &self.ctx;
-        CGContext::save_g_state(Some(ctx));
-        // The canvas is flipped; images are stored top-down, so flip back inside the tile.
-        CGContext::translate_ctm(Some(ctx), rect.origin.x, rect.origin.y + rect.size.height);
-        CGContext::scale_ctm(Some(ctx), 1.0, -1.0);
-        let scaled = (source.width as f64 - rect.size.width).abs() > 0.5;
-        CGContext::set_interpolation_quality(
-            Some(ctx),
-            if scaled {
-                CGInterpolationQuality::High
-            } else {
-                CGInterpolationQuality::None
-            },
-        );
-        CGContext::draw_image(
-            Some(ctx),
-            CGRect::new(CGPoint::new(0.0, 0.0), rect.size),
-            Some(&image),
-        );
-        CGContext::restore_g_state(Some(ctx));
-        Ok(())
-    }
-
     /// The drawn pixels. The context is released first, so the bytes are final.
     pub fn into_bitmap(self) -> Bitmap {
         let Canvas { bitmap, ctx } = self;
@@ -278,7 +240,11 @@ mod tests {
     #[test]
     fn canvas_draws_with_the_top_left_origin_and_png_round_trips() {
         let canvas = Canvas::new(Bitmap::new(20, 10).unwrap()).unwrap();
-        canvas.fill(1.0, 1.0, 1.0);
+        CGContext::set_rgb_fill_color(Some(canvas.ctx()), 1.0, 1.0, 1.0, 1.0);
+        CGContext::fill_rect(
+            Some(canvas.ctx()),
+            CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(20.0, 10.0)),
+        );
         // A red square in the top-left corner (y grows downward).
         CGContext::set_rgb_fill_color(Some(canvas.ctx()), 1.0, 0.0, 0.0, 1.0);
         CGContext::fill_rect(
@@ -302,41 +268,5 @@ mod tests {
         assert_eq!(back.pixel(2, 8), Some((255, 255, 255, 255)));
         assert!(read_png(&dir.join("missing.png")).is_err());
         std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn draw_bitmap_scales_into_the_tile() {
-        // A 4 x 2 source: left half red, right half blue.
-        let mut src = Bitmap::new(4, 2).unwrap();
-        for y in 0..2 {
-            for x in 0..4 {
-                let i = (y * 4 + x) * 4;
-                let (b, g, r) = if x < 2 { (0, 0, 255) } else { (255, 0, 0) };
-                src.bgra[i..i + 4].copy_from_slice(&[b, g, r, 255]);
-            }
-        }
-        let canvas = Canvas::new(Bitmap::new(40, 40).unwrap()).unwrap();
-        canvas.fill(1.0, 1.0, 1.0);
-        canvas
-            .draw_bitmap(
-                &src,
-                CGRect::new(CGPoint::new(10.0, 10.0), CGSize::new(20.0, 10.0)),
-            )
-            .unwrap();
-        let out = canvas.into_bitmap();
-        let (r, _, b, _) = out.pixel(12, 15).unwrap();
-        assert!(
-            r > 200 && b < 60,
-            "left half is red: {:?}",
-            out.pixel(12, 15)
-        );
-        let (r, _, b, _) = out.pixel(27, 15).unwrap();
-        assert!(
-            b > 200 && r < 60,
-            "right half is blue: {:?}",
-            out.pixel(27, 15)
-        );
-        assert_eq!(out.pixel(5, 5), Some((255, 255, 255, 255)));
-        assert_eq!(out.pixel(12, 25), Some((255, 255, 255, 255)));
     }
 }

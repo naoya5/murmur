@@ -1,13 +1,14 @@
 //! Adapter: output. Puts text on the clipboard and pastes it with Cmd+V. For an annotation
-//! bundle: the picture first (PNG on the pasteboard, Cmd+V), then the text, or the text alone
-//! for a terminal (the picture path is inside it). A bundle goes only into the app that was in
-//! front at the hotkey (`frontmost::FrontApp`): it is brought back first, and it must still be
-//! in front right before every Cmd+V, or the text stays on the clipboard.
+//! bundle: the pictures one by one (PNG on the pasteboard, Cmd+V, `IMAGE_TO_TEXT_GAP` after
+//! each), then the text, or the text alone for a terminal (the picture paths are inside it). A
+//! bundle goes only into the app that was in front at the hotkey (`frontmost::FrontApp`): it
+//! is brought back first, and it must still be in front right before every Cmd+V, or the text
+//! stays on the clipboard.
 //!
 //! Guardrails: the accessibility and secure-input checks come from `platform::macos` (G8). The
 //! transcript text is never logged (G7). Nothing here panics (G6).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -22,10 +23,11 @@ use crate::platform::macos;
 
 /// Upper bound for the whole `deliver` call.
 const DELIVER_TIMEOUT: Duration = Duration::from_secs(1);
-/// Upper bound for a bundle: bringing the app back, the modifier wait, two pastes and the gap
-/// between them.
-pub const BUNDLE_TIMEOUT: Duration = Duration::from_millis(2_500);
-/// Between the picture paste and the text paste, so the receiving app keeps both.
+/// Upper bound for a bundle: bringing the app back, the modifier wait, up to six picture pastes
+/// with their gaps, and the text paste.
+pub const BUNDLE_TIMEOUT: Duration = Duration::from_millis(4_000);
+/// After each picture paste, before the next paste, so the receiving app keeps them all (the
+/// value TextEdit was checked with).
 pub const IMAGE_TO_TEXT_GAP: Duration = Duration::from_millis(160);
 /// The hotkey's modifiers must be up before Cmd+V, or it becomes another shortcut.
 pub const MODIFIER_RELEASE_TIMEOUT: Duration = Duration::from_millis(350);
@@ -114,14 +116,14 @@ fn deliver_blocking(text: &str, opts: DeliverOptions) -> DeliveryOutcome {
 /// Pastes an annotation bundle into `front`, the app that was in front at the hotkey.
 ///
 /// The app is brought back to the front first (`BRING_TO_FRONT_TIMEOUT`). Terminal: the text
-/// alone, once. Other apps: the PNG, Cmd+V, `IMAGE_TO_TEXT_GAP`, the text, Cmd+V. Before the
-/// first Cmd+V the held modifiers may take `MODIFIER_RELEASE_TIMEOUT` to go up; right before
-/// each Cmd+V the app must still be in front. Blocking; returns within `BUNDLE_TIMEOUT`
-/// (`Unconfirmed` on timeout). When the paste is not allowed, or the app is not in front, the
-/// text goes to the clipboard and the outcome says why. No `front` (Murmur itself was in
-/// front at the hotkey): the text is copied only.
+/// alone, once. Other apps: each PNG in order, Cmd+V, `IMAGE_TO_TEXT_GAP`, then the text,
+/// Cmd+V. Before the first Cmd+V the held modifiers may take `MODIFIER_RELEASE_TIMEOUT` to go
+/// up; right before each Cmd+V the app must still be in front. Blocking; returns within
+/// `BUNDLE_TIMEOUT` (`Unconfirmed` on timeout). When the paste is not allowed, or the app is
+/// not in front, the text goes to the clipboard and the outcome says why. No `front` (Murmur
+/// itself was in front at the hotkey): the text is copied only.
 pub fn deliver_bundle(
-    png: Option<&Path>,
+    pngs: &[PathBuf],
     text: &str,
     opts: DeliverOptions,
     target: PasteTarget,
@@ -129,12 +131,12 @@ pub fn deliver_bundle(
 ) -> DeliveryOutcome {
     let (tx, rx) = mpsc::channel();
     let text = text.to_owned();
-    let png = png.map(Path::to_path_buf);
+    let pngs = pngs.to_vec();
     let spawned = std::thread::Builder::new()
         .name("deliver-bundle".into())
         .spawn(move || {
             let _ = tx.send(deliver_bundle_blocking(
-                png.as_deref(),
+                &pngs,
                 &text,
                 opts,
                 target,
@@ -149,7 +151,7 @@ pub fn deliver_bundle(
 }
 
 fn deliver_bundle_blocking(
-    png: Option<&Path>,
+    pngs: &[PathBuf],
     text: &str,
     opts: DeliverOptions,
     target: PasteTarget,
@@ -190,17 +192,19 @@ fn deliver_bundle_blocking(
     };
     wait_modifiers_released(MODIFIER_RELEASE_TIMEOUT);
 
-    // The picture first, for apps that take one.
-    if let (PasteTarget::Other, Some(png)) = (target, png) {
-        match set_clipboard_png(png) {
-            Ok(()) => {
-                if let Err(reason) = paste_into(front) {
-                    let _ = copy_text(text);
-                    return DeliveryOutcome::Copied { reason };
+    // The pictures first, one by one, for apps that take them.
+    if target == PasteTarget::Other {
+        for png in pngs {
+            match set_clipboard_png(png) {
+                Ok(()) => {
+                    if let Err(reason) = paste_into(front) {
+                        let _ = copy_text(text);
+                        return DeliveryOutcome::Copied { reason };
+                    }
+                    std::thread::sleep(IMAGE_TO_TEXT_GAP);
                 }
-                std::thread::sleep(IMAGE_TO_TEXT_GAP);
+                Err(error) => tracing::warn!(%error, "picture not put on the pasteboard"),
             }
-            Err(error) => tracing::warn!(%error, "picture not put on the pasteboard"),
         }
     }
     if copy_text(text).is_err() {
@@ -314,10 +318,17 @@ mod tests {
         ));
         assert_eq!(IMAGE_TO_TEXT_GAP, Duration::from_millis(160));
         assert_eq!(MODIFIER_RELEASE_TIMEOUT, Duration::from_millis(350));
+        let six_pictures = IMAGE_TO_TEXT_GAP * murmur_core::annotations::MAX_KEYFRAMES as u32;
         assert!(
-            BUNDLE_TIMEOUT > BRING_TO_FRONT_TIMEOUT + MODIFIER_RELEASE_TIMEOUT + IMAGE_TO_TEXT_GAP
+            BUNDLE_TIMEOUT
+                > BRING_TO_FRONT_TIMEOUT
+                    + MODIFIER_RELEASE_TIMEOUT
+                    + six_pictures
+                    + Duration::from_millis(500)
         );
-        assert!(BUNDLE_TIMEOUT < Duration::from_millis(3_000));
+        assert!(
+            BUNDLE_TIMEOUT.as_millis() < murmur_core::session::BUNDLE_DELIVERY_TIMEOUT_MS as u128
+        );
     }
 
     /// Writes to the real clipboard, so it is opt-in: `cargo test -p murmur -- --ignored png`.
@@ -449,7 +460,7 @@ tell application "TextEdit" to make new document"#);
         let front = front_app("TextEdit", "com.apple.TextEdit");
         let started = std::time::Instant::now();
         let outcome = deliver_bundle(
-            Some(&png),
+            std::slice::from_ref(&png),
             "murmur bundle test words",
             PASTE_OPTS,
             PasteTarget::Other,
@@ -481,7 +492,7 @@ tell application "TextEdit" to make new document"#);
         let front = front_app("Claude", "com.anthropic.claudefordesktop");
         let started = std::time::Instant::now();
         let outcome = deliver_bundle(
-            Some(&png),
+            std::slice::from_ref(&png),
             "murmur bundle test words",
             PASTE_OPTS,
             PasteTarget::Other,
@@ -515,7 +526,7 @@ end tell"#);
         assert!(!front.is_in_front(), "Finder did not come to the front");
         let started = std::time::Instant::now();
         let outcome = deliver_bundle(
-            Some(&png),
+            std::slice::from_ref(&png),
             "murmur bundle test words",
             PASTE_OPTS,
             PasteTarget::Other,
@@ -540,7 +551,7 @@ end tell"#);
     #[ignore = "uses the real clipboard"]
     fn deliver_bundle_without_an_app_only_copies() {
         let outcome = deliver_bundle(
-            None,
+            &[],
             "murmur bundle copy only",
             PASTE_OPTS,
             PasteTarget::Other,

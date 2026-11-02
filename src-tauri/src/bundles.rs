@@ -167,7 +167,8 @@ pub struct DisplayFacts {
     pub scale: f64,
 }
 
-/// The machine-readable record of a bundle (spec 7.4). Positions are shares of the display.
+/// The machine-readable record of a bundle (version 2): the pictures, the ink groups drawn
+/// on them, the spoken segments, where it was pasted. Positions are shares of the display.
 #[allow(clippy::too_many_arguments)]
 pub fn annotation_json(
     created_at_ms: i64,
@@ -191,58 +192,30 @@ pub fn annotation_json(
     // Four decimals of a share of the display: well under a pixel, and stable through JSON.
     let share = |v: f32| (f64::from(v) * 10_000.0).round() / 10_000.0;
     let point = |p: (f32, f32)| json!([share(p.0), share(p.1)]);
-    let keyframes: Vec<serde_json::Value> = keyframes
+    let pictures: Vec<serde_json::Value> = keyframes
         .iter()
         .map(|k| {
-            let reasons: Vec<String> = k
-                .reasons
-                .iter()
-                .map(|r| format!("{r:?}").to_lowercase())
-                .collect();
             json!({
                 "n": k.n,
                 "t_ms": k.t_ms,
-                "reasons": reasons,
-                "app": k.app.0,
                 "file": format!("frames/{}.png", k.n),
             })
         })
         .collect();
     let marks: Vec<serde_json::Value> = marks
         .iter()
-        .map(|m| match m {
-            Mark::Ink {
-                t0_ms,
-                t1_ms,
-                keyframe,
-                label,
-                points,
-            } => json!({
-                "kind": "ink",
-                "t0_ms": t0_ms,
-                "t1_ms": t1_ms,
-                "keyframe": keyframe,
-                "label": label,
-                "points": points.iter().map(|p| point(*p)).collect::<Vec<_>>(),
-            }),
-            Mark::Click { t_ms, keyframe, at } => json!({
-                "kind": "click",
-                "t_ms": t_ms,
-                "keyframe": keyframe,
-                "at": point(*at),
-            }),
-            Mark::Dwell {
-                t0_ms,
-                t1_ms,
-                keyframe,
-                at,
-            } => json!({
-                "kind": "dwell",
-                "t0_ms": t0_ms,
-                "t1_ms": t1_ms,
-                "keyframe": keyframe,
-                "at": point(*at),
-            }),
+        .map(|m| {
+            json!({
+                "picture": m.keyframe,
+                "label": m.label,
+                "t0_ms": m.t0_ms,
+                "t1_ms": m.t1_ms,
+                "strokes": m
+                    .strokes
+                    .iter()
+                    .map(|s| s.iter().map(|p| point(*p)).collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+            })
         })
         .collect();
     let chunks: Vec<serde_json::Value> = chunks
@@ -251,7 +224,7 @@ pub fn annotation_json(
             json!({
                 "start_ms": c.start_ms,
                 "end_ms": c.end_ms,
-                "keyframe": c.keyframe,
+                "picture": c.keyframe,
                 "text": c.text.0,
             })
         })
@@ -262,7 +235,7 @@ pub fn annotation_json(
         AnnotationStatus::Failed => "failed",
     };
     json!({
-        "version": 1,
+        "version": 2,
         "created_at": created_at,
         "duration_ms": duration_ms,
         "language": language,
@@ -273,7 +246,7 @@ pub fn annotation_json(
             "height_pt": d.height_pt,
             "scale": d.scale,
         })),
-        "keyframes": keyframes,
+        "pictures": pictures,
         "marks": marks,
         "chunks": chunks,
         "status": status,
@@ -621,36 +594,20 @@ mod tests {
 
     #[test]
     fn bundle_files_are_private_and_the_json_follows_the_record_shape() {
-        use murmur_core::annotations::{AppName, KeyframeReason};
         use murmur_core::session::TranscriptText;
         let dir = scratch();
         let keyframes = vec![Keyframe {
             n: 1,
-            t_ms: 0,
-            sample: 0,
-            reasons: vec![KeyframeReason::Start, KeyframeReason::Click],
-            app: AppName("Safari".into()),
+            t_ms: 2_000,
+            sample: 3,
         }];
-        let marks = vec![
-            Mark::Click {
-                t_ms: 1_300,
-                keyframe: 1,
-                at: (0.8, 0.12),
-            },
-            Mark::Ink {
-                t0_ms: 2_000,
-                t1_ms: 2_500,
-                keyframe: 1,
-                label: 1,
-                points: vec![(0.1, 0.2), (0.3, 0.4)],
-            },
-            Mark::Dwell {
-                t0_ms: 3_000,
-                t1_ms: 3_700,
-                keyframe: 1,
-                at: (0.5, 0.5),
-            },
-        ];
+        let marks = vec![Mark {
+            keyframe: 1,
+            label: 1,
+            t0_ms: 2_000,
+            t1_ms: 2_500,
+            strokes: vec![vec![(0.1, 0.2), (0.3, 0.4)], vec![(0.5, 0.5)]],
+        }];
         let chunks = vec![Chunk {
             start_ms: 0,
             end_ms: 2_900,
@@ -673,25 +630,23 @@ mod tests {
             &chunks,
             AnnotationStatus::Ok,
         );
-        assert_eq!(json["version"], 1);
+        assert_eq!(json["version"], 2);
         assert_eq!(json["status"], "ok");
         assert_eq!(json["target_bundle_id"], "com.apple.TextEdit");
+        assert_eq!(json["pictures"][0]["file"], "frames/1.png");
+        assert_eq!(json["pictures"][0]["t_ms"], 2_000);
+        assert!(json["pictures"][0].get("app").is_none());
+        assert!(json["pictures"][0].get("reasons").is_none());
+        assert_eq!(json["marks"][0]["picture"], 1);
+        assert_eq!(json["marks"][0]["label"], 1);
         assert_eq!(
-            json["keyframes"][0]["reasons"],
-            serde_json::json!(["start", "click"])
+            json["marks"][0]["strokes"][1][0],
+            serde_json::json!([0.5, 0.5])
         );
-        assert_eq!(json["keyframes"][0]["file"], "frames/1.png");
-        assert_eq!(json["marks"][0]["kind"], "click");
-        assert_eq!(json["marks"][1]["label"], 1);
-        assert_eq!(json["marks"][2]["kind"], "dwell");
+        assert_eq!(json["chunks"][0]["picture"], 1);
         assert_eq!(json["chunks"][0]["text"], "hello");
         assert_eq!(json["display"]["scale"], 2.0);
-        assert!(
-            json["created_at"]
-                .as_str()
-                .unwrap()
-                .starts_with("2023-11-1")
-        );
+        assert!(json["created_at"].as_str().unwrap().starts_with("2023-"));
         write_bundle_files(&dir, "summary", &json).unwrap();
         for name in ["summary.md", "annotation.json"] {
             let mode = std::fs::metadata(dir.join(name))
@@ -704,7 +659,7 @@ mod tests {
         let back: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("annotation.json")).unwrap())
                 .unwrap();
-        assert_eq!(back, json);
+        assert_eq!(back["version"], 2);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -3,6 +3,7 @@
 //! each other's internals.
 
 pub mod audio;
+pub mod draw;
 pub mod engine;
 pub mod frontmost;
 pub mod hotkeys;
@@ -12,6 +13,5 @@ pub mod output;
 pub mod pointer;
 pub mod screen;
 pub mod settings_file;
-pub mod sheet;
 pub mod sounds;
 pub mod store;

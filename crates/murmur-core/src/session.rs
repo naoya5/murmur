@@ -57,8 +57,9 @@
 //! | Transcribing(Annotation)   | Transcribed(NoSpeech)          | Composing without words when there is a mark (or the plan is unknown); else Idle + notice, DropAll |
 //! | Transcribing(Annotation)   | Transcribed(Failed) / timeout  | Composing; Compose(failed words); the audio is kept |
 //! | Transcribing(Annotation) / CancelPending(Tx) | CaptureFailed | Idle + notice; CancelTranscription, DropAll     |
-//! | Composing                  | Composed(Bundle)               | Delivering; SetEscCapture(false), DeliverBundle, delivery timer |
-//! | Composing                  | Composed(Failed) / 5 s timer   | Delivering; SetEscCapture(false), DeliverText (words only, no path) |
+//! | Composing                  | Composed(Bundle)               | Delivering; SetEscCapture(false), DeliverBundle, bundle delivery timer |
+//! | Composing                  | Composed(WordsOnly)            | Delivering; SetEscCapture(false), DeliverText (no ink: the words as a dictation), delivery timer |
+//! | Composing                  | Composed(Failed) / 5 s timer   | Delivering; SetEscCapture(false), DeliverText (the pictures were lost: words only), bundle delivery timer |
 //! | Composing                  | Esc                            | CancelPending; the compose keeps running and its outcome is held |
 //! | CancelPending(Compose)     | Esc / PillClicked              | the held outcome is handled, or back to Composing |
 //! | CancelPending(Compose/Tx, Annotation) | 3 s timer           | Idle; DropAll                                    |
@@ -85,6 +86,9 @@ pub const TRANSCRIBE_TIMEOUT_BASE_MS: Millis = 15_000;
 pub const TRANSCRIBE_TIMEOUT_PER_RECORDED_MS: f64 = 0.5;
 /// Safety net if the output adapter never reports back (its own paste timeout is 1 s).
 pub const DELIVERY_TIMEOUT_MS: Millis = 2_500;
+/// A bundle paste brings the app back to the front and pastes up to `MAX_KEYFRAMES` pictures
+/// before the words, so it may take longer than a text paste.
+pub const BUNDLE_DELIVERY_TIMEOUT_MS: Millis = 5_000;
 /// Extra budget when the model must be loaded before transcribing (model load 60 s).
 pub const MODEL_LOAD_TIMEOUT_MS: Millis = 60_000;
 /// How long the pill shows a result before it hides.
@@ -205,9 +209,11 @@ pub enum ComposeWords {
 /// What the compose step produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComposeOutcome {
-    /// Pictures and summary are ready. `images` is how many keyframes were drawn.
+    /// Pictures and summary are ready. `images` is how many pictures were drawn.
     Bundle { images: u32 },
-    /// No picture could be made; only the words can be delivered.
+    /// Nothing was drawn, so no picture was wanted: the words go out as a dictation.
+    WordsOnly,
+    /// The pictures could not be made; only the words can be delivered.
     Failed,
 }
 
@@ -513,6 +519,8 @@ pub struct Composing {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delivery {
     Text,
+    /// An annotation without ink: the words alone, shown like a dictation, saved as a bundle.
+    Words,
     /// `images` is 0 when the compose failed and only the words go out.
     Bundle {
         images: u32,
@@ -603,7 +611,7 @@ impl Machine {
             State::Composing(_) => Some(SessionKind::Annotation),
             State::Delivering { delivery, .. } => Some(match delivery {
                 Delivery::Text => SessionKind::Dictation,
-                Delivery::Bundle { .. } => SessionKind::Annotation,
+                Delivery::Words | Delivery::Bundle { .. } => SessionKind::Annotation,
             }),
             State::CancelPending { paused, .. } => Some(paused_kind(paused)),
         }
@@ -867,17 +875,21 @@ impl Machine {
         fx: &mut Vec<Effect>,
     ) -> State {
         fx.push(Effect::SetEscCapture(false));
-        let delivery = match outcome {
+        let (delivery, timeout_ms) = match outcome {
             ComposeOutcome::Bundle { images } => {
                 fx.push(Effect::DeliverBundle { session });
-                Delivery::Bundle { images }
+                (Delivery::Bundle { images }, BUNDLE_DELIVERY_TIMEOUT_MS)
+            }
+            ComposeOutcome::WordsOnly => {
+                fx.push(Effect::DeliverText { session });
+                (Delivery::Words, DELIVERY_TIMEOUT_MS)
             }
             ComposeOutcome::Failed => {
                 fx.push(Effect::DeliverText { session });
-                Delivery::Bundle { images: 0 }
+                (Delivery::Bundle { images: 0 }, BUNDLE_DELIVERY_TIMEOUT_MS)
             }
         };
-        let timer = self.timer(DELIVERY_TIMEOUT_MS, fx);
+        let timer = self.timer(timeout_ms, fx);
         State::Delivering {
             session,
             timer,
@@ -895,6 +907,10 @@ impl Machine {
         match delivery {
             Delivery::Text => {
                 fx.push(Effect::SaveSuccess { session, outcome });
+                self.idle_with(Some(Notice::Delivered { outcome }), fx)
+            }
+            Delivery::Words => {
+                fx.push(Effect::SaveAnnotation { session, outcome });
                 self.idle_with(Some(Notice::Delivered { outcome }), fx)
             }
             Delivery::Bundle { images } => {
@@ -3259,13 +3275,13 @@ mod tests {
         let mut h = composing();
         h.advance(900);
         let fx = h.step(composed(S1, ComposeOutcome::Bundle { images: 3 }));
-        let delivery = timer_for(&fx, DELIVERY_TIMEOUT_MS);
+        let delivery = timer_for(&fx, BUNDLE_DELIVERY_TIMEOUT_MS);
         assert_eq!(
             fx,
             vec![
                 Effect::SetEscCapture(false),
                 Effect::DeliverBundle { session: S1 },
-                arm(delivery, DELIVERY_TIMEOUT_MS),
+                arm(delivery, BUNDLE_DELIVERY_TIMEOUT_MS),
             ]
         );
         assert_eq!(
@@ -3307,13 +3323,13 @@ mod tests {
     fn compose_failure_or_timeout_delivers_the_words_alone() {
         let mut h = composing();
         let fx = h.step(composed(S1, ComposeOutcome::Failed));
-        let delivery = timer_for(&fx, DELIVERY_TIMEOUT_MS);
+        let delivery = timer_for(&fx, BUNDLE_DELIVERY_TIMEOUT_MS);
         assert_eq!(
             fx,
             vec![
                 Effect::SetEscCapture(false),
                 Effect::DeliverText { session: S1 },
-                arm(delivery, DELIVERY_TIMEOUT_MS),
+                arm(delivery, BUNDLE_DELIVERY_TIMEOUT_MS),
             ]
         );
         let outcome = DeliveryOutcome::Copied {
@@ -3345,9 +3361,48 @@ mod tests {
     }
 
     #[test]
+    fn without_ink_the_words_go_out_as_a_dictation_and_save_as_a_bundle() {
+        let mut h = composing();
+        let fx = h.step(composed(S1, ComposeOutcome::WordsOnly));
+        let delivery = timer_for(&fx, DELIVERY_TIMEOUT_MS);
+        assert_eq!(
+            fx,
+            vec![
+                Effect::SetEscCapture(false),
+                Effect::DeliverText { session: S1 },
+                arm(delivery, DELIVERY_TIMEOUT_MS),
+            ]
+        );
+        assert!(matches!(
+            h.state(),
+            State::Delivering {
+                delivery: Delivery::Words,
+                ..
+            }
+        ));
+        assert_eq!(h.m.active_kind(), Some(SessionKind::Annotation));
+        let outcome = DeliveryOutcome::Pasted;
+        let fx = h.step(delivered(S1, outcome));
+        assert!(fx.contains(&Effect::SaveAnnotation {
+            session: S1,
+            outcome
+        }));
+        assert!(!fx.iter().any(|e| matches!(e, Effect::SaveSuccess { .. })));
+        assert_eq!(
+            h.view(),
+            PillView::Notice {
+                notice: Notice::Delivered { outcome }
+            }
+        );
+    }
+
+    #[test]
     fn bundle_delivery_timeout_saves_as_unconfirmed() {
-        let mut h = delivering_bundle(2);
-        let fx = h.fire_next();
+        let mut h = composing();
+        h.advance(900);
+        let fx = h.step(composed(S1, ComposeOutcome::Bundle { images: 2 }));
+        let delivery = timer_for(&fx, BUNDLE_DELIVERY_TIMEOUT_MS);
+        let fx = h.fire(delivery);
         let outcome = DeliveryOutcome::Unconfirmed;
         assert_eq!(
             fx[0],
@@ -3410,13 +3465,13 @@ mod tests {
         // Undo: the held bundle is delivered.
         h.advance(500);
         let fx = h.step(Event::Esc);
-        let delivery = timer_for(&fx, DELIVERY_TIMEOUT_MS);
+        let delivery = timer_for(&fx, BUNDLE_DELIVERY_TIMEOUT_MS);
         assert_eq!(
             fx,
             vec![
                 Effect::SetEscCapture(false),
                 Effect::DeliverBundle { session: S1 },
-                arm(delivery, DELIVERY_TIMEOUT_MS),
+                arm(delivery, BUNDLE_DELIVERY_TIMEOUT_MS),
             ]
         );
         // The countdown timer is stale.
@@ -3942,12 +3997,12 @@ mod tests {
             },
             16 => Event::Composed {
                 session: session(rng),
-                outcome: if rng.below(4) == 0 {
-                    ComposeOutcome::Failed
-                } else {
-                    ComposeOutcome::Bundle {
+                outcome: match rng.below(5) {
+                    0 => ComposeOutcome::Failed,
+                    1 => ComposeOutcome::WordsOnly,
+                    _ => ComposeOutcome::Bundle {
                         images: 1 + rng.below(6) as u32,
-                    }
+                    },
                 },
             },
             17 => Event::AnnotationsDisabled,

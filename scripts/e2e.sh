@@ -9,7 +9,7 @@
 # Cases: ja, en, silence (no row, clipboard untouched), cancel (Esc), undo (Esc twice), crash (kill -9, spool
 # recovery at the next start), long (77 s Japanese file through the chunk path).
 # Annotations (experimental, opt-in group `annotations`): the screen is a folder of generated PNGs
-# (MURMUR_DEBUG_SCREEN=png-dir:), clicks, cursor and strokes come from a JSON script (MURMUR_DEBUG_POINTER=), and
+# (MURMUR_DEBUG_SCREEN=png-dir:), Shift and the strokes come from a JSON script (MURMUR_DEBUG_POINTER=), and
 # SIGUSR1 is the annotations hotkey (MURMUR_DEBUG_HOTKEY=annotations). Set E2E_KEEP_DIR to keep the normal and the
 # marked bundle folders for a look.
 # Several Murmur instances may run at once (a debug build with MURMUR_DATA_DIR skips single-instance); the script
@@ -805,22 +805,24 @@ def png(path, block_x):
         f.write(data)
 for i in range(12):
     png(os.path.join(root, "frames", f"{i:02d}.png"), 20 if i < 6 else 180)
+# Shift goes down, one stroke is drawn (two strokes within 1.5 s form one group), Shift goes up.
 events = [
-    {"kind": "app", "t_ms": 0, "name": "E2E App"},
-    {"kind": "click", "t_ms": 1300, "at": [0.8, 0.12]},
+    {"kind": "shift", "t_ms": 1800, "held": True},
     {"kind": "stroke", "t0_ms": 2000, "t1_ms": 2600, "points": [[0.2, 0.2], [0.3, 0.3], [0.4, 0.35]]},
+    {"kind": "stroke", "t0_ms": 2900, "t1_ms": 3200, "points": [[0.5, 0.5], [0.6, 0.55]]},
+    {"kind": "shift", "t_ms": 3300, "held": False},
 ]
-events += [{"kind": "cursor", "t_ms": 3000 + i * 100, "at": [0.6, 0.6]} for i in range(10)]
 with open(os.path.join(root, "marks.json"), "w", encoding="utf-8") as f:
     json.dump({"events": events}, f)
-# No marks, but still a script: the real pointer monitor stays off and the app name is fixed,
-# so a person at the Mac cannot change a result.
+# No strokes, but still a script: the real Shift key is not watched, so a person at the Mac
+# cannot change a result.
 with open(os.path.join(root, "noop.json"), "w", encoding="utf-8") as f:
-    json.dump({"events": [{"kind": "app", "t_ms": 0, "name": "E2E App"}]}, f)
+    json.dump({"events": []}, f)
 # One stroke at 10 s and nothing before it: the words spoken earlier must still be pasted.
 late = [
-    {"kind": "app", "t_ms": 0, "name": "E2E App"},
+    {"kind": "shift", "t_ms": 9800, "held": True},
     {"kind": "stroke", "t0_ms": 10000, "t1_ms": 10600, "points": [[0.2, 0.2], [0.3, 0.3], [0.4, 0.35]]},
+    {"kind": "shift", "t_ms": 10700, "held": False},
 ]
 with open(os.path.join(root, "late-stroke.json"), "w", encoding="utf-8") as f:
     json.dump({"events": late}, f)
@@ -874,22 +876,39 @@ expect_bundle() { # <label> <status ok|text_only|failed> <pictures yes|no> <word
   [ -f "$dir/summary.md" ] && pass "$label: summary.md" || fail "$label: summary.md missing"
   [ -f "$dir/annotation.json" ] && pass "$label: annotation.json" || fail "$label: annotation.json missing"
   [ -d "$dir/candidates" ] && fail "$label: candidates/ was not removed" || pass "$label: candidates/ removed"
+  [ -f "$dir/contact-sheet.png" ] && fail "$label: a contact sheet was written" || pass "$label: no contact sheet"
   if [ "$pictures" = yes ]; then
-    [ -f "$dir/contact-sheet.png" ] && [ -f "$dir/frames/1.png" ] && pass "$label: contact sheet and frames" || fail "$label: pictures missing"
-    [ "$rkeyframes" -ge 1 ] 2> /dev/null && pass "$label: $rkeyframes keyframe(s)" || fail "$label: no keyframes in the row"
-    grep -q '^画像: ' "$dir/summary.md" && pass "$label: summary names the sheet" || fail "$label: summary has no picture line"
+    [ -f "$dir/frames/1.png" ] && pass "$label: frames/1.png" || fail "$label: pictures missing"
+    [ "$rkeyframes" -ge 1 ] 2> /dev/null && pass "$label: $rkeyframes picture(s)" || fail "$label: no pictures in the row"
   else
-    [ -f "$dir/contact-sheet.png" ] && fail "$label: a sheet exists for a text-only bundle" || pass "$label: no pictures, as expected"
-    grep -q '^画像: ' "$dir/summary.md" && fail "$label: summary names a sheet it does not have" || pass "$label: summary without picture line"
+    # A compose that finished late (status text_only) may still have written frames/.
+    if [ "$status" = text_only ]; then
+      pass "$label: pictures not counted (late compose may leave frames/)"
+    else
+      [ -d "$dir/frames" ] && fail "$label: pictures exist for a bundle without ink" || pass "$label: no pictures, as expected"
+    fi
+    [ "$rkeyframes" = 0 ] && pass "$label: 0 pictures in the row" || fail "$label: the row counts $rkeyframes picture(s)"
   fi
   summary="$(cat "$dir/summary.md")"
-  case "$summary" in *"[Murmur Annotations]"*) pass "$label: summary header" ;; *) fail "$label: summary header missing" ;; esac
+  case "$summary" in *"[Murmur Annotations]"*|*"読み方"*|*"画像: "*) fail "$label: the summary still has a header" ;; *) pass "$label: no header in the summary" ;; esac
+  local words_only
+  words_only="$(printf '%s' "$summary" | sed -E 's/\[(画像|image) [0-9]+[^]]*\]//g; s/\(文字起こしに失敗しました\)//g' | tr -d '[:space:]')"
+  case "$pictures" in no) case "$summary" in *"[画像"*|*"[image"*) fail "$label: a mark in the text of a bundle without pictures" ;; *) pass "$label: no mark in the text" ;; esac ;; esac
   case "$words" in
     yes) case "$summary" in *公園*) pass "$label: the words are in the summary" ;; *) fail "$label: expected word missing from the summary" ;; esac ;;
-    any) case "$summary" in *「*) pass "$label: words in the summary" ;; *) fail "$label: no words in the summary" ;; esac ;;
-    no) case "$summary" in *「*) fail "$label: words in a summary that should have none" ;; *) pass "$label: no words, as expected" ;; esac ;;
+    any) [ -n "$words_only" ] && pass "$label: words in the summary" || fail "$label: no words in the summary" ;;
+    no) [ -z "$words_only" ] && pass "$label: no words, as expected" || fail "$label: words in a summary that should have none" ;;
     failed) case "$summary" in *"文字起こしに失敗"*) pass "$label: the failure note is in the summary" ;; *) fail "$label: failure note missing" ;; esac ;;
   esac
+  python3 - "$dir/annotation.json" "$pictures" <<'PY' && pass "$label: annotation.json is version 2" || fail "$label: annotation.json is not the version 2 shape"
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+ok = d.get("version") == 2 and "pictures" in d and "marks" in d and "chunks" in d and "target_bundle_id" in d
+ok = ok and all(set(p) == {"n", "t_ms", "file"} for p in d["pictures"])
+ok = ok and all(set(m) == {"picture", "label", "t0_ms", "t1_ms", "strokes"} for m in d["marks"])
+ok = ok and (len(d["pictures"]) >= 1) == (sys.argv[2] == "yes")
+sys.exit(0 if ok else 1)
+PY
   if [ -n "$marks" ]; then
     python3 - "$dir/summary.md" "$marks" <<'PY' && pass "$label: marks $marks in the summary" || fail "$label: marks $marks missing from the summary"
 import re, sys
@@ -898,7 +917,8 @@ sys.exit(0 if all(re.search(p, text) for p in sys.argv[2].split(",")) else 1)
 PY
     [ "$rmarks" -ge 1 ] 2> /dev/null && pass "$label: $rmarks mark(s) in the row" || fail "$label: no marks in the row"
   fi
-  case "$(pbpaste)" in *"[Murmur Annotations]"*) pass "$label: clipboard holds the summary" ;; *) fail "$label: clipboard does not hold the summary" ;; esac
+  [ "$(pbpaste)" = "$summary" ] && pass "$label: clipboard holds the summary" || fail "$label: clipboard does not hold the summary"
+  case "$(pbpaste)" in *"/frames/"*) fail "$label: a picture path in the text for a GUI app" ;; *) pass "$label: no picture path in the text" ;; esac
   if [ "$status" = failed ]; then
     [ "$(spool_count)" -ge 1 ] && pass "$label: audio kept for a retry" || fail "$label: audio was deleted after a failure"
   else
@@ -928,13 +948,13 @@ case_annot() { # <name> <marks|""> <keep name|"">
   start_app ja "$FIXTURES/ja.wav" || { annot_unenv; return; }
   if annot_record "$FIXTURES/ja.wav"; then
     if [ -n "$script" ]; then
-      expect_bundle "$1" ok yes yes '①,◉ クリック,◌'
+      expect_bundle "$1" ok yes yes '\[画像 1 ①\]'
     else
-      expect_bundle "$1" ok yes yes
+      expect_bundle "$1" ok no yes
     fi
     [ -n "$3" ] && keep_bundle "$3"
   fi
-  assert_log_private 公園 コーヒー "E2E App"
+  assert_log_private 公園 コーヒー
   no_panic
   stop_app
   annot_unenv
@@ -952,7 +972,7 @@ case_annot_nospeech() { # <name> <marks|""> ; silence: with marks -> a bundle wi
   start_app ja "$FIXTURES/silence.wav" || { annot_unenv; return; }
   if [ -n "$script" ]; then
     if annot_record "$FIXTURES/silence.wav"; then
-      expect_bundle "$1" ok yes no '①,◉ クリック'
+      expect_bundle "$1" ok yes no '\[画像 1 ①\]'
     fi
   else
     begin_recording || { stop_app; annot_unenv; return; }
@@ -964,7 +984,7 @@ case_annot_nospeech() { # <name> <marks|""> ; silence: with marks -> a bundle wi
     [ "$(pbpaste)" = "$SENTINEL" ] && pass "$1: clipboard unchanged" || fail "$1: clipboard changed"
     [ "$(spool_count)" = 0 ] && pass "$1: spool empty" || fail "$1: spool not empty"
   fi
-  assert_log_private 公園 コーヒー "E2E App"
+  assert_log_private 公園 コーヒー
   no_panic
   stop_app
   annot_unenv
@@ -993,7 +1013,7 @@ case_annot_dropped() { # <name> <cancel|disable>
   [ "$(bundle_count)" = "$before_bundles" ] && pass "$1: bundle folder removed" || fail "$1: a bundle folder was left"
   [ "$(pbpaste)" = "$SENTINEL" ] && pass "$1: clipboard unchanged" || fail "$1: clipboard changed"
   [ "$(spool_count)" = 0 ] && pass "$1: spool empty" || fail "$1: spool not empty"
-  assert_log_private 公園 コーヒー "E2E App"
+  assert_log_private 公園 コーヒー
   no_panic
   stop_app
   annot_unenv
@@ -1003,7 +1023,7 @@ case_annot_undo() {
   say "== annot-undo (Esc, Esc, then stop)"
   make_annotation_fixtures
   set_sentinel
-  annot_env "$ANNOT_FIX/frames" ""
+  annot_env "$ANNOT_FIX/frames" "$ANNOT_FIX/marks.json"
   start_app ja "$FIXTURES/ja.wav" || { annot_unenv; return; }
   begin_recording || { stop_app; annot_unenv; return; }
   sleep 1
@@ -1019,7 +1039,7 @@ case_annot_undo() {
   else
     fail "annot-undo: no 'annotation saved'"
   fi
-  assert_log_private 公園 コーヒー "E2E App"
+  assert_log_private 公園 コーヒー
   no_panic
   stop_app
   annot_unenv
@@ -1029,13 +1049,14 @@ case_annot_screenfail() {
   say "== annot-screenfail (no screen: words only)"
   make_annotation_fixtures
   set_sentinel
-  annot_env "$SCRATCH/no-such-folder" ""
+  annot_env "$SCRATCH/no-such-folder" "$ANNOT_FIX/marks.json"
   start_app ja "$FIXTURES/ja.wav" || { annot_unenv; return; }
   if annot_record "$FIXTURES/ja.wav"; then
     grep -q 'screen capture did not start' "$LOG" && pass "annot-screenfail: screen failure logged" || fail "annot-screenfail: no screen failure in the log"
-    expect_bundle "annot-screenfail" text_only no yes
+    # Without a screen the Shift and stroke feed never starts, so nothing is drawn: words only.
+    expect_bundle "annot-screenfail" ok no yes
   fi
-  assert_log_private 公園 コーヒー "E2E App"
+  assert_log_private 公園 コーヒー
   no_panic
   stop_app
   annot_unenv
@@ -1045,7 +1066,7 @@ case_annot_compose_timeout() {
   say "== annot-compose-timeout (compose delayed past 5 s: words only)"
   make_annotation_fixtures
   set_sentinel
-  annot_env "$ANNOT_FIX/frames" ""
+  annot_env "$ANNOT_FIX/frames" "$ANNOT_FIX/marks.json"
   export MURMUR_DEBUG_COMPOSE_DELAY_MS=6000
   start_app ja "$FIXTURES/ja.wav" || { annot_unenv; return; }
   if annot_record "$FIXTURES/ja.wav"; then
@@ -1053,7 +1074,7 @@ case_annot_compose_timeout() {
     sleep 2
     grep -q 'compose finished late' "$LOG" && pass "annot-compose-timeout: late compose dropped" || note "late compose result not seen yet"
   fi
-  assert_log_private 公園 コーヒー "E2E App"
+  assert_log_private 公園 コーヒー
   no_panic
   stop_app
   annot_unenv
@@ -1068,10 +1089,10 @@ case_annot_nomodel() {
   annot_env "$ANNOT_FIX/frames" "$ANNOT_FIX/marks.json"
   start_app ja "$FIXTURES/ja.wav" || { annot_unenv; fresh_data; return; }
   if annot_record "$FIXTURES/ja.wav"; then
-    expect_bundle "annot-nomodel" failed yes failed '①,◉ クリック'
+    expect_bundle "annot-nomodel" failed yes failed '\[画像 1 ①\]'
     assert_failed_row model_missing "annot-nomodel"
   fi
-  assert_log_private 公園 コーヒー "E2E App"
+  assert_log_private 公園 コーヒー
   no_panic
   stop_app
   annot_unenv
@@ -1138,7 +1159,7 @@ case_annot_words() {
     done
     note "row: $(last_annot_row | cut -d'|' -f1-3)"
   fi
-  assert_log_private 公園 コーヒー "E2E App"
+  assert_log_private 公園 コーヒー
   no_panic
   stop_app
   annot_unenv
@@ -1176,7 +1197,7 @@ case_annot_words() {
     [ "$first" = yes ] && pass "annot-words: the first sentence is in the summary" || fail "annot-words: the first sentence is missing from the summary"
     note "row: $(last_annot_row | cut -d'|' -f1-3)"
   fi
-  assert_log_private 公園 コーヒー "E2E App"
+  assert_log_private 公園 コーヒー
   no_panic
   stop_app
   annot_unenv
@@ -1227,7 +1248,7 @@ case_annot_target() {
     fi
   fi
   osascript -e 'tell application "TextEdit" to close front document saving no' > /dev/null 2>&1
-  assert_log_private 公園 コーヒー "E2E App" TextEdit Finder
+  assert_log_private 公園 コーヒー TextEdit Finder
   no_panic
   stop_app
   annot_unenv
@@ -1243,8 +1264,8 @@ run_annotations() {
 run_case() {
   case "$1" in
     annotations) run_annotations ;;
-    annot) case_annot "annot (normal)" "" normal ;;
-    annot-marks) case_annot "annot-marks (click, stroke, dwell)" marks marks ;;
+    annot) case_annot "annot (no ink: words only)" "" normal ;;
+    annot-marks) case_annot "annot-marks (one ink group)" marks marks ;;
     annot-nospeech-marks) case_annot_nospeech "annot-nospeech-marks" marks ;;
     annot-nospeech-nomarks) case_annot_nospeech "annot-nospeech-nomarks" "" ;;
     annot-cancel) case_annot_dropped "annot-cancel (Esc, countdown)" cancel ;;
