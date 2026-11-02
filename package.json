@@ -13,7 +13,8 @@
     "test": "vitest run",
     "build": "vite build",
     "bindings": "cargo test -p murmur export_bindings",
-    "check": "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && bash scripts/guardrails.sh && pnpm typecheck && pnpm lint && pnpm test && pnpm build"
+    "check:sidecar": "cargo fmt --manifest-path crates/murmur-llm/Cargo.toml --check && cargo clippy --manifest-path crates/murmur-llm/Cargo.toml --all-targets -- -D warnings && cargo test --manifest-path crates/murmur-llm/Cargo.toml",
+    "check": "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && bash scripts/guardrails.sh && pnpm typecheck && pnpm lint && pnpm test && pnpm build && pnpm check:sidecar"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

@@ -25,3 +25,7 @@ dist-ssr
 /docs/PLAN.md
 /docs/PROGRESS.md
 /docs/features/
+
+# Sidecar binaries staged by scripts/build-sidecar.sh for Tauri externalBin
+/src-tauri/binaries/
+/crates/murmur-llm/target/

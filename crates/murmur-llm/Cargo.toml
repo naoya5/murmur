@@ -1,0 +1,38 @@
+[package]
+name = "murmur-llm"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "LLM sidecar for Murmur: llama.cpp behind a JSON Lines protocol on stdin and stdout"
+
+# Standalone on purpose: llama.cpp carries its own ggml, and PLAN 6 allows only one ggml per
+# process. Keeping this crate out of the app workspace means the app can never link it.
+[workspace]
+
+[[bin]]
+name = "murmur-llm"
+path = "src/main.rs"
+
+[dependencies]
+# OpenMP is not available with Apple clang, so the default features are off.
+llama-cpp-2 = { version = "=0.1.160", default-features = false, features = ["metal"] }
+# Direct access to the llama and ggml log callbacks, set before backend init (G7).
+llama-cpp-sys-2 = { version = "=0.1.160", default-features = false, features = ["metal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Same rules as the app workspace (G6).
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+
+[profile.release]
+debug = false
