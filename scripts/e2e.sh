@@ -826,6 +826,15 @@ late = [
 ]
 with open(os.path.join(root, "late-stroke.json"), "w", encoding="utf-8") as f:
     json.dump({"events": late}, f)
+# Strokes at 4 s: after the Esc countdown of the undo case, whatever the microphone's open time
+# (a stroke that starts or ends inside the pause is dropped, by design).
+undo = [
+    {"kind": "shift", "t_ms": 4000, "held": True},
+    {"kind": "stroke", "t0_ms": 4200, "t1_ms": 4600, "points": [[0.2, 0.2], [0.3, 0.3]]},
+    {"kind": "shift", "t_ms": 4700, "held": False},
+]
+with open(os.path.join(root, "undo.json"), "w", encoding="utf-8") as f:
+    json.dump({"events": undo}, f)
 PY
 }
 
@@ -903,7 +912,8 @@ expect_bundle() { # <label> <status ok|text_only|failed> <pictures yes|no> <word
   python3 - "$dir/annotation.json" "$pictures" <<'PY' && pass "$label: annotation.json is version 2" || fail "$label: annotation.json is not the version 2 shape"
 import json, sys
 d = json.load(open(sys.argv[1], encoding="utf-8"))
-ok = d.get("version") == 2 and "pictures" in d and "marks" in d and "chunks" in d and "target_bundle_id" in d
+ok = d.get("version") == 2 and "pictures" in d and "marks" in d and "chunks" in d and "target_bundle_id" in d and "speech" in d
+ok = ok and all(set(s) == {"start_ms", "end_ms"} for s in d["speech"])
 ok = ok and all(set(p) == {"n", "t_ms", "file"} for p in d["pictures"])
 ok = ok and all(set(m) == {"picture", "label", "t0_ms", "t1_ms", "strokes"} for m in d["marks"])
 ok = ok and (len(d["pictures"]) >= 1) == (sys.argv[2] == "yes")
@@ -1023,7 +1033,7 @@ case_annot_undo() {
   say "== annot-undo (Esc, Esc, then stop)"
   make_annotation_fixtures
   set_sentinel
-  annot_env "$ANNOT_FIX/frames" "$ANNOT_FIX/marks.json"
+  annot_env "$ANNOT_FIX/frames" "$ANNOT_FIX/undo.json"
   start_app ja "$FIXTURES/ja.wav" || { annot_unenv; return; }
   begin_recording || { stop_app; annot_unenv; return; }
   sleep 1

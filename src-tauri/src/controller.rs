@@ -1615,6 +1615,7 @@ impl Controller {
                 &planned.selection.keyframes,
                 &planned.selection.marks,
                 &annotation.chunks,
+                &planned.speech_spans(),
                 status,
             );
             Some((annotation.bundle_dir.clone(), summary, json))

@@ -68,7 +68,7 @@ Each session records `latency_ms` (stop -> clipboard) and `asr_ms` (engine time)
 Annotations (experimental) add an `annotations` table in `murmur.db` (counts and times, no words) and the folder
 `annotations/<YYYYMMDD-HHMMSS-xxxx>/` with `frames/<n>.png` (one per drawn screen, absent when nothing was
 drawn), `summary.md` (the pasted text) and `annotation.json` (version 2: pictures, ink groups, spoken segments,
-the target app's bundle id). The folder is private (0700, files 0600). It is created by the first bundle, never at
+the spans in which speech was heard, the target app's bundle id). The folder is private (0700, files 0600). It is created by the first bundle, never at
 start-up.
 Retention is a number of days (1 to 90, default 7) plus a 1 GiB cap on the whole folder; the cleanup runs on
 blocking threads after a paste and when the setting changes.
@@ -78,8 +78,9 @@ blocking threads after a paste and when the setting changes.
 Off by default (`annotations_enabled`). While it is off nothing of it runs: no hotkey, no overlay window, no
 Screen Recording check, no folder. One hotkey (default Option+Shift+S) records the voice and the screen together.
 Holding Shift and dragging draws on the screen. At the stop, every screen that was drawn on becomes one picture
-with the lines on it, and the words are pasted with a mark such as `[画像 1 ①]` in front of the sentence spoken
-while drawing. Nothing drawn: the words alone, as a dictation. The bundle goes to the app that was in front when
+with the lines on it, and the words are pasted with a mark such as `[画像 1 ①]` at the place where that line
+was drawn (estimated from the spoken time inside the segment, then moved to a sentence or word boundary; the
+engine gives no per-word times with a dictionary). Nothing drawn: the words alone, as a dictation. The bundle goes to the app that was in front when
 the hotkey was pressed, not to whatever is in front at the stop.
 
 New parts:

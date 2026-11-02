@@ -3,8 +3,9 @@
 //!       (screen samples as cell brightness, ink strokes, speech spans), how the strokes form
 //!       groups, which picture each group is drawn on and how the pictures are capped, how the
 //!       spoken segments are cut by picture, the pasted text (the words with a mark such as
-//!       `[画像 1 ①]` before the sentence spoken while drawing, with the picture path for a
-//!       terminal), the bundle ids that count as a terminal, and every tuning constant.
+//!       `[画像 1 ①]` at the place each group was drawn, estimated from the spoken time inside
+//!       the segment and moved to a boundary, with the picture path for a terminal), the
+//!       bundle ids that count as a terminal, and every tuning constant.
 //! Why: the pictures and the wording decide whether an agent understands the bundle. Keeping
 //!      the rules pure (guardrail G1) makes them testable with numbers alone and lets the
 //!      constants be tuned from real recordings without touching an adapter.
@@ -341,9 +342,33 @@ pub struct Summary<'a> {
     pub bundle_dir: &'a str,
     pub marks: &'a [Mark],
     pub chunks: &'a [Chunk],
+    /// The spans in which speech was heard (VAD), to place a mark inside a chunk by the spoken
+    /// time before it. Empty: the chunk's own span stands in.
+    pub speech: &'a [SpeechSpan],
     /// The transcription failed: a note replaces the words; the marks still go out.
     pub transcription_failed: bool,
 }
+
+/// A mark is moved to the best boundary within this many characters of its estimated place.
+pub const MARK_SNAP_CHARS: usize = 6;
+
+/// Words a mark is placed in front of when they are near its estimated place.
+pub const DEMONSTRATIVES: [&str; 14] = [
+    "これ",
+    "ここ",
+    "この",
+    "それ",
+    "そこ",
+    "その",
+    "あれ",
+    "あそこ",
+    "あの",
+    "こっち",
+    "this",
+    "that",
+    "here",
+    "there",
+];
 
 const INK_LABELS: [char; 20] = [
     '①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩', '⑪', '⑫', '⑬', '⑭', '⑮', '⑯', '⑰', '⑱', '⑲',
@@ -375,14 +400,20 @@ fn failed_note(language: Language) -> &'static str {
     }
 }
 
-/// The mark of one picture: `[画像 1 ①②]`, with the picture path for a terminal.
-fn mark_token(s: &Summary<'_>, keyframe: usize, labels: &[u32]) -> String {
-    let labels: String = labels.iter().map(|l| ink_label(*l)).collect();
-    let mut token = format!("[{} {keyframe} {labels}", image_word(s.language));
-    if s.target == PasteTarget::Terminal {
+/// The token of one mark: `[画像 1 ①]`; with the picture path (a terminal, the first mark of
+/// the picture only).
+fn mark_token(s: &Summary<'_>, mark: &Mark, with_path: bool) -> String {
+    let mut token = format!(
+        "[{} {} {}",
+        image_word(s.language),
+        mark.keyframe,
+        ink_label(mark.label)
+    );
+    if with_path {
         let path = format!(
-            "{}/frames/{keyframe}.png",
-            s.bundle_dir.trim_end_matches('/')
+            "{}/frames/{}.png",
+            s.bundle_dir.trim_end_matches('/'),
+            mark.keyframe
         );
         token.push_str(": ");
         token.push_str(&path_for_paste(&path, s.target));
@@ -391,56 +422,245 @@ fn mark_token(s: &Summary<'_>, keyframe: usize, labels: &[u32]) -> String {
     token
 }
 
-/// The text pasted after the pictures (and written to `summary.md`): the spoken words in
-/// order, with the mark of each ink group before the sentence spoken while it was drawn (the
-/// chunk whose span holds the group's start, else the next chunk, else at the end). Marks of
-/// one picture that fall at the same place share one token. Without ink: the words alone, as a
-/// dictation. A failed transcription: a note, then the marks.
-pub fn summary_text(s: &Summary<'_>) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    let mut pending: Vec<&Mark> = s.marks.iter().collect();
-    let mut flush = |parts: &mut Vec<String>, before_ms: Option<Millis>| {
-        let take: Vec<&Mark> = pending
-            .iter()
-            .copied()
-            .filter(|m| before_ms.is_none_or(|t| m.t0_ms < t))
-            .collect();
-        pending.retain(|m| before_ms.is_some_and(|t| m.t0_ms >= t));
-        let mut i = 0;
-        while i < take.len() {
-            let keyframe = take[i].keyframe;
-            let mut labels = Vec::new();
-            while i < take.len() && take[i].keyframe == keyframe {
-                labels.push(take[i].label);
-                i += 1;
-            }
-            parts.push(mark_token(s, keyframe, &labels));
+/// Share of the spoken time of a chunk that lies before `t_ms`: the VAD spans inside the
+/// chunk, silence left out. Without a span the chunk's own span stands in.
+pub fn spoken_share(chunk: &Chunk, speech: &[SpeechSpan], t_ms: Millis) -> f32 {
+    let (cs, ce) = (chunk.start_ms, chunk.end_ms.max(chunk.start_ms));
+    let mut total = 0u64;
+    let mut before = 0u64;
+    for span in speech {
+        let (a, b) = (span.start_ms.max(cs), span.end_ms.min(ce));
+        if b <= a {
+            continue;
         }
+        total += b - a;
+        before += b.min(t_ms).saturating_sub(a);
+    }
+    if total == 0 {
+        total = ce - cs;
+        before = t_ms.min(ce).saturating_sub(cs);
+    }
+    if total == 0 {
+        return 0.0;
+    }
+    (before as f32 / total as f32).clamp(0.0, 1.0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Script {
+    Kanji,
+    Hiragana,
+    Katakana,
+    Latin,
+    Other,
+}
+
+fn script_of(c: char) -> Script {
+    match c {
+        '\u{3040}'..='\u{309F}' => Script::Hiragana,
+        '\u{30A0}'..='\u{30FF}' | '\u{31F0}'..='\u{31FF}' | '\u{FF66}'..='\u{FF9D}' => {
+            Script::Katakana
+        }
+        _ if crate::text::is_cjk_char(c) => Script::Kanji,
+        _ if c.is_alphanumeric() => Script::Latin,
+        _ => Script::Other,
+    }
+}
+
+fn is_punctuation(c: char) -> bool {
+    matches!(
+        c,
+        '。' | '、' | '，' | '．' | '！' | '？' | '.' | ',' | '!' | '?' | ';' | ':'
+    )
+}
+
+fn starts_with_demonstrative(chars: &[char], i: usize) -> bool {
+    DEMONSTRATIVES.iter().any(|w| {
+        let w: Vec<char> = w.chars().collect();
+        chars.len() >= i + w.len()
+            && chars[i..i + w.len()]
+                .iter()
+                .zip(&w)
+                .all(|(a, b)| a.to_lowercase().eq(b.to_lowercase()))
+            && chars
+                .get(i + w.len())
+                .is_none_or(|c| !(w[0].is_ascii_alphabetic() && c.is_alphanumeric()))
+    })
+}
+
+/// How good a place between `chars[i - 1]` and `chars[i]` is for a mark: 1 after a
+/// punctuation mark, 2 before a demonstrative, 3 where the script changes (English: at a
+/// space), `None` inside a word or a run of kanji.
+fn boundary_rank(chars: &[char], i: usize, language: Language) -> Option<u8> {
+    let n = chars.len();
+    if i == 0 {
+        return Some(3);
+    }
+    if i >= n {
+        return Some(if chars.last().is_some_and(|c| is_punctuation(*c)) {
+            1
+        } else {
+            3
+        });
+    }
+    let (prev, next) = (chars[i - 1], chars[i]);
+    match language {
+        Language::En => {
+            if !prev.is_whitespace() && !next.is_whitespace() {
+                return None;
+            }
+            let before_word = prev.is_whitespace();
+            let after_punct = i >= 2 && chars[i - 2..i].iter().any(|c| is_punctuation(*c));
+            if before_word && after_punct {
+                Some(1)
+            } else if before_word && starts_with_demonstrative(chars, i) {
+                Some(2)
+            } else {
+                Some(3)
+            }
+        }
+        Language::Ja => {
+            if is_punctuation(prev) {
+                return Some(1);
+            }
+            if starts_with_demonstrative(chars, i) {
+                return Some(2);
+            }
+            let (a, b) = (script_of(prev), script_of(next));
+            if a == b && matches!(a, Script::Kanji | Script::Latin) {
+                return None;
+            }
+            if a != b || a == Script::Other {
+                Some(3)
+            } else {
+                // Inside a run of kana: allowed, but worse than a real boundary.
+                Some(4)
+            }
+        }
+    }
+}
+
+/// The character index of a mark in `text`: the estimated place (`share` of the characters),
+/// moved to the best boundary within `MARK_SNAP_CHARS` (the best rank, then the nearest). With
+/// no boundary near, the nearest boundary anywhere.
+pub fn mark_index(text: &str, share: f32, language: Language) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let estimate = ((share * n as f32).round() as usize).min(n);
+    let candidate =
+        |i: usize| boundary_rank(&chars, i, language).map(|r| (r, i.abs_diff(estimate), i));
+    let near = (estimate.saturating_sub(MARK_SNAP_CHARS)..=(estimate + MARK_SNAP_CHARS).min(n))
+        .filter_map(candidate)
+        .filter(|(r, _, _)| *r < 4)
+        .min();
+    if let Some((_, _, i)) = near {
+        return i;
+    }
+    (0..=n)
+        .filter_map(candidate)
+        .map(|(r, d, i)| (d, r, i))
+        .min()
+        .map_or(estimate, |(_, _, i)| i)
+}
+
+/// Where each mark goes: the chunk whose span holds its start (by the spoken time before it),
+/// the next chunk's head when it falls between chunks, the last chunk's end after the words.
+/// Returns `(chunk index, character index)` per mark, in mark order; `None` without chunks.
+fn mark_places(s: &Summary<'_>) -> Vec<Option<(usize, usize)>> {
+    s.marks
+        .iter()
+        .map(|mark| {
+            let t = mark.t0_ms;
+            let inside = s
+                .chunks
+                .iter()
+                .position(|c| c.start_ms <= t && t < c.end_ms);
+            if let Some(i) = inside {
+                let chunk = &s.chunks[i];
+                let share = spoken_share(chunk, s.speech, t);
+                return Some((i, mark_index(chunk.text.0.trim(), share, s.language)));
+            }
+            // Drawn before the words of the next chunk: its head. After all the words: the end.
+            match s.chunks.iter().position(|c| c.start_ms > t) {
+                Some(i) => Some((i, 0)),
+                None => s
+                    .chunks
+                    .len()
+                    .checked_sub(1)
+                    .map(|i| (i, s.chunks[i].text.0.trim().chars().count())),
+            }
+        })
+        .collect()
+}
+
+/// The text pasted after the pictures (and written to `summary.md`): the spoken words in
+/// order, with the token of each ink group at the place it was drawn (R10, R11). A terminal
+/// gets the picture path in the first token of each picture. Without ink: the words alone, as
+/// a dictation. A failed transcription: a note, then the tokens.
+pub fn summary_text(s: &Summary<'_>) -> String {
+    let mut first_of_picture: Vec<usize> = Vec::new();
+    let with_path = |mark: &Mark, seen: &mut Vec<usize>| -> bool {
+        if s.target != PasteTarget::Terminal || seen.contains(&mark.keyframe) {
+            return false;
+        }
+        seen.push(mark.keyframe);
+        true
     };
     if s.transcription_failed {
-        parts.push(failed_note(s.language).to_owned());
-        flush(&mut parts, None);
-    } else {
-        for chunk in s.chunks {
-            flush(&mut parts, Some(chunk.end_ms));
-            let text = chunk.text.0.trim();
-            if !text.is_empty() {
-                parts.push(text.to_owned());
-            }
+        let mut parts = vec![failed_note(s.language).to_owned()];
+        for mark in s.marks {
+            let path = with_path(mark, &mut first_of_picture);
+            parts.push(mark_token(s, mark, path));
         }
-        flush(&mut parts, None);
+        return join_parts(&parts);
+    }
+    let places = mark_places(s);
+    let mut parts: Vec<String> = Vec::new();
+    for (ci, chunk) in s.chunks.iter().enumerate() {
+        let chars: Vec<char> = chunk.text.0.trim().chars().collect();
+        // Tokens of this chunk, by their character index, in mark order.
+        let mut cut = 0;
+        let mut piece = String::new();
+        let flush_piece = |piece: &mut String, parts: &mut Vec<String>| {
+            if !piece.trim().is_empty() {
+                parts.push(piece.trim().to_owned());
+            }
+            piece.clear();
+        };
+        for (mark, place) in s.marks.iter().zip(&places) {
+            let Some((chunk_index, at)) = place else {
+                continue;
+            };
+            if *chunk_index != ci {
+                continue;
+            }
+            let at = (*at).max(cut).min(chars.len());
+            piece.extend(&chars[cut..at]);
+            flush_piece(&mut piece, &mut parts);
+            let path = with_path(mark, &mut first_of_picture);
+            parts.push(mark_token(s, mark, path));
+            cut = at;
+        }
+        piece.extend(&chars[cut..]);
+        flush_piece(&mut piece, &mut parts);
+    }
+    if s.chunks.is_empty() {
+        for mark in s.marks {
+            let path = with_path(mark, &mut first_of_picture);
+            parts.push(mark_token(s, mark, path));
+        }
     }
     join_parts(&parts)
 }
 
-/// Words join as a dictation (`pipeline::join_texts`); a mark always has a space on both sides.
+/// Words join as a dictation (`pipeline::join_texts`); a token always has a space on both sides.
 fn join_parts(parts: &[String]) -> String {
     let mut out = String::new();
     for part in parts {
-        let mark = part.starts_with('[');
+        let token = part.starts_with('[');
         if out.is_empty() {
             out.push_str(part);
-        } else if mark || out.ends_with(']') {
+        } else if token || out.ends_with(']') {
             out.push(' ');
             out.push_str(part);
         } else {
@@ -727,6 +947,7 @@ mod tests {
         target: PasteTarget,
         marks: &'a [Mark],
         chunks: &'a [Chunk],
+        speech: &'a [SpeechSpan],
         failed: bool,
     ) -> Summary<'a> {
         Summary {
@@ -735,23 +956,144 @@ mod tests {
             bundle_dir: DIR,
             marks,
             chunks,
+            speech,
             transcription_failed: failed,
         }
     }
 
+    /// Spans that cover each chunk whole (no silence inside).
+    fn continuous(chunks: &[Chunk]) -> Vec<SpeechSpan> {
+        chunks.iter().map(|c| span(c.start_ms, c.end_ms)).collect()
+    }
+
     #[test]
-    fn japanese_text_puts_each_mark_before_the_sentence_spoken_while_drawing() {
-        let chunks = vec![
-            chunk(0, 3_000, 1, "このボタンを押すと、"),
-            chunk(8_000, 12_000, 1, "ここの表示がずれるんですよ。"),
-            chunk(21_000, 24_000, 2, "こっちは正しく出てます。"),
-        ];
-        let marks = vec![mark(1, 1, 9_000), mark(2, 2, 21_500)];
+    fn spoken_share_leaves_silence_out() {
+        let c = chunk(10_000, 20_000, 1, "x");
+        // 10 s of chunk, but speech only in 10..12 and 18..20: 4 s spoken.
+        let speech = [span(10_000, 12_000), span(18_000, 20_000)];
+        assert_eq!(spoken_share(&c, &speech, 9_000), 0.0);
+        assert_eq!(spoken_share(&c, &speech, 11_000), 0.25);
+        assert_eq!(spoken_share(&c, &speech, 15_000), 0.5); // in the silence: half spoken
+        assert_eq!(spoken_share(&c, &speech, 19_000), 0.75);
+        assert_eq!(spoken_share(&c, &speech, 25_000), 1.0);
+        // Without spans the chunk's own span stands in.
+        assert_eq!(spoken_share(&c, &[], 15_000), 0.5);
+        // Spans outside the chunk do not count.
+        assert_eq!(spoken_share(&c, &[span(0, 5_000)], 15_000), 0.5);
+    }
+
+    #[test]
+    fn mark_index_prefers_punctuation_then_demonstratives_then_script_changes() {
+        // A punctuation mark within reach wins.
+        let text = "ここを押す。そしてこれも押す";
+        let i = mark_index(text, 0.45, Language::Ja); // estimate 6, 。 is at index 5
+        assert_eq!(i, 6);
+        // A demonstrative within reach, no punctuation near.
+        let text = "ボタンだからこれを押してください";
+        let i = mark_index(text, 0.5, Language::Ja); // estimate 8, これ starts at 6
+        assert_eq!(i, 6);
+        // A script change only: between kana and kanji.
+        let text = "いいかんじだから採用します";
+        let i = mark_index(text, 0.6, Language::Ja); // estimate 8: 採 is at 8
+        assert_eq!(i, 8);
+        // Never inside a run of kanji: 採用 stays whole.
+        let i = mark_index("採用採用採用採用採用", 0.45, Language::Ja);
+        assert!(i == 0 || i == 10);
+        // The ends are always fine.
+        assert_eq!(mark_index("言葉", 0.0, Language::Ja), 0);
+        assert_eq!(mark_index("言葉", 1.0, Language::Ja), 2);
+        assert_eq!(mark_index("", 0.5, Language::Ja), 0);
+    }
+
+    #[test]
+    fn mark_index_in_english_lands_between_words() {
+        let text = "press this button. then that one";
+        // Estimate 14 (inside "button"): the punctuation boundary at 19 is within reach and
+        // beats the plain word boundary at 11.
+        assert_eq!(mark_index(text, 14.0 / 32.0, Language::En), 19);
+        // Estimate 8 (inside "this"): no punctuation within reach; before "this" wins.
+        assert_eq!(mark_index(text, 8.0 / 32.0, Language::En), 6);
+        // Estimate 26 (inside "that"): before "that".
+        assert_eq!(mark_index(text, 26.0 / 32.0, Language::En), 24);
+        // Never inside a word.
+        for i in 0..=32 {
+            let at = mark_index(text, i as f32 / 32.0, Language::En);
+            assert!(
+                at == 0 || at == 32 || text.chars().nth(at - 1) == Some(' '),
+                "{i} -> {at}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_second_mark_lands_before_the_second_demonstrative() {
+        // Shaped like the real case: one chunk of 9.3 s, the first mark before the words, the
+        // second about 63 % into them. Expected: ① at the head, ② after そして and before これも.
+        let chunks = vec![chunk(
+            11_000,
+            20_300,
+            1,
+            "これはいい感じだから使おうかなそしてこれもいい感じだからこれも使おう。",
+        )];
+        let marks = vec![mark(1, 1, 8_800), mark(1, 2, 16_900)];
+        let speech = continuous(&chunks);
         let text = summary_text(&summary(
             Language::Ja,
             PasteTarget::Other,
             &marks,
             &chunks,
+            &speech,
+            false,
+        ));
+        assert_eq!(
+            text,
+            "[画像 1 ①] これはいい感じだから使おうかなそして [画像 1 ②] これもいい感じだからこれも使おう。"
+        );
+    }
+
+    #[test]
+    fn a_terminal_puts_the_path_in_the_first_token_of_each_picture_only() {
+        let chunks = vec![chunk(
+            11_000,
+            20_300,
+            1,
+            "これはいい感じだから使おうかなそしてこれもいい感じだからこれも使おう。",
+        )];
+        let marks = vec![mark(1, 1, 8_800), mark(1, 2, 16_900), mark(2, 3, 25_000)];
+        let speech = continuous(&chunks);
+        let text = summary_text(&summary(
+            Language::Ja,
+            PasteTarget::Terminal,
+            &marks,
+            &chunks,
+            &speech,
+            false,
+        ));
+        let path =
+            "/Users/me/Library/Application\\ Support/murmur/annotations/20261102-1200-ab12/frames";
+        assert_eq!(
+            text,
+            format!(
+                "[画像 1 ①: {path}/1.png] これはいい感じだから使おうかなそして [画像 1 ②] これもいい感じだからこれも使おう。 [画像 2 ③: {path}/2.png]"
+            )
+        );
+    }
+
+    #[test]
+    fn marks_between_chunks_go_to_the_head_of_the_next_chunk() {
+        let chunks = vec![
+            chunk(0, 3_000, 1, "このボタンを押すと、"),
+            chunk(8_000, 12_000, 1, "ここの表示がずれるんですよ。"),
+            chunk(21_000, 24_000, 2, "こっちは正しく出てます。"),
+        ];
+        let marks = vec![mark(1, 1, 5_000), mark(2, 2, 15_000)];
+        let speech = continuous(&chunks);
+        let text = summary_text(&summary(
+            Language::Ja,
+            PasteTarget::Other,
+            &marks,
+            &chunks,
+            &speech,
             false,
         ));
         assert_eq!(
@@ -761,68 +1103,81 @@ mod tests {
     }
 
     #[test]
-    fn a_terminal_gets_the_picture_path_in_the_mark() {
-        let chunks = vec![chunk(0, 3_000, 1, "ここです。")];
-        let marks = vec![mark(1, 1, 1_000)];
-        let text = summary_text(&summary(
-            Language::Ja,
-            PasteTarget::Terminal,
-            &marks,
-            &chunks,
-            false,
-        ));
-        assert_eq!(
-            text,
-            "[画像 1 ①: /Users/me/Library/Application\\ Support/murmur/annotations/20261102-1200-ab12/frames/1.png] ここです。"
-        );
-    }
-
-    #[test]
-    fn english_text_uses_image_and_spaces() {
-        let chunks = vec![
-            chunk(0, 3_000, 1, "When I press this button,"),
-            chunk(4_000, 7_000, 1, "the layout breaks here."),
-        ];
-        let marks = vec![mark(1, 1, 4_500)];
+    fn english_text_places_the_mark_at_a_word_boundary() {
+        let chunks = vec![chunk(
+            0,
+            8_000,
+            1,
+            "When I press this button the layout breaks here.",
+        )];
+        let marks = vec![mark(1, 1, 5_000)];
+        let speech = continuous(&chunks);
         let text = summary_text(&summary(
             Language::En,
             PasteTarget::Other,
             &marks,
             &chunks,
+            &speech,
             false,
         ));
+        // 62 % of 48 characters is index 30, inside "layout": the boundary before it wins.
         assert_eq!(
             text,
-            "When I press this button, [image 1 ①] the layout breaks here."
+            "When I press this button the [image 1 ①] layout breaks here."
         );
     }
 
     #[test]
-    fn marks_of_one_picture_at_the_same_place_share_a_token() {
-        let chunks = vec![
-            chunk(0, 2_000, 1, "まず、"),
-            chunk(10_000, 12_000, 1, "両方です。"),
-        ];
-        let marks = vec![mark(1, 1, 3_000), mark(1, 2, 5_000)];
+    fn silence_inside_a_chunk_moves_the_mark_by_spoken_time() {
+        // Words in 0..4 s and 10..14 s; the mark at 12 s is half into the second part, which
+        // is 75 % of the spoken time: after the second sentence.
+        let chunks = vec![chunk(
+            0,
+            14_000,
+            1,
+            "最初の文を話します。しばらく黙ります。それから次の文を話します。",
+        )];
+        let marks = vec![mark(1, 1, 12_000)];
+        let speech = [span(0, 4_000), span(10_000, 14_000)];
         let text = summary_text(&summary(
             Language::Ja,
             PasteTarget::Other,
             &marks,
             &chunks,
+            &speech,
             false,
         ));
-        assert_eq!(text, "まず、 [画像 1 ①②] 両方です。");
+        assert_eq!(
+            text,
+            "最初の文を話します。しばらく黙ります。 [画像 1 ①] それから次の文を話します。"
+        );
+        // Treated as continuous, 12 s of 14 s lands at the end instead.
+        let spans = continuous(&chunks);
+        let text = summary_text(&summary(
+            Language::Ja,
+            PasteTarget::Other,
+            &marks,
+            &chunks,
+            &spans,
+            false,
+        ));
+        assert_eq!(
+            text,
+            "最初の文を話します。しばらく黙ります。それから次の文を話します。 [画像 1 ①]"
+        );
     }
 
     #[test]
     fn marks_after_the_last_sentence_and_marks_without_words() {
         let chunks = vec![chunk(0, 2_000, 1, "見てください。")];
         let marks = vec![mark(1, 1, 5_000), mark(2, 2, 9_000)];
+        let speech = continuous(&chunks);
         let text = summary_text(&summary(
             Language::Ja,
             PasteTarget::Other,
             &marks,
             &chunks,
+            &speech,
             false,
         ));
         assert_eq!(text, "見てください。 [画像 1 ①] [画像 2 ②]");
@@ -830,6 +1185,7 @@ mod tests {
             Language::Ja,
             PasteTarget::Other,
             &marks,
+            &[],
             &[],
             false,
         ));
@@ -842,11 +1198,13 @@ mod tests {
             chunk(0, 2_000, 1, "公園に行きました。"),
             chunk(3_000, 5_000, 1, "コーヒーを飲みました。"),
         ];
+        let speech = continuous(&chunks);
         let text = summary_text(&summary(
             Language::Ja,
             PasteTarget::Terminal,
             &[],
             &chunks,
+            &speech,
             false,
         ));
         assert_eq!(text, "公園に行きました。コーヒーを飲みました。");
@@ -854,23 +1212,41 @@ mod tests {
             chunk(0, 2_000, 1, "Open the settings."),
             chunk(3_000, 5_000, 1, "Press the hotkey."),
         ];
-        let text = summary_text(&summary(Language::En, PasteTarget::Other, &[], &en, false));
+        let text = summary_text(&summary(
+            Language::En,
+            PasteTarget::Other,
+            &[],
+            &en,
+            &[],
+            false,
+        ));
         assert_eq!(text, "Open the settings. Press the hotkey.");
     }
 
     #[test]
     fn failed_transcription_writes_a_note_then_the_marks() {
-        let marks = vec![mark(1, 1, 2_000)];
+        let marks = vec![mark(1, 1, 2_000), mark(1, 2, 3_000)];
         let chunks = vec![chunk(0, 2_000, 1, "ignored")];
         let text = summary_text(&summary(
             Language::Ja,
-            PasteTarget::Other,
+            PasteTarget::Terminal,
             &marks,
             &chunks,
+            &[],
             true,
         ));
-        assert_eq!(text, "(文字起こしに失敗しました) [画像 1 ①]");
-        let text = summary_text(&summary(Language::En, PasteTarget::Other, &[], &[], true));
+        assert_eq!(
+            text,
+            "(文字起こしに失敗しました) [画像 1 ①: /Users/me/Library/Application\\ Support/murmur/annotations/20261102-1200-ab12/frames/1.png] [画像 1 ②]"
+        );
+        let text = summary_text(&summary(
+            Language::En,
+            PasteTarget::Other,
+            &[],
+            &[],
+            &[],
+            true,
+        ));
         assert_eq!(text, "(transcription failed)");
     }
 
@@ -882,6 +1258,7 @@ mod tests {
             PasteTarget::Other,
             &[],
             &chunks,
+            &[],
             false,
         ));
         assert_eq!(text, "言葉。");

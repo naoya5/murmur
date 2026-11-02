@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use murmur_core::annotations::{Chunk, Keyframe, Mark};
+use murmur_core::annotations::{Chunk, Keyframe, Mark, SpeechSpan};
 
 use crate::adapters::store::{AnnotationStatus, Store};
 
@@ -168,7 +168,8 @@ pub struct DisplayFacts {
 }
 
 /// The machine-readable record of a bundle (version 2): the pictures, the ink groups drawn
-/// on them, the spoken segments, where it was pasted. Positions are shares of the display.
+/// on them, the spoken segments, the spans in which speech was heard (times only), where it
+/// was pasted. Positions are shares of the display.
 #[allow(clippy::too_many_arguments)]
 pub fn annotation_json(
     created_at_ms: i64,
@@ -180,6 +181,7 @@ pub fn annotation_json(
     keyframes: &[Keyframe],
     marks: &[Mark],
     chunks: &[Chunk],
+    speech: &[SpeechSpan],
     status: AnnotationStatus,
 ) -> serde_json::Value {
     use chrono::TimeZone;
@@ -229,6 +231,10 @@ pub fn annotation_json(
             })
         })
         .collect();
+    let speech: Vec<serde_json::Value> = speech
+        .iter()
+        .map(|s| json!({ "start_ms": s.start_ms, "end_ms": s.end_ms }))
+        .collect();
     let status = match status {
         AnnotationStatus::Ok => "ok",
         AnnotationStatus::TextOnly => "text_only",
@@ -249,6 +255,7 @@ pub fn annotation_json(
         "pictures": pictures,
         "marks": marks,
         "chunks": chunks,
+        "speech": speech,
         "status": status,
     })
 }
@@ -628,9 +635,16 @@ mod tests {
             &keyframes,
             &marks,
             &chunks,
+            &[SpeechSpan {
+                start_ms: 100,
+                end_ms: 2_900,
+            }],
             AnnotationStatus::Ok,
         );
         assert_eq!(json["version"], 2);
+        assert_eq!(json["speech"][0]["start_ms"], 100);
+        assert_eq!(json["speech"][0]["end_ms"], 2_900);
+        assert!(json["speech"][0].get("text").is_none());
         assert_eq!(json["status"], "ok");
         assert_eq!(json["target_bundle_id"], "com.apple.TextEdit");
         assert_eq!(json["pictures"][0]["file"], "frames/1.png");

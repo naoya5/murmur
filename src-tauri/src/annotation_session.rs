@@ -75,6 +75,17 @@ impl Planned {
     pub fn pictures_wanted(&self) -> bool {
         !self.selection.keyframes.is_empty() || self.selection.dropped_groups > 0
     }
+
+    /// The VAD spans in recording milliseconds (to place the marks inside the words).
+    pub fn speech_spans(&self) -> Vec<SpeechSpan> {
+        self.regions
+            .iter()
+            .map(|r| SpeechSpan {
+                start_ms: ann::samples_to_ms(r.start),
+                end_ms: ann::samples_to_ms(r.end),
+            })
+            .collect()
+    }
 }
 
 impl AnnotationCtx {
@@ -383,6 +394,7 @@ pub fn compose(
         &planned.selection.keyframes,
         &planned.selection.marks,
         chunks,
+        &planned.speech_spans(),
         status,
     );
     bundles::write_bundle_files(bundle_dir, &summary, &json).map_err(|e| e.to_string())?;
@@ -405,6 +417,7 @@ pub fn summary_text(
         bundle_dir: &bundle_dir.to_string_lossy(),
         marks: &planned.selection.marks,
         chunks,
+        speech: &planned.speech_spans(),
         transcription_failed: words == ComposeWords::Failed,
     })
 }
