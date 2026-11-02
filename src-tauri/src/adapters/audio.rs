@@ -927,6 +927,7 @@ fn level_from_rms(rms: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(debug_assertions)]
     use std::sync::Mutex;
 
     fn sine(rate: u32, hz: f32, secs: f32, amp: f32) -> Vec<f32> {
@@ -1135,6 +1136,7 @@ mod tests {
         assert!(devices.iter().filter(|d| d.is_default).count() <= 1);
     }
 
+    #[cfg(debug_assertions)]
     fn write_wav(path: &Path, rate: u32, channels: u16, samples: &[f32]) {
         let spec = hound::WavSpec {
             channels,
@@ -1149,6 +1151,7 @@ mod tests {
         w.finalize().unwrap();
     }
 
+    #[cfg(debug_assertions)]
     fn record_wav(wav: &Path, spool: &Path, run: Duration) -> (CapturedAudio, Vec<AudioEvent>) {
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&events);

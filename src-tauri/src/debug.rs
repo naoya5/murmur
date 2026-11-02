@@ -16,13 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use murmur_core::session::Event;
-use murmur_core::settings::RecordMode;
-use tokio::signal::unix::{SignalKind, signal};
-
 use crate::adapters::pointer::{PointerEvent, PointerFeed};
-use crate::app::App;
-use crate::controller::{ControllerHandle, Msg};
 use crate::ipc::InkPoint;
 
 fn debug_var(name: &str) -> Option<String> {
@@ -160,7 +154,17 @@ impl PointerFeed for ScriptPlayer {
     }
 }
 
-pub fn install(app: tauri::AppHandle, services: Arc<App>, controller: ControllerHandle) {
+#[cfg(debug_assertions)]
+pub fn install(
+    app: tauri::AppHandle,
+    services: Arc<crate::app::App>,
+    controller: crate::controller::ControllerHandle,
+) {
+    use crate::controller::Msg;
+    use murmur_core::session::Event;
+    use murmur_core::settings::RecordMode;
+    use tokio::signal::unix::{SignalKind, signal};
+
     tauri::async_runtime::spawn(async move {
         let (Ok(mut hotkey), Ok(mut esc), Ok(mut toggle)) = (
             signal(SignalKind::user_defined1()),
@@ -207,6 +211,7 @@ pub fn install(app: tauri::AppHandle, services: Arc<App>, controller: Controller
 
 /// `MURMUR_DEBUG_VIEW=<view>` opens the main window on that view at start (visual QA of the real
 /// app without clicking through the tray).
+#[cfg(debug_assertions)]
 pub fn show_initial_view(app: &tauri::AppHandle) {
     use tauri_specta::Event as _;
     let Ok(view) = std::env::var("MURMUR_DEBUG_VIEW") else {
