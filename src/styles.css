@@ -2336,13 +2336,35 @@ button {
   overflow: hidden;
 }
 
+/* The pill window has one fixed size: the widest capsule plus a transparent margin on every side,
+   where the transcribing glow shines. The capsule is as wide as its content and centered; the
+   native glass is cut to it, and clicks anywhere else go through to the app below. PILL_MARGIN in
+   src-tauri/src/windows.rs must equal --pill-margin. */
+.pill-page {
+  --pill-margin: 20px;
+}
+
+.pill-page #root {
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: var(--pill-margin);
+}
+
+.pill-frame {
+  position: relative;
+  flex: none;
+  height: 40px;
+}
+
 /* The native Liquid Glass supplies the capsule; the page adds the same warm fill as the content
-   panel (so white ink stays legible over a bright app) and the lit rim. */
+   panel (so white ink stays legible over a bright app), the lit rim and the drop shadow (the window
+   has none of its own; the shadow's reach stays inside --pill-margin). */
 .pill-capsule {
   position: relative;
+  z-index: 1;
   display: block;
   height: 40px;
-  width: 100%;
   border-radius: 20px;
   overflow: hidden;
   color: var(--ink);
@@ -2350,7 +2372,9 @@ button {
   background: var(--glass-panel);
   box-shadow:
     inset 0 1px 0 rgba(255, 238, 220, 0.2),
-    inset 0 0 0 1px rgba(255, 238, 220, 0.09);
+    inset 0 0 0 1px rgba(255, 238, 220, 0.09),
+    0 1px 1px rgba(0, 0, 0, 0.25),
+    0 8px 18px -8px rgba(0, 0, 0, 0.55);
 }
 
 .pill-capsule::after {
@@ -2386,6 +2410,36 @@ button {
   outline: none;
 }
 
+/* A well or a bead at the end sits concentric with the capsule's round end. */
+.pill--wave {
+  padding: 0 10px 0 6px;
+}
+
+.pill--notice {
+  padding: 0 16px 0 6px;
+}
+
+/* The recessed channel that holds the waveform, or a notice icon. */
+.pill__well {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 14px;
+  background: var(--well);
+  box-shadow:
+    inset 0 1px 2px rgba(0, 0, 0, 0.45),
+    inset 0 -1px 0 rgba(255, 238, 220, 0.08);
+  flex-shrink: 0;
+}
+
+.pill__well--icon {
+  justify-content: center;
+  width: 28px;
+  padding: 0;
+}
+
 .pill__dot {
   width: 8px;
   height: 8px;
@@ -2414,6 +2468,7 @@ button {
   }
 }
 
+/* The ends fade out, so the wave reads as a slice of a longer one. */
 .pill__wave {
   position: relative;
   display: flex;
@@ -2423,42 +2478,41 @@ button {
   height: 20px;
   flex-shrink: 0;
   overflow: hidden;
-  border-radius: 4px;
+  -webkit-mask-image: linear-gradient(90deg, transparent 0%, #000 14%, #000 86%, transparent 100%);
+  mask-image: linear-gradient(90deg, transparent 0%, #000 14%, #000 86%, transparent 100%);
 }
 
 .pill__bar {
   flex: 1;
   min-height: 3px;
-  border-radius: 1.5px;
+  border-radius: var(--radius-full);
   background: linear-gradient(180deg, #fff4e6 0%, var(--accent-hi) 100%);
   opacity: 0.9;
   transform-origin: center;
 }
 
-.pill__wave--shimmer .pill__bar {
-  opacity: 0.35;
+/* Transcribing: the recorded levels give way to a slow swell that travels left to right; each bar
+   is one step (--i, set per bar in Pill.tsx) behind its left neighbour. The wave also fills the
+   recording dot and clock (8 + 8 + 70 + 10 + 42 px), so the capsule keeps its width and the window
+   does not move when the transcription starts. */
+.pill__wave--breathe {
+  width: 138px;
 }
 
-.pill__wave--shimmer::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  width: 50%;
-  background: linear-gradient(
-    100deg,
-    transparent 0%,
-    rgba(255, 157, 77, 0.7) 50%,
-    transparent 100%
-  );
-  animation: pill-shimmer 1.1s var(--ease) infinite;
+.pill__wave--breathe .pill__bar {
+  height: 18px;
+  transform: scaleY(0.3);
+  animation: pill-breathe 1.2s ease-in-out infinite;
+  animation-delay: calc(var(--i, 0) * 45ms - 1400ms);
 }
 
-@keyframes pill-shimmer {
-  from {
-    transform: translateX(-100%);
+@keyframes pill-breathe {
+  0%,
+  100% {
+    transform: scaleY(0.3);
   }
-  to {
-    transform: translateX(200%);
+  50% {
+    transform: scaleY(1);
   }
 }
 
@@ -2471,15 +2525,17 @@ button {
 }
 
 .pill__lang {
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
   border-radius: 50%;
   display: grid;
   place-items: center;
   font-size: 11px;
   font-weight: 600;
   background: rgba(255, 240, 225, 0.12);
-  box-shadow: inset 0 0 0 1px rgba(255, 240, 225, 0.1);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 238, 220, 0.22),
+    inset 0 0 0 1px rgba(255, 240, 225, 0.1);
   flex-shrink: 0;
   line-height: 1;
 }
@@ -2533,15 +2589,132 @@ button {
   font-weight: 400;
 }
 
+/* Transcribing: an ember light circles the capsule. Both layers turn the same conic gradient
+   around the capsule's center; a ring mask keeps only the edge. The halo is a blurred band under
+   the capsule that spills into the margin; the rim is a thin line over the capsule's edge. */
+.pill-frame--glow .pill-capsule {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 238, 220, 0.2),
+    0 1px 1px rgba(0, 0, 0, 0.25),
+    0 8px 18px -8px rgba(0, 0, 0, 0.55);
+}
+
+.pill-glow,
+.pill-rim {
+  position: absolute;
+  pointer-events: none;
+}
+
+/* Band edge (3 px out) plus the blur's reach stays inside --pill-margin, so the window edge never
+   cuts the glow. */
+.pill-glow {
+  inset: -3px;
+  z-index: 0;
+  filter: blur(7px);
+  animation: pill-glow-breathe 2.6s ease-in-out infinite;
+}
+
+.pill-glow__band,
+.pill-rim {
+  overflow: hidden;
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+}
+
+.pill-glow__band {
+  position: absolute;
+  inset: 0;
+  padding: 6px;
+  border-radius: 23px;
+}
+
+.pill-rim {
+  inset: 0;
+  z-index: 2;
+  padding: 1.5px;
+  border-radius: 20px;
+  background: var(--accent-soft);
+}
+
+.pill-glow__orbit,
+.pill-rim__orbit {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 520px;
+  height: 520px;
+  transform: translate(-50%, -50%);
+  animation: pill-orbit 2.6s linear infinite;
+}
+
+.pill-glow__orbit {
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg 190deg,
+    var(--accent-lo) 255deg,
+    var(--accent) 300deg,
+    var(--accent-hi) 338deg,
+    transparent 360deg
+  );
+}
+
+/* The head of the light is the hottest point, almost white. */
+.pill-rim__orbit {
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg 210deg,
+    var(--accent-lo) 270deg,
+    var(--accent) 300deg,
+    var(--accent-hi) 325deg,
+    #fff4e6 342deg,
+    transparent 360deg
+  );
+}
+
+@keyframes pill-orbit {
+  from {
+    transform: translate(-50%, -50%) rotate(0deg);
+  }
+  to {
+    transform: translate(-50%, -50%) rotate(360deg);
+  }
+}
+
+@keyframes pill-glow-breathe {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .pill__dot {
     animation: none;
     box-shadow: 0 0 6px rgba(255, 95, 82, 0.8);
   }
 
-  .pill__wave--shimmer::after {
+  .pill__wave--breathe .pill__bar {
     animation: none;
-    opacity: 0.35;
+    transform: scaleY(0.55);
+  }
+
+  .pill-glow {
+    animation: none;
+    opacity: 0.45;
+  }
+
+  .pill-glow__orbit,
+  .pill-rim__orbit {
+    animation: none;
   }
 }
 
