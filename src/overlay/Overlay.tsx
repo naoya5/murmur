@@ -111,6 +111,11 @@ export default function Overlay() {
     };
   }, [resize]);
 
+  // Ask for the current state once mounted: a recording may have started before this page.
+  useEffect(() => {
+    commands.overlayReady().catch(() => undefined);
+  }, []);
+
   useEvent("overlayState", (state) => {
     if (state.kind === "shown") {
       shown.current = true;

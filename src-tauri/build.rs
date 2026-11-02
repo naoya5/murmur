@@ -33,6 +33,7 @@ fn main() {
             "install_update",
             "submit_ink_stroke",
             "open_annotations_folder",
+            "overlay_ready",
         ]));
     if let Err(error) = tauri_build::try_build(attributes) {
         eprintln!("tauri build failed: {error:#}");

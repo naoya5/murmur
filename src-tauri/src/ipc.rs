@@ -65,6 +65,7 @@ pub const COMMANDS: &[&str] = &[
     "install_update",
     "submit_ink_stroke",
     "open_annotations_folder",
+    "overlay_ready",
 ];
 
 /// Commands the pill window may call (its capability lists exactly these).
@@ -73,7 +74,7 @@ pub const PILL_COMMANDS: &[&str] = &["pill_clicked", "set_pill_width", "get_pill
 
 /// Commands the annotations drawing layer may call (its capability lists exactly these).
 #[cfg(test)]
-pub const OVERLAY_COMMANDS: &[&str] = &["submit_ink_stroke"];
+pub const OVERLAY_COMMANDS: &[&str] = &["submit_ink_stroke", "overlay_ready"];
 
 type Services<'a> = State<'a, Arc<App>>;
 
@@ -547,6 +548,17 @@ pub fn submit_ink_stroke(
     }
 }
 
+/// The drawing layer's page has mounted: it gets the current `OverlayState` again, so a page
+/// that came up after a recording started still knows to draw. Only the overlay window may call
+/// this.
+#[tauri::command]
+#[specta::specta]
+pub fn overlay_ready(services: Services<'_>) {
+    if let Some(controller) = services.controller() {
+        controller.send(crate::controller::Msg::OverlayReady);
+    }
+}
+
 /// Opens the annotations folder in the Finder. The folder is created by the first bundle, never
 /// here (while the feature is off nothing of it exists on disk).
 #[tauri::command]
@@ -597,6 +609,7 @@ pub fn builder() -> Builder<Wry> {
             install_update,
             submit_ink_stroke,
             open_annotations_folder,
+            overlay_ready,
         ])
         .events(collect_events![
             PillState,

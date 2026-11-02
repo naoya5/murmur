@@ -8,13 +8,20 @@
 #
 # Cases: ja, en, silence (no row, clipboard untouched), cancel (Esc), undo (Esc twice), crash (kill -9, spool
 # recovery at the next start), long (77 s Japanese file through the chunk path).
+# Annotations (experimental, opt-in group `annotations`): the screen is a folder of generated PNGs
+# (MURMUR_DEBUG_SCREEN=png-dir:), clicks, cursor and strokes come from a JSON script (MURMUR_DEBUG_POINTER=), and
+# SIGUSR1 is the annotations hotkey (MURMUR_DEBUG_HOTKEY=annotations). Set E2E_KEEP_DIR to keep the normal and the
+# marked bundle folders for a look.
 # Several Murmur instances may run at once (a debug build with MURMUR_DATA_DIR skips single-instance); the script
 #        only ever signals the PID it started.
 # Needs: the speech models in $MURMUR_TEST_MODELS (default ~/.murmur-dev-models), macOS tools pbcopy/pbpaste,
 #        sqlite3, python3. The user's text clipboard is saved and restored (images and other types are lost).
 #
 # Usage: scripts/e2e.sh [case ...]     cases: ja en silence cancel undo crash long   (default: all of these)
-#        opt-in: mic (makes sound: real microphone + afplay through the speakers), tenmin (about 12 minutes)
+#        opt-in: mic (makes sound: real microphone + afplay through the speakers), tenmin (about 12 minutes),
+#                annotations (the annotation group, about 3 minutes; or one of annot annot-marks
+#                annot-nospeech-marks annot-nospeech-nomarks annot-cancel annot-undo annot-disable annot-screenfail
+#                annot-compose-timeout annot-nomodel)
 # Exit code: 0 all passed, 1 an assertion failed, 2 the environment is not ready.
 
 set -u -o pipefail
@@ -124,6 +131,7 @@ write_settings() { # <language> <wav>
   python3 - "$DATA/settings.json" "$1" "$2" <<'PY'
 import json, sys
 path, language, wav = sys.argv[1:4]
+import os
 settings = {
     "schema_version": 1,
     "onboarding_completed": True,
@@ -131,6 +139,7 @@ settings = {
     "language": language,
     "auto_paste": False,
     "restore_clipboard": False,
+    "annotations_enabled": os.environ.get("E2E_ANNOTATIONS") == "1",
 }
 with open(path, "w", encoding="utf-8") as f:
     json.dump(settings, f)
@@ -724,8 +733,313 @@ PY
   stop_app
 }
 
+# ---------------------------------------------------------------------------------------------
+# Annotations (experimental)
+# ---------------------------------------------------------------------------------------------
+
+ANNOT_FIX=""
+
+# 12 PNG frames (320 x 180): a bright block that moves after frame 6, so a "change" keyframe exists;
+# and a pointer script with a click, a stroke and a dwell (cursor still for 0.9 s while the WAV speaks).
+make_annotation_fixtures() {
+  [ -n "$ANNOT_FIX" ] && return 0
+  ANNOT_FIX="$SCRATCH/annot"
+  mkdir -p "$ANNOT_FIX/frames"
+  python3 - "$ANNOT_FIX" <<'PY'
+import json, os, struct, sys, zlib
+root = sys.argv[1]
+w, h = 320, 180
+def png(path, block_x):
+    rows = []
+    for y in range(h):
+        row = bytearray(b"\x00")
+        for x in range(w):
+            inside = block_x <= x < block_x + 120 and 50 <= y < 130
+            row += bytes((230, 230, 230) if inside else (40, 40, 40))
+        rows.append(bytes(row))
+    raw = b"".join(rows)
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+    data = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+    data += chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(data)
+for i in range(12):
+    png(os.path.join(root, "frames", f"{i:02d}.png"), 20 if i < 6 else 180)
+events = [
+    {"kind": "app", "t_ms": 0, "name": "E2E App"},
+    {"kind": "click", "t_ms": 1300, "at": [0.8, 0.12]},
+    {"kind": "stroke", "t0_ms": 2000, "t1_ms": 2600, "points": [[0.2, 0.2], [0.3, 0.3], [0.4, 0.35]]},
+]
+events += [{"kind": "cursor", "t_ms": 3000 + i * 100, "at": [0.6, 0.6]} for i in range(10)]
+with open(os.path.join(root, "marks.json"), "w", encoding="utf-8") as f:
+    json.dump({"events": events}, f)
+PY
+}
+
+annot_env() { # <png-dir|missing> [script]
+  export E2E_ANNOTATIONS=1 MURMUR_DEBUG_HOTKEY=annotations
+  export MURMUR_DEBUG_SCREEN="png-dir:$1"
+  if [ -n "${2:-}" ]; then export MURMUR_DEBUG_POINTER="$2"; else unset MURMUR_DEBUG_POINTER; fi
+}
+annot_unenv() { unset E2E_ANNOTATIONS MURMUR_DEBUG_HOTKEY MURMUR_DEBUG_SCREEN MURMUR_DEBUG_POINTER MURMUR_DEBUG_COMPOSE_DELAY_MS; }
+switch_off() { kill -INFO "$APP_PID"; }
+annot_rows() { sqlite3 "$DATA/murmur.db" "SELECT count(*) FROM annotations" 2> /dev/null || echo 0; }
+last_annot_row() { # status|keyframes|marks|latency_ms|asr_ms|compose_ms|error|folder
+  sqlite3 -separator '|' "$DATA/murmur.db" \
+    "SELECT status, keyframes, marks, coalesce(latency_ms,''), coalesce(asr_ms,''), coalesce(compose_ms,''), coalesce(error,''), folder FROM annotations ORDER BY created_at DESC, id DESC LIMIT 1"
+}
+bundle_count() { ls -d "$DATA"/annotations/*/ 2> /dev/null | wc -l | tr -d ' '; }
+newest_bundle() { ls -d "$DATA"/annotations/*/ 2> /dev/null | sort | tail -1 | sed 's#/$##'; }
+spool_count() { ls -A "$DATA/spool" 2> /dev/null | wc -l | tr -d ' '; }
+
+# Records the WAV through the annotations hotkey and waits for the bundle to be saved.
+annot_record() { # <wav> -> 0 when "annotation saved" appeared
+  local length
+  length="$(wav_seconds "$1")"
+  begin_recording || return 1
+  sleep "$(python3 -c "print($length + 0.5)")"
+  hotkey
+  if wait_for_log 'annotation saved' "$RESULT_TIMEOUT"; then
+    pass "annotation saved"
+    note "stop -> paste: $(plain_log | grep -E 'bundle delivered' | tail -1 | sed -E 's/.*latency_ms=([0-9]+).*/\1/') ms"
+    return 0
+  fi
+  fail "no 'annotation saved' within ${RESULT_TIMEOUT}s"
+  failure_lines | sed 's/^/    log: /'
+  return 1
+}
+
+# Checks the newest bundle: row status, files, summary lines, clipboard, spool.
+expect_bundle() { # <label> <status ok|text_only|failed> <pictures yes|no> <words yes|no|failed> [marks regex]
+  local label="$1" status="$2" pictures="$3" words="$4" marks="${5:-}"
+  local row dir summary
+  row="$(last_annot_row)"
+  local rstatus rkeyframes rmarks rlatency rasr rcompose rerror rfolder
+  IFS='|' read -r rstatus rkeyframes rmarks rlatency rasr rcompose rerror rfolder <<< "$row"
+  [ "$rstatus" = "$status" ] && pass "$label: row status $status" || fail "$label: row status is '$rstatus' (want $status)"
+  dir="$DATA/annotations/$rfolder"
+  [ -d "$dir" ] && pass "$label: bundle folder exists" || fail "$label: bundle folder missing ($rfolder)"
+  [ -f "$dir/summary.md" ] && pass "$label: summary.md" || fail "$label: summary.md missing"
+  [ -f "$dir/annotation.json" ] && pass "$label: annotation.json" || fail "$label: annotation.json missing"
+  [ -d "$dir/candidates" ] && fail "$label: candidates/ was not removed" || pass "$label: candidates/ removed"
+  if [ "$pictures" = yes ]; then
+    [ -f "$dir/contact-sheet.png" ] && [ -f "$dir/frames/1.png" ] && pass "$label: contact sheet and frames" || fail "$label: pictures missing"
+    [ "$rkeyframes" -ge 1 ] 2> /dev/null && pass "$label: $rkeyframes keyframe(s)" || fail "$label: no keyframes in the row"
+    grep -q '^画像: ' "$dir/summary.md" && pass "$label: summary names the sheet" || fail "$label: summary has no picture line"
+  else
+    [ -f "$dir/contact-sheet.png" ] && fail "$label: a sheet exists for a text-only bundle" || pass "$label: no pictures, as expected"
+    grep -q '^画像: ' "$dir/summary.md" && fail "$label: summary names a sheet it does not have" || pass "$label: summary without picture line"
+  fi
+  summary="$(cat "$dir/summary.md")"
+  case "$summary" in *"[Murmur Annotations]"*) pass "$label: summary header" ;; *) fail "$label: summary header missing" ;; esac
+  case "$words" in
+    yes) case "$summary" in *公園*) pass "$label: the words are in the summary" ;; *) fail "$label: expected word missing from the summary" ;; esac ;;
+    any) case "$summary" in *「*) pass "$label: words in the summary" ;; *) fail "$label: no words in the summary" ;; esac ;;
+    no) case "$summary" in *「*) fail "$label: words in a summary that should have none" ;; *) pass "$label: no words, as expected" ;; esac ;;
+    failed) case "$summary" in *"文字起こしに失敗"*) pass "$label: the failure note is in the summary" ;; *) fail "$label: failure note missing" ;; esac ;;
+  esac
+  if [ -n "$marks" ]; then
+    python3 - "$dir/summary.md" "$marks" <<'PY' && pass "$label: marks $marks in the summary" || fail "$label: marks $marks missing from the summary"
+import re, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+sys.exit(0 if all(re.search(p, text) for p in sys.argv[2].split(",")) else 1)
+PY
+    [ "$rmarks" -ge 1 ] 2> /dev/null && pass "$label: $rmarks mark(s) in the row" || fail "$label: no marks in the row"
+  fi
+  case "$(pbpaste)" in *"[Murmur Annotations]"*) pass "$label: clipboard holds the summary" ;; *) fail "$label: clipboard does not hold the summary" ;; esac
+  if [ "$status" = failed ]; then
+    [ "$(spool_count)" -ge 1 ] && pass "$label: audio kept for a retry" || fail "$label: audio was deleted after a failure"
+  else
+    [ "$(spool_count)" = 0 ] && pass "$label: spool empty" || fail "$label: spool not empty"
+  fi
+  note "row: keyframes=$rkeyframes marks=$rmarks latency=${rlatency}ms asr=${rasr}ms compose=${rcompose}ms error='$rerror'"
+}
+
+keep_bundle() { # <name>
+  [ -n "${E2E_KEEP_DIR:-}" ] || return 0
+  local dir
+  dir="$(newest_bundle)"
+  [ -d "$dir" ] || return 0
+  mkdir -p "$E2E_KEEP_DIR"
+  rm -rf "${E2E_KEEP_DIR:?}/$1"
+  cp -R "$dir" "$E2E_KEEP_DIR/$1"
+  note "kept: $E2E_KEEP_DIR/$1"
+}
+
+case_annot() { # <name> <marks|""> <keep name|"">
+  say "== $1"
+  make_annotation_fixtures
+  local script=""
+  [ "$2" = marks ] && script="$ANNOT_FIX/marks.json"
+  set_sentinel
+  annot_env "$ANNOT_FIX/frames" "$script"
+  start_app ja "$FIXTURES/ja.wav" || { annot_unenv; return; }
+  if annot_record "$FIXTURES/ja.wav"; then
+    if [ -n "$script" ]; then
+      expect_bundle "$1" ok yes yes '①,○ クリック,◎'
+    else
+      expect_bundle "$1" ok yes yes
+    fi
+    [ -n "$3" ] && keep_bundle "$3"
+  fi
+  no_panic
+  stop_app
+  annot_unenv
+}
+
+case_annot_nospeech() { # <name> <marks|""> ; silence: with marks -> a bundle without words, without -> nothing kept
+  say "== $1"
+  make_annotation_fixtures
+  local script=""
+  [ "$2" = marks ] && script="$ANNOT_FIX/marks.json"
+  local before_rows before_bundles
+  before_rows="$(annot_rows)"; before_bundles="$(bundle_count)"
+  set_sentinel
+  annot_env "$ANNOT_FIX/frames" "$script"
+  start_app ja "$FIXTURES/silence.wav" || { annot_unenv; return; }
+  if [ -n "$script" ]; then
+    if annot_record "$FIXTURES/silence.wav"; then
+      expect_bundle "$1" ok yes no '①,○ クリック'
+    fi
+  else
+    begin_recording || { stop_app; annot_unenv; return; }
+    sleep "$(python3 -c "print($(wav_seconds "$FIXTURES/silence.wav") + 0.5)")"
+    hotkey
+    sleep "$SILENCE_WAIT"
+    [ "$(annot_rows)" = "$before_rows" ] && pass "$1: no row" || fail "$1: a row was written"
+    [ "$(bundle_count)" = "$before_bundles" ] && pass "$1: bundle folder removed" || fail "$1: a bundle folder was left"
+    [ "$(pbpaste)" = "$SENTINEL" ] && pass "$1: clipboard unchanged" || fail "$1: clipboard changed"
+    [ "$(spool_count)" = 0 ] && pass "$1: spool empty" || fail "$1: spool not empty"
+  fi
+  no_panic
+  stop_app
+  annot_unenv
+}
+
+case_annot_dropped() { # <name> <cancel|disable>
+  say "== $1"
+  make_annotation_fixtures
+  local before_rows before_bundles
+  before_rows="$(annot_rows)"; before_bundles="$(bundle_count)"
+  set_sentinel
+  annot_env "$ANNOT_FIX/frames" "$ANNOT_FIX/marks.json"
+  start_app ja "$FIXTURES/ja.wav" || { annot_unenv; return; }
+  begin_recording || { stop_app; annot_unenv; return; }
+  sleep 1.5
+  if [ "$2" = cancel ]; then
+    esc
+    sleep 4.5 # the 3 s countdown ends and everything is dropped
+  else
+    switch_off
+    wait_for_log 'annotations switch flipped' 10 || fail "$1: the switch did not flip"
+    wait_for_log 'drawing layer destroyed' 5 && pass "$1: drawing layer destroyed" || fail "$1: drawing layer not destroyed"
+    sleep 2
+  fi
+  [ "$(annot_rows)" = "$before_rows" ] && pass "$1: no row" || fail "$1: a row was written"
+  [ "$(bundle_count)" = "$before_bundles" ] && pass "$1: bundle folder removed" || fail "$1: a bundle folder was left"
+  [ "$(pbpaste)" = "$SENTINEL" ] && pass "$1: clipboard unchanged" || fail "$1: clipboard changed"
+  [ "$(spool_count)" = 0 ] && pass "$1: spool empty" || fail "$1: spool not empty"
+  no_panic
+  stop_app
+  annot_unenv
+}
+
+case_annot_undo() {
+  say "== annot-undo (Esc, Esc, then stop)"
+  make_annotation_fixtures
+  set_sentinel
+  annot_env "$ANNOT_FIX/frames" ""
+  start_app ja "$FIXTURES/ja.wav" || { annot_unenv; return; }
+  begin_recording || { stop_app; annot_unenv; return; }
+  sleep 1
+  esc
+  sleep 1
+  esc # undo: the recording continues
+  sleep "$(python3 -c "print($(wav_seconds "$FIXTURES/ja.wav") + 0.5)")"
+  hotkey
+  if wait_for_log 'annotation saved' "$RESULT_TIMEOUT"; then
+    pass "annot-undo: annotation saved after the undo"
+    # The pause cut a second out of the sentence, so only "some words" can be expected.
+    expect_bundle "annot-undo" ok yes any
+  else
+    fail "annot-undo: no 'annotation saved'"
+  fi
+  no_panic
+  stop_app
+  annot_unenv
+}
+
+case_annot_screenfail() {
+  say "== annot-screenfail (no screen: words only)"
+  make_annotation_fixtures
+  set_sentinel
+  annot_env "$SCRATCH/no-such-folder" ""
+  start_app ja "$FIXTURES/ja.wav" || { annot_unenv; return; }
+  if annot_record "$FIXTURES/ja.wav"; then
+    grep -q 'screen capture did not start' "$LOG" && pass "annot-screenfail: screen failure logged" || fail "annot-screenfail: no screen failure in the log"
+    expect_bundle "annot-screenfail" text_only no yes
+  fi
+  no_panic
+  stop_app
+  annot_unenv
+}
+
+case_annot_compose_timeout() {
+  say "== annot-compose-timeout (compose delayed past 5 s: words only)"
+  make_annotation_fixtures
+  set_sentinel
+  annot_env "$ANNOT_FIX/frames" ""
+  export MURMUR_DEBUG_COMPOSE_DELAY_MS=6000
+  start_app ja "$FIXTURES/ja.wav" || { annot_unenv; return; }
+  if annot_record "$FIXTURES/ja.wav"; then
+    expect_bundle "annot-compose-timeout" text_only no yes
+    sleep 2
+    grep -q 'compose finished late' "$LOG" && pass "annot-compose-timeout: late compose dropped" || note "late compose result not seen yet"
+  fi
+  no_panic
+  stop_app
+  annot_unenv
+}
+
+case_annot_nomodel() {
+  say "== annot-nomodel (VAD only: the words fail, the pictures go out, the audio is kept)"
+  make_annotation_fixtures
+  fresh_data
+  remove_recognition_models
+  set_sentinel
+  annot_env "$ANNOT_FIX/frames" "$ANNOT_FIX/marks.json"
+  start_app ja "$FIXTURES/ja.wav" || { annot_unenv; fresh_data; return; }
+  if annot_record "$FIXTURES/ja.wav"; then
+    expect_bundle "annot-nomodel" failed yes failed '①,○ クリック'
+    assert_failed_row model_missing "annot-nomodel"
+  fi
+  no_panic
+  stop_app
+  annot_unenv
+  fresh_data
+}
+
+run_annotations() {
+  for c in annot annot-marks annot-nospeech-marks annot-nospeech-nomarks annot-cancel annot-undo annot-disable \
+    annot-screenfail annot-compose-timeout annot-nomodel; do
+    run_case "$c"
+  done
+}
+
 run_case() {
   case "$1" in
+    annotations) run_annotations ;;
+    annot) case_annot "annot (normal)" "" normal ;;
+    annot-marks) case_annot "annot-marks (click, stroke, dwell)" marks marks ;;
+    annot-nospeech-marks) case_annot_nospeech "annot-nospeech-marks" marks ;;
+    annot-nospeech-nomarks) case_annot_nospeech "annot-nospeech-nomarks" "" ;;
+    annot-cancel) case_annot_dropped "annot-cancel (Esc, countdown)" cancel ;;
+    annot-disable) case_annot_dropped "annot-disable (switch off while recording)" disable ;;
+    annot-undo) case_annot_undo ;;
+    annot-screenfail) case_annot_screenfail ;;
+    annot-compose-timeout) case_annot_compose_timeout ;;
+    annot-nomodel) case_annot_nomodel ;;
     ja) case_dictation "ja" ja ja 公園 コーヒー ;;
     en) case_dictation "en" en en settings hotkey ;;
     silence) case_silence ;;
@@ -740,7 +1054,7 @@ run_case() {
     esc-mash) case_escmash ;;
     readonly) case_readonly ;;
     tenmin) case_tenmin ;;
-    *) die "unknown case: $1 (ja en silence cancel undo crash long mic nomodel corrupt mash esc-mash readonly tenmin)" ;;
+    *) die "unknown case: $1 (ja en silence cancel undo crash long mic nomodel corrupt mash esc-mash readonly tenmin annotations annot ...)" ;;
   esac
 }
 

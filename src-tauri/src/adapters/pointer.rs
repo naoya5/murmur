@@ -69,6 +69,17 @@ struct Monitor(Retained<AnyObject>);
 // exists so the handle can be stored in a `Pointer` that lives on another thread.
 unsafe impl Send for Monitor {}
 
+/// Anything that feeds pointer events into a recording: the real monitor, or a test script.
+pub trait PointerFeed: Send {
+    fn stop(self: Box<Self>);
+}
+
+impl PointerFeed for Pointer {
+    fn stop(mut self: Box<Self>) {
+        self.shutdown();
+    }
+}
+
 pub struct Pointer {
     app: AppHandle,
     stop: Arc<AtomicBool>,
@@ -133,11 +144,6 @@ pub fn start(
 }
 
 impl Pointer {
-    /// Removes the monitor and stops the sampler. Waits briefly for both (G5).
-    pub fn stop(mut self) {
-        self.shutdown();
-    }
-
     fn shutdown(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(handle) = self.sampler.take() {

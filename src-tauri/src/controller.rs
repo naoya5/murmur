@@ -19,8 +19,8 @@ use murmur_core::annotations as ann;
 use murmur_core::ports::{CancelToken, RawTranscript};
 use murmur_core::session::{
     self, AnnotationsRefusal, CaptureError, ComposeOutcome, ComposeWords, DeliveryOutcome, Effect,
-    Event, FailureKind, Machine, Notice, PillView, PlanCounts, SessionId, SessionKind, State,
-    TranscribeOutcome, TranscriptText,
+    Event, FailureKind, Machine, Notice, Paused, PillView, PlanCounts, SessionId, SessionKind,
+    State, TranscribeOutcome, TranscriptText,
 };
 use murmur_core::text::{self, FormatOptions};
 use serde::Serialize;
@@ -31,13 +31,16 @@ use tokio::sync::{mpsc, watch};
 
 use crate::adapters::audio::{self, AudioConfig, AudioError, AudioEvent, CapturedAudio, Recorder};
 use crate::adapters::output::{self, DeliverOptions};
-use crate::adapters::pointer::{self, PointerEvent};
-use crate::adapters::screen::{self, DisplayInfo, ScreenCapture, ScreenConfig, ScreenEvent};
+use crate::adapters::pointer::{self, PointerEvent, PointerFeed};
+use crate::adapters::screen::{
+    self, DisplayInfo, ScreenCapture, ScreenConfig, ScreenEvent, ScreenSource,
+};
 use crate::adapters::sounds::{self, Cue};
 use crate::adapters::store::AnnotationRow;
 use crate::annotation_session::{self as ann_session, AnnotationCtx, PlanInput, Planned};
 use crate::app::App;
 use crate::bundles::{self, RecordingClock};
+use crate::debug;
 use crate::history::{self, Record};
 use crate::inference::{
     InferenceError, InferenceOutput, RangesRequest, RegionsRequest, StreamId, StreamRequest,
@@ -146,6 +149,8 @@ pub enum Msg {
         session: SessionId,
         result: Result<(crate::adapters::sheet::Rendered, u64), String>,
     },
+    /// The drawing layer's page has mounted and wants the current state.
+    OverlayReady,
     Shutdown,
 }
 
@@ -335,6 +340,10 @@ impl Controller {
             Msg::Planned { session, planned } => self.on_planned(session, planned),
             Msg::Segments { session, result } => self.on_segments(session, result),
             Msg::Composed { session, result } => self.on_composed(session, result),
+            Msg::OverlayReady => {
+                self.emit_overlay_state();
+                None
+            }
             Msg::Shutdown => None,
         }
     }
@@ -886,6 +895,7 @@ impl Controller {
             }
         };
         let config = ScreenConfig {
+            source: debug::screen_png_dir().map_or(ScreenSource::Display, ScreenSource::PngDir),
             exclude_bundle_id: Some(self.app.config().identifier.clone()),
             cursor: pointer::cursor_position().unwrap_or((0.0, 0.0)),
             candidates_dir: annotation.candidates_dir.clone(),
@@ -927,12 +937,39 @@ impl Controller {
                 let on_event: Arc<dyn Fn(PointerEvent) + Send + Sync> = Arc::new(move |event| {
                     let _ = tx.send(Msg::Pointer { session, event });
                 });
-                annotation.pointer = Some(pointer::start(
-                    &self.app,
-                    display.rect,
-                    annotation.clock.origin(),
-                    on_event,
-                ));
+                // A test script replaces the real pointer, so nobody's clicks leak into a test.
+                annotation.pointer = match debug::pointer_script() {
+                    Some(script) => {
+                        let strokes = self.tx.clone();
+                        let on_stroke: Arc<dyn Fn(Vec<InkPoint>, f64, f64) + Send + Sync> =
+                            Arc::new(move |points, started_ms, ended_ms| {
+                                let _ = strokes.send(Msg::InkStroke {
+                                    points,
+                                    started_ms,
+                                    ended_ms,
+                                });
+                            });
+                        match debug::play_pointer_script(
+                            &script,
+                            annotation.clock.origin(),
+                            annotation.clock.origin_epoch_ms(),
+                            on_event,
+                            on_stroke,
+                        ) {
+                            Ok(player) => Some(Box::new(player) as Box<dyn PointerFeed>),
+                            Err(error) => {
+                                tracing::warn!(%error, "pointer script not played");
+                                None
+                            }
+                        }
+                    }
+                    None => Some(Box::new(pointer::start(
+                        &self.app,
+                        display.rect,
+                        annotation.clock.origin(),
+                        on_event,
+                    ))),
+                };
                 annotation.screen = Some(capture);
                 annotation.display = Some(display);
                 None
@@ -1013,20 +1050,38 @@ impl Controller {
 
     fn show_overlay(&mut self) {
         crate::windows::show_overlay(&self.app);
-        let started = self
-            .machine
-            .active_session()
-            .and_then(|s| self.sessions.get(&s))
-            .and_then(|c| c.annotation.as_ref())
-            .map_or_else(
-                || chrono::Utc::now().timestamp_millis() as f64,
-                |a| a.clock.origin_epoch_ms(),
-            );
-        if let Err(error) = (OverlayState::Shown {
-            recording_started_ms: started,
-        })
-        .emit(&self.app)
-        {
+        self.emit_overlay_state();
+    }
+
+    /// Tells the drawing layer whether to draw: shown while an annotation is being recorded
+    /// (also during its cancel countdown), hidden otherwise. Sent on every change and again when
+    /// the layer's page asks (`Msg::OverlayReady`), so a page that mounted late catches up.
+    fn emit_overlay_state(&self) {
+        let recording = match self.machine.state() {
+            State::Recording(rec) => rec.kind == SessionKind::Annotation,
+            State::CancelPending {
+                paused: Paused::Recording(rec),
+                ..
+            } => rec.kind == SessionKind::Annotation,
+            _ => false,
+        };
+        let state = if recording {
+            let started = self
+                .machine
+                .active_session()
+                .and_then(|s| self.sessions.get(&s))
+                .and_then(|c| c.annotation.as_ref())
+                .map_or_else(
+                    || chrono::Utc::now().timestamp_millis() as f64,
+                    |a| a.clock.origin_epoch_ms(),
+                );
+            OverlayState::Shown {
+                recording_started_ms: started,
+            }
+        } else {
+            OverlayState::Hidden
+        };
+        if let Err(error) = state.emit(&self.app) {
             tracing::warn!(%error, "overlay state emit failed");
         }
     }
@@ -1034,9 +1089,7 @@ impl Controller {
     fn hide_overlay(&mut self) {
         crate::windows::set_overlay_interactive(&self.app, false);
         crate::windows::hide_overlay(&self.app);
-        if let Err(error) = OverlayState::Hidden.emit(&self.app) {
-            tracing::warn!(%error, "overlay state emit failed");
-        }
+        self.emit_overlay_state();
     }
 
     /// The stop pipeline: audio and screen done, VAD, keyframes (`Msg::Planned`), segments,
@@ -1242,6 +1295,22 @@ impl Controller {
         session: SessionId,
         result: Result<SegmentsOutcome, InferenceError>,
     ) -> Option<Event> {
+        let transcribing = match self.machine.state() {
+            State::Transcribing(tx) => tx.session == session,
+            State::CancelPending {
+                session: s,
+                paused: Paused::Transcribing { .. },
+                ..
+            } => *s == session,
+            _ => false,
+        };
+        if !transcribing {
+            tracing::warn!(
+                session = session.0,
+                "segments finished late; result dropped"
+            );
+            return None;
+        }
         let ctx = self.sessions.get_mut(&session)?;
         let outcome = match result {
             Ok(SegmentsOutcome::NoSpeech) => TranscribeOutcome::NoSpeech,
@@ -1315,7 +1384,11 @@ impl Controller {
         let model_id = ctx.model_id.map(str::to_owned);
         let display = ann_session::display_facts(annotation.display.as_ref());
         let bundle_dir = annotation.bundle_dir.clone();
+        let delay = debug::compose_delay();
         tauri::async_runtime::spawn_blocking(move || {
+            if let Some(delay) = delay {
+                std::thread::sleep(delay);
+            }
             let started = Instant::now();
             let result = ann_session::compose(
                 &bundle_dir,
@@ -1338,6 +1411,21 @@ impl Controller {
         session: SessionId,
         result: Result<(crate::adapters::sheet::Rendered, u64), String>,
     ) -> Option<Event> {
+        // After the compose timer the words went out alone; a late result must not turn the
+        // saved row into "ok".
+        let composing = match self.machine.state() {
+            State::Composing(c) => c.session == session,
+            State::CancelPending {
+                session: s,
+                paused: Paused::Composing { .. },
+                ..
+            } => *s == session,
+            _ => false,
+        };
+        if !composing {
+            tracing::warn!(session = session.0, "compose finished late; result dropped");
+            return None;
+        }
         let annotation = self.sessions.get_mut(&session)?.annotation.as_mut()?;
         let outcome = match result {
             Ok((rendered, compose_ms)) => {
@@ -1477,6 +1565,39 @@ impl Controller {
             compose_ms: annotation.compose_ms,
             error: failure.map(|f| history::failure_text(f).to_owned()),
         };
+        // A bundle without pictures still gets its summary and record on disk.
+        let text_only_files = if annotation.rendered.is_none() {
+            let planned = annotation.plan.clone().unwrap_or_else(|| Planned {
+                selection: ann::Selection::default(),
+                pictures: Vec::new(),
+                regions: Vec::new(),
+                total_samples: 0,
+            });
+            let duration_ms = ctx.meta.as_ref().map_or(0, |m| m.duration_ms);
+            let summary = ann_session::summary_text(
+                ctx.language,
+                duration_ms,
+                None,
+                ann::PasteTarget::Other,
+                &planned,
+                &annotation.chunks,
+                words,
+            );
+            let json = bundles::annotation_json(
+                annotation.created_at_ms,
+                duration_ms,
+                ctx.language.code(),
+                ctx.model_id,
+                ann_session::display_facts(annotation.display.as_ref()),
+                &planned.selection.keyframes,
+                &planned.selection.marks,
+                &annotation.chunks,
+                status,
+            );
+            Some((annotation.bundle_dir.clone(), summary, json))
+        } else {
+            None
+        };
         let failed_record = failure.map(|f| Self::record(&ctx, Some(f)));
         let app = self.app.clone();
         let store = self.services.store().clone();
@@ -1491,6 +1612,11 @@ impl Controller {
             tauri::async_runtime::spawn_blocking(move || {
                 if let Err(error) = store.insert_annotation(&row) {
                     tracing::error!(%error, "could not save the annotation row");
+                }
+                if let Some((dir, summary, json)) = text_only_files
+                    && let Err(error) = bundles::write_bundle_files(&dir, &summary, &json)
+                {
+                    tracing::warn!(%error, "could not write the bundle files");
                 }
                 ann_session::remove_candidates(&candidates_dir);
                 let now = chrono::Utc::now().timestamp_millis();

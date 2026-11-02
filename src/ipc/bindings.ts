@@ -201,6 +201,14 @@ async openAnnotationsFolder() : Promise<Result<null, IpcError>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * The drawing layer's page has mounted: it gets the current `OverlayState` again, so a page
+ * that came up after a recording started still knows to draw. Only the overlay window may call
+ * this.
+ */
+async overlayReady() : Promise<void> {
+    await TAURI_INVOKE("overlay_ready");
 }
 }
 

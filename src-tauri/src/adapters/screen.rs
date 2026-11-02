@@ -6,11 +6,14 @@
 //! brightness) at once; the pixels of the last four pictures stay in memory so that the
 //! controller can keep one as a candidate PNG when the core asks for it (`keep_frame`). The
 //! screen sends no picture while nothing changes, so every frame carries its arrival time.
-//! Pictures never reach the log (G7). Every wait has a timeout (G5). Nothing panics (G6).
+//! Debug builds can play a folder of PNGs instead of the screen (`ScreenSource::PngDir`), through
+//! the same picture path. Pictures never reach the log (G7). Every wait has a timeout (G5).
+//! Nothing panics (G6).
 
 use std::collections::VecDeque;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -69,9 +72,19 @@ pub enum ScreenError {
     Write(String),
 }
 
+/// Where the pictures come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScreenSource {
+    /// The display under the cursor, through ScreenCaptureKit.
+    Display,
+    /// A folder of PNGs of one size, played in name order at 2 fps (debug builds, tests).
+    PngDir(PathBuf),
+}
+
 /// What to capture and where candidate pictures go.
 #[derive(Debug, Clone)]
 pub struct ScreenConfig {
+    pub source: ScreenSource,
     /// Murmur's own bundle id, so that its windows are left out of the pictures.
     pub exclude_bundle_id: Option<String>,
     /// Where the cursor was when the hotkey went down (CoreGraphics global points).
@@ -179,6 +192,11 @@ impl Shared {
         let Some((cells, bitmap)) = picture else {
             return;
         };
+        self.push_picture(cells, bitmap);
+    }
+
+    /// One picture, from any source: numbers out, pixels into the ring, unless paused.
+    fn push_picture(&self, cells: Vec<f32>, bitmap: Bitmap) {
         let t_ms = self.origin.elapsed().as_millis() as u64;
         let frame = {
             let mut state = self.lock();
@@ -297,19 +315,135 @@ struct SharedQueue(#[allow(dead_code)] dispatch2::DispatchRetained<DispatchQueue
 unsafe impl Send for SharedQueue {}
 unsafe impl Sync for SharedQueue {}
 
+enum Backend {
+    Sck {
+        stream: Shareable<SCStream>,
+        /// Kept alive for the stream: SCK holds them weakly.
+        #[allow(dead_code)]
+        output: Shareable<Output>,
+        #[allow(dead_code)]
+        queue: SharedQueue,
+    },
+    /// A thread that plays PNGs (debug builds).
+    Pictures {
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    },
+}
+
 pub struct ScreenCapture {
-    stream: Shareable<SCStream>,
-    /// Kept alive for the stream: SCK holds them weakly.
-    #[allow(dead_code)]
-    output: Shareable<Output>,
-    #[allow(dead_code)]
-    queue: SharedQueue,
+    backend: Backend,
     shared: Arc<Shared>,
 }
 
 /// Starts capturing. Blocking for up to `START_TIMEOUT` (call it off the controller loop). The
 /// caller has checked the Screen Recording permission (G8).
 pub fn start(
+    config: ScreenConfig,
+    on_event: Callback,
+) -> Result<(ScreenCapture, DisplayInfo), ScreenError> {
+    match config.source.clone() {
+        ScreenSource::Display => start_display(config, on_event),
+        ScreenSource::PngDir(dir) => start_pictures(config, on_event, &dir),
+    }
+}
+
+fn new_shared(config: &ScreenConfig, on_event: Callback) -> Arc<Shared> {
+    let (writes_tx, writes_rx) = mpsc::channel();
+    Arc::new(Shared {
+        origin: config.origin,
+        on_event,
+        candidates_dir: config.candidates_dir.clone(),
+        state: Mutex::new(State {
+            paused: false,
+            next_index: 0,
+            frames: Vec::new(),
+            ring: VecDeque::with_capacity(RING_FRAMES + 1),
+            kept: Vec::new(),
+            pending_writes: 0,
+        }),
+        writes_done: Mutex::new(Some(writes_rx)),
+        writes_tx,
+    })
+}
+
+/// Plays `dir/*.png` (name order) at 2 fps as if it were the screen. The pictures must share
+/// one size; the first one decides the display size (points = pixels, scale 1). Once the last
+/// picture is shown nothing more arrives, as with a screen that stopped changing.
+fn start_pictures(
+    config: ScreenConfig,
+    on_event: Callback,
+    dir: &std::path::Path,
+) -> Result<(ScreenCapture, DisplayInfo), ScreenError> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| ScreenError::Capture(format!("{}: {e}", dir.display())))?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("png"))
+        .collect();
+    files.sort();
+    let first = files
+        .first()
+        .ok_or_else(|| ScreenError::Capture("no PNG in the folder".into()))?;
+    let picture = image::read_png(first).map_err(|e| ScreenError::Capture(e.to_string()))?;
+    let info = DisplayInfo {
+        id: 0,
+        rect: DisplayRect {
+            x: 0.0,
+            y: 0.0,
+            width: picture.width as f64,
+            height: picture.height as f64,
+        },
+        width_px: picture.width,
+        height_px: picture.height,
+        scale: 1.0,
+    };
+    let shared = new_shared(&config, on_event);
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    let player = shared.clone();
+    let interval = Duration::from_millis(1_000 / FRAMES_PER_SECOND as u64);
+    let thread = std::thread::Builder::new()
+        .name("screen-pictures".into())
+        .spawn(move || {
+            let mut next = Instant::now();
+            for path in files {
+                while Instant::now() < next {
+                    if flag.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                if flag.load(Ordering::SeqCst) {
+                    return;
+                }
+                next += interval;
+                let Ok(bitmap) = image::read_png(&path) else {
+                    continue;
+                };
+                let cells = cells_of(&bitmap.bgra, bitmap.width, bitmap.height, bitmap.width * 4);
+                player.push_picture(cells, bitmap);
+            }
+        })
+        .map_err(|e| ScreenError::Capture(e.to_string()))?;
+    tracing::info!(
+        width_px = info.width_px,
+        height_px = info.height_px,
+        "screen capture started (pictures from a folder)"
+    );
+    Ok((
+        ScreenCapture {
+            backend: Backend::Pictures {
+                stop,
+                thread: Some(thread),
+            },
+            shared,
+        },
+        info,
+    ))
+}
+
+fn start_display(
     config: ScreenConfig,
     on_event: Callback,
 ) -> Result<(ScreenCapture, DisplayInfo), ScreenError> {
@@ -337,22 +471,7 @@ pub fn start(
         (filter, stream_config)
     };
 
-    let (writes_tx, writes_rx) = mpsc::channel();
-    let shared = Arc::new(Shared {
-        origin: config.origin,
-        on_event,
-        candidates_dir: config.candidates_dir,
-        state: Mutex::new(State {
-            paused: false,
-            next_index: 0,
-            frames: Vec::new(),
-            ring: VecDeque::with_capacity(RING_FRAMES + 1),
-            kept: Vec::new(),
-            pending_writes: 0,
-        }),
-        writes_done: Mutex::new(Some(writes_rx)),
-        writes_tx,
-    });
+    let shared = new_shared(&config, on_event);
     let output = Output::new(shared.clone());
     let queue = DispatchQueue::new("io.github.naoya5.murmur.screen", None);
     // SAFETY: the stream keeps the filter and the configuration; the output object and the
@@ -401,9 +520,11 @@ pub fn start(
     );
     Ok((
         ScreenCapture {
-            stream: Shareable(stream),
-            output: Shareable(output),
-            queue: SharedQueue(queue),
+            backend: Backend::Sck {
+                stream: Shareable(stream),
+                output: Shareable(output),
+                queue: SharedQueue(queue),
+            },
             shared,
         },
         info,
@@ -466,23 +587,29 @@ impl ScreenCapture {
 
     /// Stops the capture and waits (with timeouts) for the stream and the candidate writes.
     pub fn stop(self) -> Result<Stopped, ScreenError> {
-        let (tx, rx) = mpsc::channel::<()>();
-        let tx = Mutex::new(Some(tx));
-        let on_stopped = RcBlock::new(move |_error: *mut NSError| {
-            if let Ok(mut guard) = tx.lock()
-                && let Some(tx) = guard.take()
-            {
-                let _ = tx.send(());
+        match self.backend {
+            Backend::Sck { stream, .. } => {
+                let (tx, rx) = mpsc::channel::<()>();
+                let tx = Mutex::new(Some(tx));
+                let on_stopped = RcBlock::new(move |_error: *mut NSError| {
+                    if let Ok(mut guard) = tx.lock()
+                        && let Some(tx) = guard.take()
+                    {
+                        let _ = tx.send(());
+                    }
+                });
+                // SAFETY: the completion block is copied by SCK and owns only a `Sender`.
+                unsafe { stream.0.stopCaptureWithCompletionHandler(Some(&on_stopped)) };
+                if rx.recv_timeout(STOP_TIMEOUT).is_err() {
+                    tracing::warn!("screen capture did not confirm its stop in time");
+                }
             }
-        });
-        // SAFETY: the completion block is copied by SCK and owns only a `Sender`.
-        unsafe {
-            self.stream
-                .0
-                .stopCaptureWithCompletionHandler(Some(&on_stopped))
-        };
-        if rx.recv_timeout(STOP_TIMEOUT).is_err() {
-            tracing::warn!("screen capture did not confirm its stop in time");
+            Backend::Pictures { stop, mut thread } => {
+                stop.store(true, Ordering::SeqCst);
+                if let Some(thread) = thread.take() {
+                    let _ = thread.join();
+                }
+            }
         }
         // Candidate writes in flight.
         let pending = self.shared.lock().pending_writes;

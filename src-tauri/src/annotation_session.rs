@@ -22,7 +22,7 @@ use murmur_core::session::{ComposeWords, TranscriptText};
 use murmur_core::{Language, pipeline};
 
 use crate::adapters::image::{self, Bitmap};
-use crate::adapters::pointer::{Pointer, PointerEvent};
+use crate::adapters::pointer::{PointerEvent, PointerFeed};
 use crate::adapters::screen::{DisplayInfo, Frame, ScreenCapture};
 use crate::adapters::sheet::{self, FrameInput, Rendered};
 use crate::adapters::store::AnnotationStatus;
@@ -38,7 +38,7 @@ pub struct AnnotationCtx {
     pub candidates_dir: PathBuf,
     pub screen: Option<ScreenCapture>,
     pub display: Option<DisplayInfo>,
-    pub pointer: Option<Pointer>,
+    pub pointer: Option<Box<dyn PointerFeed>>,
     /// Signals in recording time. App names are filled in at plan time from `apps`.
     pub signals: Signals,
     /// Frame index of each screen sample (the candidate file name), in sample order.

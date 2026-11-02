@@ -10,7 +10,6 @@ mod annotation_session;
 mod app;
 mod bundles;
 mod controller;
-#[cfg(debug_assertions)]
 mod debug;
 mod history;
 mod inference;

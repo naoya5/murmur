@@ -834,7 +834,7 @@ pub fn summary_text(s: &Summary<'_>) -> String {
 
     // One block per keyframe, after one blank line.
     for k in s.keyframes {
-        if k.n == 1 || s.keyframes.first().is_some_and(|f| f.n == k.n) {
+        if s.keyframes.first().is_some_and(|f| f.n == k.n) {
             out.push('\n');
         }
         out.push_str(&format!("#{} ({})", k.n, clock(k.t_ms)));
@@ -845,47 +845,14 @@ pub fn summary_text(s: &Summary<'_>) -> String {
         out.push('\n');
         let chunks: Vec<&Chunk> = s.chunks.iter().filter(|c| c.keyframe == k.n).collect();
         let marks: Vec<&Mark> = s.marks.iter().filter(|m| m.keyframe() == k.n).collect();
-        if s.transcription_failed {
-            let mut line = w.failed.to_owned();
-            append_marks(&mut line, &marks, w);
-            out.push_str(&line);
-            out.push('\n');
-            continue;
-        }
-        // A mark goes after the newest sentence that started before it; the rest stand alone.
-        let mut orphans: Vec<&Mark> = Vec::new();
-        let mut per_chunk: Vec<Vec<&Mark>> = vec![Vec::new(); chunks.len()];
-        for m in marks {
-            match chunks.iter().rposition(|c| c.start_ms <= m.t_ms()) {
-                Some(i) => {
-                    if let Some(list) = per_chunk.get_mut(i) {
-                        list.push(m);
-                    }
-                }
-                None => orphans.push(m),
-            }
-        }
-        if !orphans.is_empty() {
-            let mut line = String::new();
-            append_marks(&mut line, &orphans, w);
-            out.push_str(line.trim_start());
-            out.push('\n');
-        }
-        for (c, marks) in chunks.iter().zip(per_chunk) {
-            let text = c.text.0.trim();
-            if text.is_empty() && marks.is_empty() {
-                continue;
-            }
-            let mut line = String::new();
-            if !text.is_empty() {
-                line.push_str(w.quote.0);
-                line.push_str(text);
-                line.push_str(w.quote.1);
-            }
-            append_marks(&mut line, &marks, w);
-            out.push_str(line.trim_start());
-            out.push('\n');
-        }
+        write_block(&mut out, &chunks, &marks, w, s.transcription_failed);
+    }
+    // Without any picture (the screen was not captured) the words still go out, in one block.
+    if n == 0 && (!s.chunks.is_empty() || s.transcription_failed || !s.marks.is_empty()) {
+        out.push('\n');
+        let chunks: Vec<&Chunk> = s.chunks.iter().collect();
+        let marks: Vec<&Mark> = s.marks.iter().collect();
+        write_block(&mut out, &chunks, &marks, w, s.transcription_failed);
     }
 
     if s.sheet_path.is_some() && n > 0 {
@@ -903,6 +870,52 @@ pub fn summary_text(s: &Summary<'_>) -> String {
         out.push('\n');
     }
     out
+}
+
+/// The sentences of one picture (or of the whole bundle without pictures), each followed by the
+/// marks made while it was spoken; marks before any sentence stand on their own line.
+fn write_block(out: &mut String, chunks: &[&Chunk], marks: &[&Mark], w: &Wording, failed: bool) {
+    if failed {
+        let mut line = w.failed.to_owned();
+        append_marks(&mut line, marks, w);
+        out.push_str(&line);
+        out.push('\n');
+        return;
+    }
+    // A mark goes after the newest sentence that started before it; the rest stand alone.
+    let mut orphans: Vec<&Mark> = Vec::new();
+    let mut per_chunk: Vec<Vec<&Mark>> = vec![Vec::new(); chunks.len()];
+    for m in marks {
+        match chunks.iter().rposition(|c| c.start_ms <= m.t_ms()) {
+            Some(i) => {
+                if let Some(list) = per_chunk.get_mut(i) {
+                    list.push(m);
+                }
+            }
+            None => orphans.push(m),
+        }
+    }
+    if !orphans.is_empty() {
+        let mut line = String::new();
+        append_marks(&mut line, &orphans, w);
+        out.push_str(line.trim_start());
+        out.push('\n');
+    }
+    for (c, marks) in chunks.iter().zip(per_chunk) {
+        let text = c.text.0.trim();
+        if text.is_empty() && marks.is_empty() {
+            continue;
+        }
+        let mut line = String::new();
+        if !text.is_empty() {
+            line.push_str(w.quote.0);
+            line.push_str(text);
+            line.push_str(w.quote.1);
+        }
+        append_marks(&mut line, &marks, w);
+        out.push_str(line.trim_start());
+        out.push('\n');
+    }
 }
 
 fn append_marks(line: &mut String, marks: &[&Mark], w: &Wording) {
@@ -1727,6 +1740,49 @@ Full-size pictures: frames/1.png to frames/3.png (same folder)
         assert!(!text.contains("Image:"));
         assert!(!text.contains("Full-size"));
         assert!(text.contains("\"hello\"\n"));
+    }
+
+    #[test]
+    fn words_without_any_picture_are_still_written() {
+        let chunks = vec![chunk(0, 2_900, 1, "画面は取れなかったけど、話はしました。")];
+        let text = summary_text(&Summary {
+            language: Language::Ja,
+            duration_ms: 4_000,
+            sheet_path: None,
+            target: PasteTarget::Other,
+            keyframes: &[],
+            marks: &[],
+            chunks: &chunks,
+            transcription_failed: false,
+        });
+        assert_eq!(
+            text,
+            "[Murmur Annotations] 画面の説明 (0:04)\n\n「画面は取れなかったけど、話はしました。」\n"
+        );
+        // A failed transcription without pictures still says so.
+        let text = summary_text(&Summary {
+            language: Language::En,
+            duration_ms: 4_000,
+            sheet_path: None,
+            target: PasteTarget::Other,
+            keyframes: &[],
+            marks: &[],
+            chunks: &[],
+            transcription_failed: true,
+        });
+        assert!(text.ends_with("\n\n(transcription failed)\n"));
+        // Nothing at all: the header alone.
+        let text = summary_text(&Summary {
+            language: Language::En,
+            duration_ms: 4_000,
+            sheet_path: None,
+            target: PasteTarget::Other,
+            keyframes: &[],
+            marks: &[],
+            chunks: &[],
+            transcription_failed: false,
+        });
+        assert_eq!(text, "[Murmur Annotations] Screen notes (0:04)\n");
     }
 
     #[test]
