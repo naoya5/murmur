@@ -96,3 +96,14 @@ describe("display", () => {
     expect(comboTokens(parseAccelerator("F5"))).toEqual(["F5"]);
   });
 });
+
+describe("code-style key names", () => {
+  it("reads KeyS and Digit4 as S and 4", () => {
+    expect(parseAccelerator("Option+Shift+KeyS")).toMatchObject({
+      alt: true,
+      shift: true,
+      key: "S",
+    });
+    expect(parseAccelerator("Cmd+Digit4").key).toBe("4");
+  });
+});

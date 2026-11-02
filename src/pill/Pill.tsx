@@ -1,12 +1,22 @@
-import { AlertTriangle, Check, MicOff } from "lucide-react";
+import { AlertTriangle, Camera, Check, MicOff } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { I18nContext, resolveLocale, type Strings, strings } from "../i18n";
-import { commands, type Notice, type PillState, type UiLanguage, useEvent } from "../ipc";
+import {
+  type AnnotationPill,
+  commands,
+  type DeliveryOutcome,
+  type Notice,
+  type PillState,
+  type UiLanguage,
+  useEvent,
+} from "../ipc";
 import { formatClock } from "../lib/format";
 import { deadlineFrom, elapsedAt, fractionLeft, smoothLevel, startFrom } from "./countdown";
 
 const BAR_COUNT = 16;
 const CANCEL_TOTAL_MS = 3000;
+/** How long the drawing hint shows at the start of an annotation recording. */
+const HINT_MS = 3000;
 
 function usePrefersReducedMotion(): boolean {
   const [reduced, setReduced] = useState(
@@ -105,6 +115,33 @@ function Ring({ fraction }: { fraction: number }) {
   );
 }
 
+function annotationDelivered(
+  outcome: DeliveryOutcome,
+  images: number,
+  t: Strings,
+): { icon: "ok" | "warn" | "info"; text: string; sub?: string } {
+  const a = t.pill.annotation;
+  const wordsOnly = images === 0;
+  if (outcome.kind === "unconfirmed") {
+    return { icon: "info", text: t.pill.unconfirmed };
+  }
+  const pasted = outcome.kind === "pasted";
+  const text = wordsOnly
+    ? pasted
+      ? a.pastedWordsOnly
+      : a.copiedWordsOnly
+    : pasted
+      ? a.pastedWithImages(images)
+      : a.copiedWithImages(images);
+  let sub: string | undefined;
+  if (wordsOnly) {
+    sub = a.imagesInFolder;
+  } else if (outcome.kind === "copied") {
+    sub = outcome.reason === "secure_input" ? a.secureField : a.pressPaste;
+  }
+  return { icon: wordsOnly ? "warn" : "ok", text, sub };
+}
+
 function noticeContent(
   notice: Notice,
   t: Strings,
@@ -126,8 +163,27 @@ function noticeContent(
       return { icon: "warn", text: t.pill.failure[notice.failure], sub: t.pill.savedToHistory };
     case "capture_failed":
       return { icon: "warn", text: t.pill.capture[notice.error] };
+    case "annotation_delivered":
+      return annotationDelivered(notice.outcome, notice.images, t);
+    case "annotation_empty":
+      return { icon: "info", text: t.pill.annotation.empty };
+    case "annotations_refused":
+      return { icon: "warn", text: t.pill.annotation.refused[notice.reason] };
   }
   return { icon: "info", text: "" };
+}
+
+function ScreenMark({ annotation, t }: { annotation: AnnotationPill; t: Strings }) {
+  const lost = annotation.screen_lost;
+  return (
+    <span
+      className={lost ? "pill__shot pill__shot--lost" : "pill__shot"}
+      title={lost ? t.pill.annotation.screenLost : t.pill.annotation.screen}
+    >
+      {lost ? <AlertTriangle aria-hidden="true" /> : <Camera aria-hidden="true" />}
+      <span>{annotation.images}</span>
+    </span>
+  );
 }
 
 function NoticeIcon({ tone }: { tone: "ok" | "warn" | "info" }) {
@@ -195,6 +251,9 @@ export default function Pill() {
     return () => window.clearInterval(id);
   }, [view, reducedMotion]);
 
+  const annotation = state.annotation ?? null;
+  const showHint =
+    recording && annotation !== null && !annotation.screen_lost && elapsedMs < HINT_MS;
   const notice = view.kind === "notice" ? noticeContent(view.notice, t) : null;
   const layoutKey = useMemo(() => {
     if (view.kind === "notice") {
@@ -203,8 +262,8 @@ export default function Pill() {
     if (view.kind === "cancel_pending") {
       return `${view.kind}:${t.pill.escToUndo}`;
     }
-    return `${view.kind}:${state.language}`;
-  }, [view, notice, state.language, t]);
+    return `${view.kind}:${state.language}:${annotation ? `shot${annotation.images}${annotation.screen_lost}${showHint}` : ""}`;
+  }, [view, notice, state.language, t, annotation, showHint]);
 
   // Width: measured from the content and sent to the native window on every layout change.
   const contentRef = useRef<HTMLSpanElement>(null);
@@ -251,11 +310,16 @@ export default function Pill() {
           {(recording || busy) && (
             <>
               <span className="pill__dot" style={busy ? { visibility: "hidden" } : undefined} />
+              {annotation && <ScreenMark annotation={annotation} t={t} />}
               <Waveform bars={bars} shimmer={busy} />
               <span className="pill__time">{formatClock(elapsedMs)}</span>
               <span className="pill__lang" title={langTitle}>
                 {state.language === "ja" ? "あ" : "A"}
               </span>
+              {recording && annotation?.screen_lost && (
+                <span className="pill__hint pill__hint--warn">{t.pill.annotation.screenLost}</span>
+              )}
+              {showHint && <span className="pill__hint">{t.pill.annotation.hint}</span>}
             </>
           )}
           {view.kind === "cancel_pending" && (

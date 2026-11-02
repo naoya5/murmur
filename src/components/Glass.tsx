@@ -11,12 +11,17 @@ export function Card({ tight, className, children, ...rest }: CardProps) {
   );
 }
 
-type GroupProps = { title?: string; children: ReactNode; id?: string };
+type GroupProps = { title?: string; badge?: ReactNode; children: ReactNode; id?: string };
 
-export function Group({ title, children, id }: GroupProps) {
+export function Group({ title, badge, children, id }: GroupProps) {
   return (
     <section className="settings__section" id={id}>
-      {title && <h2 className="group__title">{title}</h2>}
+      {title && (
+        <h2 className={badge ? "group__title group__title--with-badge" : "group__title"}>
+          {title}
+          {badge}
+        </h2>
+      )}
       <div className="group">{children}</div>
     </section>
   );

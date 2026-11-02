@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigation } from "../app/navigation";
 import { useSettings } from "../app/settings";
 import { useUpdates } from "../app/updates";
-import { Dot } from "../components/Badge";
+import { Badge, Dot } from "../components/Badge";
 import { Button } from "../components/Button";
 import { Group, LinkRow, Row } from "../components/Glass";
 import { KeyRecorder } from "../components/KeyRecorder";
@@ -58,6 +58,7 @@ export function Settings() {
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [confirmReset, setConfirmReset] = useState(false);
+  const [folderNote, setFolderNote] = useState(false);
   const [tab, setTab] = useState<SettingsTab>(() => asTab(target.anchor) ?? "general");
   const tabsId = useTabsId();
   const headerRef = useRef<HTMLElement>(null);
@@ -149,6 +150,12 @@ export function Settings() {
 
   const retentionDays =
     settings.history_retention.kind === "days" ? settings.history_retention.days : 30;
+
+  const openFolder = async () => {
+    const result = await commands.openAnnotationsFolder().catch(() => null);
+    // The folder only exists after the first bundle; a failed open is guidance, not an error.
+    setFolderNote(result === null || result.status === "error");
+  };
 
   return (
     <>
@@ -333,6 +340,96 @@ export function Settings() {
                 ]}
               />
             </Row>
+          </Group>
+        )}
+
+        {tab === "recording" && (
+          <Group
+            title={t.settings.experimental.title}
+            badge={<Badge tone="accent">{t.settings.experimental.badge}</Badge>}
+          >
+            <Row
+              label={t.settings.experimental.toggle}
+              hint={t.settings.experimental.toggleHint}
+              error={errors.annotations_enabled}
+            >
+              <Toggle
+                label={t.settings.experimental.toggle}
+                checked={settings.annotations_enabled}
+                onChange={async (annotations_enabled) => {
+                  await set("annotations_enabled", { annotations_enabled });
+                  refreshPermissions();
+                }}
+              />
+            </Row>
+            {settings.annotations_enabled && (
+              <>
+                <Row
+                  label={t.settings.experimental.hotkey}
+                  hint={t.settings.experimental.hotkeyHint}
+                  error={errors.annotations_hotkey}
+                >
+                  <KeyRecorder
+                    label={t.settings.experimental.hotkey}
+                    value={settings.annotations_hotkey}
+                    onListenStart={() => commands.suspendHotkeys().catch(() => undefined)}
+                    onListenEnd={() => commands.resumeHotkeys().catch(() => undefined)}
+                    onChange={(annotations_hotkey) => {
+                      if (annotations_hotkey) {
+                        set("annotations_hotkey", { annotations_hotkey });
+                      }
+                    }}
+                  />
+                </Row>
+                <Row
+                  label={
+                    <span className="perm">
+                      <Dot tone={permissions?.screen_recording ? "ok" : "warn"} />
+                      {t.settings.experimental.permission}
+                    </span>
+                  }
+                  hint={t.settings.experimental.permissionHint}
+                >
+                  {permissions?.screen_recording && (
+                    <span className="muted small">{t.settings.granted}</span>
+                  )}
+                  {permissions && !permissions.screen_recording && (
+                    <Button size="sm" onClick={() => commands.openPrivacyPane("ScreenCapture")}>
+                      {t.settings.openSystemSettings}
+                    </Button>
+                  )}
+                </Row>
+                <Row
+                  label={t.settings.experimental.retention}
+                  hint={t.settings.experimental.retentionHint}
+                  error={errors.annotations_retention_days}
+                >
+                  <NumberField
+                    label={t.settings.experimental.retention}
+                    value={settings.annotations_retention_days}
+                    min={1}
+                    max={90}
+                    unit={t.settings.days}
+                    onCommit={(annotations_retention_days) =>
+                      set("annotations_retention_days", { annotations_retention_days })
+                    }
+                  />
+                </Row>
+                <Row
+                  label={t.settings.experimental.folderLabel}
+                  hint={
+                    folderNote
+                      ? t.settings.experimental.folderMissing
+                      : t.settings.experimental.folderHint
+                  }
+                >
+                  <Button size="sm" onClick={openFolder}>
+                    {t.settings.experimental.openFolder}
+                  </Button>
+                </Row>
+              </>
+            )}
+            <Row label={<span className="row__note">{t.settings.experimental.storageNote}</span>} />
           </Group>
         )}
 

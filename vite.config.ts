@@ -9,12 +9,14 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig({
   plugins: [react()],
 
-  // Two windows, two pages: `main` (index.html) and `pill` (pill.html).
+  // Three windows, three pages: `main` (index.html), `pill` (pill.html) and the annotations
+  // drawing layer `overlay` (overlay.html).
   build: {
     rollupOptions: {
       input: {
         main: resolve(import.meta.dirname, "index.html"),
         pill: resolve(import.meta.dirname, "pill.html"),
+        overlay: resolve(import.meta.dirname, "overlay.html"),
       },
     },
   },

@@ -66,6 +66,11 @@
   --yellow: #ffd84a;
   --green: #4ade80;
 
+  /* Annotation ink: the pen of the drawing layer. A saturated red with a thin white edge, so a
+     stroke reads on a dark and on a bright screen. (--ink above is the text colour.) */
+  --ink-stroke: #ff3b30;
+  --ink-stroke-edge: rgba(255, 255, 255, 0.92);
+
   /* Scene: a light tint over the native glass (it must stay see-through), the light, and
      the dust it shows. */
   --scene-tint: rgba(12, 9, 8, 0.4);
@@ -658,6 +663,12 @@ button {
   padding: 0 var(--space-1) var(--space-2);
 }
 
+.group__title--with-badge {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
 .row {
   position: relative;
   display: flex;
@@ -693,6 +704,14 @@ button {
 
 .row__hint {
   font-size: var(--text-small);
+  color: var(--ink-2);
+  line-break: strict;
+}
+
+.row__note {
+  font-size: var(--text-small);
+  font-weight: 400;
+  line-height: 1.5;
   color: var(--ink-2);
   line-break: strict;
 }
@@ -2533,6 +2552,45 @@ button {
   font-weight: 400;
 }
 
+/* The screen mark of an annotation recording: a camera and the number of pictures so far. */
+.pill__shot {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  padding: 0 8px 0 7px;
+  border-radius: 11px;
+  flex-shrink: 0;
+  font-size: var(--text-small);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent-line);
+  color: var(--accent-hi);
+}
+
+.pill__shot svg {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+}
+
+.pill__shot--lost {
+  background: rgba(255, 216, 74, 0.12);
+  box-shadow: inset 0 0 0 1px rgba(255, 216, 74, 0.34);
+  color: var(--yellow);
+}
+
+.pill__hint {
+  color: var(--ink-2);
+  font-weight: 400;
+}
+
+.pill__hint--warn {
+  color: var(--yellow);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .pill__dot {
     animation: none;
@@ -2543,6 +2601,27 @@ button {
     animation: none;
     opacity: 0.35;
   }
+}
+
+/* ---------- Annotations drawing layer ---------- */
+
+.overlay-page,
+.overlay-page body,
+.overlay-page #root {
+  background: transparent;
+  overflow: hidden;
+  width: 100%;
+  height: 100%;
+}
+
+.overlay-canvas {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: crosshair;
+  touch-action: none;
 }
 
 /* ---------- Dev mock dressing (browser only; never active inside Tauri) ---------- */
@@ -2566,4 +2645,9 @@ html.mock.mock-pill body {
 
 html.mock.mock-pill .pill-capsule {
   background: rgba(36, 30, 27, 0.92);
+}
+
+/* The drawing layer in a browser: a screen-like backdrop with a hint of what a stroke covers. */
+html.mock.mock-overlay body {
+  background: linear-gradient(rgba(24, 22, 22, 0.35), rgba(24, 22, 22, 0.35)), var(--wallpaper);
 }

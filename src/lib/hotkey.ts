@@ -172,6 +172,11 @@ export function parseAccelerator(accelerator: string): Combo {
 }
 
 function normalizeKeyName(part: string): string {
+  // The backend writes letters and digits as codes ("KeyS", "Digit4").
+  const code = /^(?:Key([A-Za-z])|Digit([0-9]))$/.exec(part);
+  if (code) {
+    return (code[1] ?? code[2] ?? part).toUpperCase();
+  }
   const lower = part.toLowerCase();
   const aliases: Record<string, string> = {
     arrowup: "Up",
