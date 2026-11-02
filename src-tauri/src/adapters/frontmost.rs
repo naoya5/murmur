@@ -1,22 +1,23 @@
 //! Adapter: the app in front. An annotation is pasted into the app that was in front when its
 //! hotkey was pressed, not into whatever is in front at the stop (the user clicks around while
-//! recording). `capture` remembers that app (pid, bundle id and, through accessibility, the
-//! element that had the focus); `bring_to_front` activates it again, waits for it with a
-//! timeout (G5) and puts the focus back; `is_in_front` is checked right before every paste
-//! keystroke, so a keystroke never lands in another app.
+//! recording). `capture` remembers that app (pid and bundle id at once; the element that had
+//! the focus a moment later, on its own thread, so the recording does not wait for an
+//! accessibility call); `bring_to_front` activates it again, waits for it with a timeout (G5)
+//! and puts the focus back; `is_in_front` is checked right before every paste keystroke, so a
+//! keystroke never lands in another app. "In front" means the app is the active one: the one
+//! the keyboard goes to, from `NSWorkspace`, which the main run loop keeps fresh. (The window
+//! list is not consulted: quick-entry panels and floating inputs are not ordinary windows, yet
+//! they take a paste.)
 //!
 //! Accessibility is checked right before its first use, through `platform::macos` (G8). Bundle
 //! ids and element names never reach the log (G7). Nothing here panics (G6).
 
 use std::ffi::c_void;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication, NSWorkspace};
-use objc2_core_foundation::{CFDictionary, CFNumber, CFString};
-use objc2_core_graphics::{
-    CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID, kCGWindowLayer,
-    kCGWindowOwnerPID,
-};
+use objc2_core_foundation::CFString;
 
 use crate::platform::macos;
 
@@ -54,6 +55,8 @@ unsafe extern "C" {
 unsafe extern "C" {
     /// `void CFRelease(CFTypeRef)`
     fn CFRelease(cf: *const c_void);
+    /// `CFTypeRef CFRetain(CFTypeRef)`
+    fn CFRetain(cf: *const c_void) -> *const c_void;
 }
 
 /// A retained accessibility element (`AXUIElementRef`), released on drop.
@@ -82,67 +85,45 @@ impl std::fmt::Debug for AxElement {
 pub struct FrontApp {
     pub pid: i32,
     pub bundle_id: Option<String>,
-    focused: Option<AxElement>,
+    /// Filled by the `front-focus` thread shortly after `capture`; empty until then, or when
+    /// accessibility is not granted or the app has no focused element.
+    focused: Arc<Mutex<Option<AxElement>>>,
 }
 
-/// The pid of the app in front right now: the owner of the frontmost ordinary window on the
-/// screen, as the window server lists it. The list is fresh from any thread and needs no run
-/// loop or permission (`NSWorkspace`'s answer is updated by the main run loop and lags behind
-/// on other threads). Panels, the menu bar and the desktop are not ordinary windows. With no
-/// ordinary window on the screen, `NSWorkspace`'s answer.
-pub fn frontmost_pid() -> Option<i32> {
-    if let Some(pid) = front_window_owner() {
-        return Some(pid);
-    }
+/// The pid of the active app: the one the keyboard goes to (`NSWorkspace`, which the main run
+/// loop keeps up to date; on a thread of a process without a running main loop it may lag).
+pub fn active_pid() -> Option<i32> {
     let app = NSWorkspace::sharedWorkspace().frontmostApplication()?;
     Some(app.processIdentifier())
-}
-
-/// The owner of the first on-screen window at the normal level (the list is front to back).
-fn front_window_owner() -> Option<i32> {
-    let windows = CGWindowListCopyWindowInfo(
-        CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
-        kCGNullWindowID,
-    )?;
-    let count = windows.count();
-    for index in 0..count {
-        // SAFETY: the list holds dictionaries of window facts, read while the list is retained;
-        // the keys are the immortal constants of the window server.
-        unsafe {
-            let window = windows.value_at_index(index) as *const CFDictionary;
-            if window.is_null() {
-                continue;
-            }
-            let number = |key: &CFString| -> Option<i64> {
-                let value =
-                    (*window).value(key as *const CFString as *const c_void) as *const CFNumber;
-                (!value.is_null()).then(|| (*value).as_i64()).flatten()
-            };
-            if number(kCGWindowLayer) != Some(0) {
-                continue;
-            }
-            if let Some(pid) = number(kCGWindowOwnerPID) {
-                return i32::try_from(pid).ok();
-            }
-        }
-    }
-    None
 }
 
 /// Remembers the app in front. `None` when it is Murmur itself (there is nowhere to paste) or
 /// when no app is in front.
 pub fn capture() -> Option<FrontApp> {
-    let pid = frontmost_pid()?;
+    let pid = active_pid()?;
     if pid == std::process::id() as i32 {
         return None;
     }
     let app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)?;
     let bundle_id = app.bundleIdentifier().map(|s| s.to_string());
-    // The focused element is read only with the permission in hand (G8); without it the app
-    // still comes back to the front, and restores its own focus.
-    let focused = macos::accessibility_trusted()
-        .then(|| focused_element(pid))
-        .flatten();
+    let focused: Arc<Mutex<Option<AxElement>>> = Arc::new(Mutex::new(None));
+    // The focused element is read on its own thread (an accessibility call can take up to
+    // `AX_MESSAGE_TIMEOUT_S`), only with the permission in hand (G8); without it the app still
+    // comes back to the front, and restores its own focus.
+    let slot = focused.clone();
+    let spawned = std::thread::Builder::new()
+        .name("front-focus".into())
+        .spawn(move || {
+            let element = macos::accessibility_trusted()
+                .then(|| focused_element(pid))
+                .flatten();
+            if let Ok(mut slot) = slot.lock() {
+                *slot = element;
+            }
+        });
+    if spawned.is_err() {
+        tracing::debug!("focus of the app in front not read");
+    }
     Some(FrontApp {
         pid,
         bundle_id,
@@ -180,9 +161,9 @@ fn focused_element(pid: i32) -> Option<AxElement> {
 }
 
 impl FrontApp {
-    /// Whether the remembered app is the one in front right now.
+    /// Whether the remembered app is the active one right now.
     pub fn is_in_front(&self) -> bool {
-        frontmost_pid() == Some(self.pid)
+        active_pid() == Some(self.pid)
     }
 
     /// Brings the remembered app back to the front, waiting at most `timeout`, and gives the
@@ -209,7 +190,11 @@ impl FrontApp {
                 return false;
             }
         }
-        if let Some(focused) = &self.focused {
+        let focused = self.focused.lock().ok().and_then(|slot| {
+            // SAFETY: a retained element stays valid; the copy is released on its own.
+            slot.as_ref().map(|e| AxElement(unsafe { CFRetain(e.0) }))
+        });
+        if let Some(focused) = focused {
             let attribute = ax_string("AXFocused");
             // SAFETY: the element is retained by `self`; the attribute and the constant live for
             // the call. A failure only means the app keeps the focus it chose itself.
@@ -242,7 +227,7 @@ mod tests {
         }
     }
 
-    /// The window list names the same app as System Events (read only: nothing is activated).
+    /// The active app is the one System Events names (read only: nothing is activated).
     /// Skipped where System Events does not answer (no session, no automation permission).
     #[test]
     fn front_app_agrees_with_system_events() {
@@ -254,7 +239,7 @@ mod tests {
         let Ok(truth) = truth.parse::<i32>() else {
             return;
         };
-        assert_eq!(frontmost_pid(), Some(truth));
+        assert_eq!(active_pid(), Some(truth));
     }
 
     /// Needs the screen: TextEdit comes back although Safari was brought in front, with the
