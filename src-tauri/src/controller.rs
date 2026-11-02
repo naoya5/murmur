@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use murmur_core::Language;
 use murmur_core::ports::{CancelToken, RawTranscript};
 use murmur_core::session::{
-    self, CaptureError, DeliveryOutcome, Effect, Event, FailureKind, Machine, PillView, SessionId,
-    SessionKind, TranscribeOutcome, TranscriptText,
+    self, AnnotationsRefusal, CaptureError, DeliveryOutcome, Effect, Event, FailureKind, Machine,
+    PillView, SessionId, SessionKind, TranscribeOutcome, TranscriptText,
 };
 use murmur_core::text::{self, FormatOptions};
 use serde::Serialize;
@@ -82,6 +82,8 @@ pub enum Msg {
     Core(Event),
     /// The main hotkey with a language override (alternate hotkey).
     HotkeyDownWithLanguage(Language),
+    /// The annotations hotkey. The permissions are checked here, right before use (G8).
+    AnnotationsHotkey,
     CaptureOpened {
         session: SessionId,
         result: Result<Recorder, CaptureError>,
@@ -217,6 +219,7 @@ impl Controller {
                     mode: self.services.settings().record_mode,
                 })
             }
+            Msg::AnnotationsHotkey => self.on_annotations_hotkey(),
             Msg::CaptureOpened { session, result } => self.on_capture_opened(session, result),
             Msg::AudioReady { session, result } => {
                 if let Some(ctx) = self.sessions.get_mut(&session)
@@ -229,6 +232,30 @@ impl Controller {
             Msg::Inferred { session, result } => self.on_inferred(session, result),
             Msg::Shutdown => None,
         }
+    }
+
+    /// Screen Recording and the microphone are checked only when a recording would start; a
+    /// press that stops one needs no permission. A press after the feature was switched off
+    /// (the key may fire once before it is unregistered) does nothing.
+    fn on_annotations_hotkey(&self) -> Option<Event> {
+        if !self.services.settings().annotations_enabled {
+            return None;
+        }
+        if self.machine.active_session().is_some() {
+            return Some(Event::AnnotationsHotkey);
+        }
+        if !macos::screen_recording_granted() && !macos::request_screen_recording() {
+            return Some(Event::AnnotationsRefused {
+                reason: AnnotationsRefusal::ScreenRecordingDenied,
+            });
+        }
+        // `NotDetermined` is fine: opening the microphone shows the system prompt, as for dictation.
+        if macos::microphone_permission() == Permission::Denied {
+            return Some(Event::AnnotationsRefused {
+                reason: AnnotationsRefusal::MicrophoneDenied,
+            });
+        }
+        Some(Event::AnnotationsHotkey)
     }
 
     fn on_capture_opened(

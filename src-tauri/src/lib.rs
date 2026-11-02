@@ -7,6 +7,7 @@
 
 mod adapters;
 mod app;
+mod bundles;
 mod controller;
 #[cfg(debug_assertions)]
 mod debug;
@@ -163,6 +164,7 @@ fn hotkey_callback(
             };
             controller.send(Msg::HotkeyDownWithLanguage(other));
         }
+        HotkeyEvent::Annotations => controller.send(Msg::AnnotationsHotkey),
         HotkeyEvent::Esc => controller.event(Event::Esc),
     })
 }

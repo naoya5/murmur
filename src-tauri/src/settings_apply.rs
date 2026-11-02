@@ -6,7 +6,8 @@
 
 use std::sync::Arc;
 
-use murmur_core::settings::{SettingKey, Settings, SettingsError};
+use murmur_core::session::Event;
+use murmur_core::settings::{SettingKey, Settings, SettingsError, same_accelerator};
 use serde::Serialize;
 use specta::Type;
 use tauri::AppHandle;
@@ -53,8 +54,11 @@ pub fn update(
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    requested.validate()?;
     let old = services.settings();
+    if let Some(error) = hotkey_clash(&old, &requested) {
+        return Err(error);
+    }
+    requested.validate()?;
     let mut next = requested;
     next.schema_version = old.schema_version;
     let mut first_error = None;
@@ -82,12 +86,29 @@ pub fn update(
                 {
                     tracing::error!(%error, "could not restore the alternate hotkey");
                 }
+                if keys.iter().any(|k| {
+                    matches!(
+                        k,
+                        SettingKey::AnnotationsEnabled | SettingKey::AnnotationsHotkey
+                    )
+                }) && let Err(error) = hotkeys.set_annotations(
+                    old.annotations_enabled
+                        .then_some(old.annotations_hotkey.as_str()),
+                ) {
+                    tracing::error!(%error, "could not restore the annotations hotkey");
+                }
             }
             if keys.contains(&SettingKey::LaunchAtLogin) {
                 sync_autostart(app, old.launch_at_login);
             }
+            if keys.contains(&SettingKey::AnnotationsEnabled) {
+                set_overlay_present(app, old.annotations_enabled);
+            }
         },
     )?;
+    if keys.contains(&SettingKey::AnnotationsRetentionDays) {
+        spawn_bundle_cleanup(services, next.annotations_retention_days);
+    }
     if keys.contains(&SettingKey::HistoryRetention) {
         let store = services.store().clone();
         let retention = next.history_retention;
@@ -130,6 +151,54 @@ fn save_and_publish(
     Ok(())
 }
 
+/// A clash between the annotations hotkey (while that feature is on) and a dictation hotkey,
+/// worded for the field the user changed. `validate` reports the same clash under
+/// `AnnotationsHotkey`, which fits only when that field changed.
+fn hotkey_clash(old: &Settings, next: &Settings) -> Option<ApplyError> {
+    if !next.annotations_enabled {
+        return None;
+    }
+    let changed = old.diff(next);
+    let clashes = |other: &str| same_accelerator(&next.annotations_hotkey, other);
+    if changed.contains(&SettingKey::Hotkey) && clashes(&next.hotkey) {
+        return Some(ApplyError::Hotkey(
+            "this key is the annotations hotkey".to_owned(),
+        ));
+    }
+    if changed.contains(&SettingKey::AlternateLanguageHotkey)
+        && next
+            .alternate_language_hotkey
+            .as_deref()
+            .is_some_and(clashes)
+    {
+        return Some(ApplyError::Hotkey(
+            "this key is the annotations hotkey".to_owned(),
+        ));
+    }
+    None
+}
+
+/// Creates or destroys the drawing layer to match the feature switch.
+fn set_overlay_present(app: &AppHandle, present: bool) {
+    if present {
+        if let Err(error) = crate::windows::create_overlay(app) {
+            tracing::error!(%error, "could not create the annotations drawing layer");
+        }
+    } else {
+        crate::windows::destroy_overlay(app);
+    }
+}
+
+/// Retention and size cap of the annotation bundles, on the blocking pool (G9).
+fn spawn_bundle_cleanup(services: &Arc<App>, retention_days: u32) {
+    let store = services.store().clone();
+    let root = services.paths().annotations.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let now = chrono::Utc::now().timestamp_millis();
+        crate::bundles::cleanup(&store, &root, retention_days, now);
+    });
+}
+
 /// Side effects at startup, for keys whose state lives outside the settings file.
 pub fn apply_at_start(app: &AppHandle, services: &Arc<App>) {
     let settings = services.settings();
@@ -140,7 +209,18 @@ pub fn apply_at_start(app: &AppHandle, services: &Arc<App>) {
         if let Err(error) = hotkeys.set_alternate(settings.alternate_language_hotkey.as_deref()) {
             tracing::warn!(%error, "could not register the alternate hotkey at start");
         }
+        if settings.annotations_enabled
+            && let Err(error) = hotkeys.set_annotations(Some(&settings.annotations_hotkey))
+        {
+            tracing::warn!(%error, "could not register the annotations hotkey at start");
+        }
     }
+    // Off: no window, no hotkey, no permission check, no folder (spec rule for experiments).
+    if settings.annotations_enabled {
+        set_overlay_present(app, true);
+    }
+    // A no-op while the annotations folder does not exist.
+    spawn_bundle_cleanup(services, settings.annotations_retention_days);
     sync_autostart(app, settings.launch_at_login);
     services.ensure_model_loaded(settings.language);
     let store = services.store().clone();
@@ -221,11 +301,48 @@ fn apply(
         SettingKey::Sounds => Ok(()),
         // Read by the main window on start.
         SettingKey::OnboardingCompleted => Ok(()),
-        // Annotations (experimental): the hotkey registration, the drawing layer and the
-        // retention cleanup arrive with the platform ticket. Until then the values are only stored.
-        SettingKey::AnnotationsEnabled
-        | SettingKey::AnnotationsHotkey
-        | SettingKey::AnnotationsRetentionDays => Ok(()),
+        // Annotations (experimental). On: the drawing layer and the hotkey. Off: both go, and a
+        // recording in progress is dropped. Permissions and the folder are never touched here.
+        SettingKey::AnnotationsEnabled => {
+            if next.annotations_enabled {
+                set_overlay_present(app, true);
+                let Some(hotkeys) = services.hotkeys() else {
+                    return Ok(());
+                };
+                hotkeys
+                    .set_annotations(Some(&next.annotations_hotkey))
+                    .map_err(|error| {
+                        next.annotations_enabled = false;
+                        set_overlay_present(app, false);
+                        ApplyError::Hotkey(error.to_string())
+                    })
+            } else {
+                if let Some(hotkeys) = services.hotkeys()
+                    && let Err(error) = hotkeys.set_annotations(None)
+                {
+                    tracing::warn!(%error, "could not unregister the annotations hotkey");
+                }
+                if let Some(controller) = services.controller() {
+                    controller.event(Event::AnnotationsDisabled);
+                }
+                set_overlay_present(app, false);
+                Ok(())
+            }
+        }
+        SettingKey::AnnotationsHotkey => {
+            // Registered only while the feature is on; otherwise the value is stored for later.
+            let Some(hotkeys) = services.hotkeys().filter(|_| next.annotations_enabled) else {
+                return Ok(());
+            };
+            hotkeys
+                .set_annotations(Some(&next.annotations_hotkey))
+                .map_err(|error| {
+                    next.annotations_hotkey = old.annotations_hotkey.clone();
+                    ApplyError::Hotkey(error.to_string())
+                })
+        }
+        // The cleanup runs after the settings commit in `update`.
+        SettingKey::AnnotationsRetentionDays => Ok(()),
     }
 }
 
@@ -299,5 +416,50 @@ mod tests {
         .unwrap();
         assert_eq!(*memory.borrow(), next);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn hotkey_clash_is_reported_for_the_field_the_user_changed() {
+        let on = Settings {
+            annotations_enabled: true,
+            ..Settings::default()
+        };
+        // The dictation hotkey takes the annotations key.
+        let next = Settings {
+            hotkey: "Alt+Shift+S".into(),
+            ..on.clone()
+        };
+        assert!(matches!(
+            hotkey_clash(&on, &next),
+            Some(ApplyError::Hotkey(_))
+        ));
+        // The alternate hotkey takes it.
+        let next = Settings {
+            alternate_language_hotkey: Some("option+shift+keys".into()),
+            ..on.clone()
+        };
+        assert!(matches!(
+            hotkey_clash(&on, &next),
+            Some(ApplyError::Hotkey(_))
+        ));
+        // The annotations hotkey itself moved onto the dictation key: `validate` reports that.
+        let next = Settings {
+            annotations_hotkey: "Alt+Space".into(),
+            ..on.clone()
+        };
+        assert!(hotkey_clash(&on, &next).is_none());
+        assert!(next.validate().is_err());
+        // No clash, or the feature off: nothing to report.
+        let next = Settings {
+            hotkey: "Alt+Shift+D".into(),
+            ..on.clone()
+        };
+        assert!(hotkey_clash(&on, &next).is_none());
+        let off = Settings::default();
+        let next = Settings {
+            hotkey: "Alt+Shift+S".into(),
+            ..off.clone()
+        };
+        assert!(hotkey_clash(&off, &next).is_none());
     }
 }

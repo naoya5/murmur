@@ -1,6 +1,6 @@
 //! SOT: db-schema
-//! What: the SQLite schema (`transcripts`, `daily_stats`), the append-only migration list, and the
-//!       `Store` that reads and writes them.
+//! What: the SQLite schema (`transcripts`, `daily_stats`, `annotations`), the append-only
+//!       migration list, and the `Store` that reads and writes them.
 //! Why: history may be deleted, but the lifetime totals must survive, so `daily_stats` is a separate
 //!      table that history deletion never touches. Migrations are an append-only array keyed by
 //!      `PRAGMA user_version`; a shipped migration never changes (a test pins migration 1).
@@ -46,7 +46,82 @@ const MIGRATIONS: &[&str] = &[
         speech_ms INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (day, language)
     );",
+    // Migration 2: annotation bundles (experimental). No spoken words and no window titles here:
+    // the folder holds them. `folder` is the bundle folder name under the annotations root.
+    "CREATE TABLE annotations (
+        id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        folder TEXT NOT NULL,
+        duration_ms INTEGER NOT NULL,
+        keyframes INTEGER NOT NULL,
+        marks INTEGER NOT NULL,
+        language TEXT,
+        model_id TEXT,
+        latency_ms INTEGER,
+        asr_ms INTEGER,
+        compose_ms INTEGER,
+        error TEXT
+    );
+    CREATE INDEX idx_annotations_created ON annotations(created_at);",
 ];
+
+const ANNOTATION_COLUMNS: &str = "id, created_at, status, folder, duration_ms, keyframes, marks,                                   language, model_id, latency_ms, asr_ms, compose_ms, error";
+
+/// How an annotation bundle ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "snake_case")]
+pub enum AnnotationStatus {
+    /// Pictures and summary were delivered.
+    Ok,
+    /// No picture could be made in time; the summary went out alone.
+    TextOnly,
+    /// The transcription failed; the pictures went out with a note.
+    Failed,
+}
+
+impl AnnotationStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            AnnotationStatus::Ok => "ok",
+            AnnotationStatus::TextOnly => "text_only",
+            AnnotationStatus::Failed => "failed",
+        }
+    }
+
+    fn parse(s: &str) -> Option<AnnotationStatus> {
+        match s {
+            "ok" => Some(AnnotationStatus::Ok),
+            "text_only" => Some(AnnotationStatus::TextOnly),
+            "failed" => Some(AnnotationStatus::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// One annotation bundle. Counts and times only (G7): the words live in the folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, specta::Type)]
+pub struct AnnotationRow {
+    pub id: String,
+    #[specta(type = f64)]
+    pub created_at_ms: i64,
+    pub status: AnnotationStatus,
+    /// Folder name under the annotations root (`YYYYMMDD-HHMMSS-xxxx`).
+    pub folder: String,
+    #[specta(type = f64)]
+    pub duration_ms: u64,
+    pub keyframes: u32,
+    pub marks: u32,
+    pub language: Option<Language>,
+    pub model_id: Option<String>,
+    #[specta(type = Option<f64>)]
+    pub latency_ms: Option<u64>,
+    #[specta(type = Option<f64>)]
+    pub asr_ms: Option<u64>,
+    #[specta(type = Option<f64>)]
+    pub compose_ms: Option<u64>,
+    pub error: Option<String>,
+}
 
 const COLUMNS: &str = "id, created_at, status, text, raw_text, language, duration_ms, latin_words, \
                        cjk_chars, model_id, latency_ms, asr_ms, audio_path, error";
@@ -367,6 +442,72 @@ impl Store {
         Ok(paths)
     }
 
+    // --- annotations ---
+
+    pub fn insert_annotation(&self, row: &AnnotationRow) -> Result<(), StoreError> {
+        self.conn().execute(
+            &format!(
+                "INSERT INTO annotations ({ANNOTATION_COLUMNS}) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"
+            ),
+            params![
+                row.id,
+                row.created_at_ms,
+                row.status.as_str(),
+                row.folder,
+                to_i64(row.duration_ms),
+                row.keyframes,
+                row.marks,
+                row.language.map(Language::code),
+                row.model_id,
+                row.latency_ms.map(to_i64),
+                row.asr_ms.map(to_i64),
+                row.compose_ms.map(to_i64),
+                row.error,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every bundle, oldest first (the size cap removes from the front).
+    pub fn list_annotations_oldest_first(&self) -> Result<Vec<AnnotationRow>, StoreError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {ANNOTATION_COLUMNS} FROM annotations ORDER BY created_at ASC, id ASC"
+        ))?;
+        let rows = stmt.query_map([], annotation_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row??);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_annotation(&self, id: &str) -> Result<(), StoreError> {
+        self.conn()
+            .execute("DELETE FROM annotations WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Retention: deletes the bundles created before `cutoff_ms`, whatever their status, and
+    /// returns their folder names so the caller can remove the folders.
+    pub fn purge_annotations_before(&self, cutoff_ms: i64) -> Result<Vec<String>, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let folders = {
+            let mut stmt = tx.prepare("SELECT folder FROM annotations WHERE created_at < ?1")?;
+            let rows = stmt.query_map([cutoff_ms], |r| r.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            out
+        };
+        tx.execute("DELETE FROM annotations WHERE created_at < ?1", [cutoff_ms])?;
+        tx.commit()?;
+        Ok(folders)
+    }
+
     /// Every audio path the history refers to (for spool recovery and orphan cleanup).
     pub fn audio_paths(&self) -> Result<HashSet<String>, StoreError> {
         let conn = self.conn();
@@ -510,6 +651,42 @@ fn like_pattern(query: &str) -> Option<String> {
     }
     out.push('%');
     Some(out)
+}
+
+fn annotation_row(r: &Row<'_>) -> rusqlite::Result<Result<AnnotationRow, StoreError>> {
+    let status: String = r.get(2)?;
+    let language: Option<String> = r.get(7)?;
+    let duration: i64 = r.get(4)?;
+    let keyframes: i64 = r.get(5)?;
+    let marks: i64 = r.get(6)?;
+    let latency: Option<i64> = r.get(9)?;
+    let asr: Option<i64> = r.get(10)?;
+    let compose: Option<i64> = r.get(11)?;
+    let Some(status) = AnnotationStatus::parse(&status) else {
+        return Ok(Err(StoreError::BadValue("status")));
+    };
+    let language = match language {
+        None => None,
+        Some(code) => match Language::from_code(&code) {
+            Some(l) => Some(l),
+            None => return Ok(Err(StoreError::BadValue("language"))),
+        },
+    };
+    Ok(Ok(AnnotationRow {
+        id: r.get(0)?,
+        created_at_ms: r.get(1)?,
+        status,
+        folder: r.get(3)?,
+        duration_ms: to_u64(duration),
+        keyframes: u32::try_from(keyframes).unwrap_or(0),
+        marks: u32::try_from(marks).unwrap_or(0),
+        language,
+        model_id: r.get(8)?,
+        latency_ms: latency.map(to_u64),
+        asr_ms: asr.map(to_u64),
+        compose_ms: compose.map(to_u64),
+        error: r.get(12)?,
+    }))
 }
 
 fn audio_paths_where<P: rusqlite::Params>(
@@ -994,5 +1171,107 @@ mod tests {
             assert!(took < Duration::from_millis(50), "{q}: {took:?}");
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- annotations ---
+
+    fn annotation(id: &str, created: i64) -> AnnotationRow {
+        AnnotationRow {
+            id: id.to_owned(),
+            created_at_ms: created,
+            status: AnnotationStatus::Ok,
+            folder: format!("20261102-093015-{id}"),
+            duration_ms: 42_000,
+            keyframes: 3,
+            marks: 4,
+            language: Some(Language::Ja),
+            model_id: Some("haas-ja-v1.0-q8_0".to_owned()),
+            latency_ms: Some(1_200),
+            asr_ms: Some(400),
+            compose_ms: Some(250),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn annotations_round_trip_oldest_first() {
+        let store = Store::open_in_memory().unwrap();
+        let b = annotation("b", 2_000);
+        let a = annotation("a", 1_000);
+        let failed = AnnotationRow {
+            status: AnnotationStatus::Failed,
+            error: Some("timeout".to_owned()),
+            language: None,
+            model_id: None,
+            latency_ms: None,
+            asr_ms: None,
+            compose_ms: None,
+            ..annotation("c", 3_000)
+        };
+        for r in [&b, &a, &failed] {
+            store.insert_annotation(r).unwrap();
+        }
+        let rows = store.list_annotations_oldest_first().unwrap();
+        assert_eq!(rows, vec![a.clone(), b.clone(), failed.clone()]);
+        let text_only = AnnotationRow {
+            status: AnnotationStatus::TextOnly,
+            ..annotation("d", 4_000)
+        };
+        store.insert_annotation(&text_only).unwrap();
+        assert_eq!(
+            store.list_annotations_oldest_first().unwrap()[3].status,
+            AnnotationStatus::TextOnly
+        );
+        store.delete_annotation("b").unwrap();
+        store.delete_annotation("no-such").unwrap();
+        let ids: Vec<String> = store
+            .list_annotations_oldest_first()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, vec!["a", "c", "d"]);
+    }
+
+    #[test]
+    fn annotation_purge_returns_the_folders_of_every_status() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert_annotation(&annotation("a", 1_000)).unwrap();
+        store
+            .insert_annotation(&AnnotationRow {
+                status: AnnotationStatus::Failed,
+                ..annotation("b", 2_000)
+            })
+            .unwrap();
+        store.insert_annotation(&annotation("c", 3_000)).unwrap();
+        let folders = store.purge_annotations_before(2_500).unwrap();
+        assert_eq!(
+            folders,
+            vec![
+                "20261102-093015-a".to_owned(),
+                "20261102-093015-b".to_owned()
+            ]
+        );
+        let rows = store.list_annotations_oldest_first().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "c");
+        assert!(store.purge_annotations_before(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn annotations_do_not_touch_the_transcripts() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert(&row("t", 1_000, "hello")).unwrap();
+        store.insert_annotation(&annotation("a", 1_000)).unwrap();
+        store.purge_annotations_before(5_000).unwrap();
+        assert_eq!(store.count("").unwrap(), 1);
+        store.delete_all().unwrap();
+        assert_eq!(store.list_annotations_oldest_first().unwrap().len(), 0);
+        // The database opened fresh has both migrations applied.
+        let v: i64 = store
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 2);
     }
 }

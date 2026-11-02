@@ -63,6 +63,7 @@
 //! | CancelPending(Compose)     | Esc / PillClicked              | the held outcome is handled, or back to Composing |
 //! | CancelPending(Compose/Tx, Annotation) | 3 s timer           | Idle; DropAll                                    |
 //! | Delivering(Annotation)     | Delivered / delivery timer     | Idle + notice; SaveAnnotation (after the paste, G9) |
+//! | any annotation state but Delivering | AnnotationsDisabled    | Idle, no notice; the screen and the overlay are released, the engine cancelled, DropAll |
 //!
 //! Every dictation row above is unchanged by the annotation rows.
 
@@ -327,6 +328,9 @@ pub enum Event {
         session: SessionId,
         outcome: ComposeOutcome,
     },
+    /// The user switched the feature off: an annotation session in progress ends at once and
+    /// keeps nothing. A delivery in flight finishes. Dictation sessions ignore it.
+    AnnotationsDisabled,
 }
 
 /// Instructions for the controller. Executed in order.
@@ -758,6 +762,24 @@ impl Machine {
         }
     }
 
+    /// Ends a paused session without saving anything (countdown expiry, feature switched off).
+    fn abandon_paused(session: SessionId, paused: Paused, fx: &mut Vec<Effect>) -> State {
+        let kind = paused_kind(&paused);
+        match paused {
+            Paused::Recording(_) => {
+                fx.push(Effect::StopCapture { session });
+                Self::release_screen(session, kind, fx);
+            }
+            Paused::Transcribing { held: None, .. } => {
+                fx.push(Effect::CancelTranscription { session })
+            }
+            Paused::Transcribing { held: Some(_), .. } | Paused::Composing { .. } => {}
+        }
+        fx.push(Effect::SetEscCapture(false));
+        Self::drop_session(session, kind, fx);
+        State::Idle { notice: None }
+    }
+
     /// Ends a session without saving anything: the audio for a dictation, everything for an
     /// annotation.
     fn drop_session(session: SessionId, kind: SessionKind, fx: &mut Vec<Effect>) {
@@ -957,6 +979,9 @@ impl Machine {
                     Self::drop_session(session, rec.kind, fx);
                     self.idle_with(Some(Notice::CaptureFailed { error }), fx)
                 }
+                Event::AnnotationsDisabled if rec.kind == SessionKind::Annotation => {
+                    Self::abandon_paused(rec.session, Paused::Recording(rec), fx)
+                }
                 _ => State::Recording(rec),
             },
 
@@ -1004,6 +1029,9 @@ impl Machine {
                         ..tx
                     })
                 }
+                Event::AnnotationsDisabled if tx.kind == SessionKind::Annotation => {
+                    Self::abandon_paused(tx.session, Paused::Transcribing { tx, held: None }, fx)
+                }
                 _ => State::Transcribing(tx),
             },
 
@@ -1026,6 +1054,14 @@ impl Machine {
                         fx,
                     )
                 }
+                Event::AnnotationsDisabled => Self::abandon_paused(
+                    composing.session,
+                    Paused::Composing {
+                        composing,
+                        held: None,
+                    },
+                    fx,
+                ),
                 _ => State::Composing(composing),
             },
 
@@ -1065,20 +1101,13 @@ impl Machine {
         match (paused, event) {
             // The countdown ran out: discard everything, save nothing.
             (paused, Event::TimerFired(id)) if id == timer => {
-                let kind = paused_kind(&paused);
-                match paused {
-                    Paused::Recording(_) => {
-                        fx.push(Effect::StopCapture { session });
-                        Self::release_screen(session, kind, fx);
-                    }
-                    Paused::Transcribing { held: None, .. } => {
-                        fx.push(Effect::CancelTranscription { session })
-                    }
-                    Paused::Transcribing { held: Some(_), .. } | Paused::Composing { .. } => {}
-                }
-                fx.push(Effect::SetEscCapture(false));
-                Self::drop_session(session, kind, fx);
-                State::Idle { notice: None }
+                Self::abandon_paused(session, paused, fx)
+            }
+            // The feature was switched off under a paused annotation session: the same.
+            (paused, Event::AnnotationsDisabled)
+                if paused_kind(&paused) == SessionKind::Annotation =>
+            {
+                Self::abandon_paused(session, paused, fx)
             }
 
             // Undo while recording: resume, or transcribe if the microphone went away.
@@ -3514,6 +3543,103 @@ mod tests {
     }
 
     #[test]
+    fn disabling_the_feature_ends_an_annotation_session_at_once() {
+        let drop_all = [
+            Effect::SetEscCapture(false),
+            Effect::DropAll { session: S1 },
+        ];
+        type Case = (&'static str, fn() -> Harness, Vec<Effect>);
+        let cases: Vec<Case> = vec![
+            (
+                "recording",
+                recording_annotation,
+                vec![
+                    Effect::StopCapture { session: S1 },
+                    Effect::StopScreen { session: S1 },
+                    Effect::HideOverlay,
+                    Effect::SetEscCapture(false),
+                    Effect::DropAll { session: S1 },
+                ],
+            ),
+            (
+                "cancel from recording",
+                || cancel_rec_annotation(1_000),
+                vec![
+                    Effect::StopCapture { session: S1 },
+                    Effect::StopScreen { session: S1 },
+                    Effect::HideOverlay,
+                    Effect::SetEscCapture(false),
+                    Effect::DropAll { session: S1 },
+                ],
+            ),
+            (
+                "transcribing",
+                || transcribing_annotation(1_000),
+                vec![
+                    Effect::CancelTranscription { session: S1 },
+                    Effect::SetEscCapture(false),
+                    Effect::DropAll { session: S1 },
+                ],
+            ),
+            (
+                "cancel from transcribing",
+                cancel_tx_annotation,
+                vec![
+                    Effect::CancelTranscription { session: S1 },
+                    Effect::SetEscCapture(false),
+                    Effect::DropAll { session: S1 },
+                ],
+            ),
+            (
+                "cancel with held result",
+                || {
+                    let mut h = cancel_tx_annotation();
+                    h.step(transcribed(S1, TranscribeOutcome::Text(text("held"))));
+                    h
+                },
+                drop_all.to_vec(),
+            ),
+            ("composing", composing, drop_all.to_vec()),
+            ("cancel from composing", cancel_compose, drop_all.to_vec()),
+            (
+                "cancel with held bundle",
+                || {
+                    let mut h = cancel_compose();
+                    h.step(composed(S1, ComposeOutcome::Bundle { images: 1 }));
+                    h
+                },
+                drop_all.to_vec(),
+            ),
+        ];
+        for (name, build, expected) in cases {
+            let mut h = build();
+            let fx = h.step(Event::AnnotationsDisabled);
+            assert_eq!(fx, expected, "{name}");
+            assert_eq!(h.state(), &State::Idle { notice: None }, "{name}");
+            assert!(!h.m.wants_esc(), "{name}");
+        }
+        // A paste in flight finishes; dictation sessions and idle ignore it.
+        let builders: Vec<Builder> = vec![
+            ("delivering bundle", || delivering_bundle(1)),
+            ("idle", Harness::new),
+            ("idle with notice", idle_with_notice),
+            ("recording", || recording(RecordMode::Toggle)),
+            ("cancel from recording", || {
+                cancel_rec(RecordMode::Toggle, 1_000)
+            }),
+            ("transcribing", || transcribing(1_000)),
+            ("cancel from transcribing", cancel_tx),
+            ("delivering", delivering),
+        ];
+        for (name, build) in builders {
+            let mut h = build();
+            let before = h.state().clone();
+            assert!(h.step(Event::AnnotationsDisabled).is_empty(), "{name}");
+            assert_eq!(h.state(), &before, "{name}");
+        }
+    }
+
+    #[test]
     fn annotation_notice_durations() {
         for outcome in [
             DeliveryOutcome::Pasted,
@@ -3788,7 +3914,7 @@ mod tests {
                 SessionId(rng.below(6))
             }
         };
-        let event = match rng.below(17) {
+        let event = match rng.below(18) {
             0 => Event::HotkeyDown {
                 mode: rng.pick(&[RecordMode::Toggle, RecordMode::PushToTalk]),
             },
@@ -3821,6 +3947,7 @@ mod tests {
                     }
                 },
             },
+            17 => Event::AnnotationsDisabled,
             5 | 6 => {
                 // The earliest armed timer, fired at its due time.
                 let (id, _) = *h.timers.iter().min_by_key(|(_, due)| *due)?;

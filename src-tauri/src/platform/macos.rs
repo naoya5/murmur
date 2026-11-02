@@ -142,6 +142,13 @@ pub fn screen_recording_granted() -> bool {
     core_graphics::access::ScreenCaptureAccess.preflight()
 }
 
+/// Shows the system Screen Recording prompt the first time (later calls only return the state)
+/// and registers the app in the Screen Recording list. Returns at once; macOS may ask for a
+/// restart after the user allows it. Called right before an annotation recording (G8).
+pub fn request_screen_recording() -> bool {
+    core_graphics::access::ScreenCaptureAccess.request()
+}
+
 /// Whether some app has enabled secure event input (a password field has focus). While it is
 /// on, synthesized key events are dropped, so pasting with Cmd+V would silently do nothing.
 pub fn secure_input_enabled() -> bool {

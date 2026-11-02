@@ -1,8 +1,9 @@
 //! Adapter: hotkeys, on top of `tauri-plugin-global-shortcut`.
 //!
-//! Registers the main hotkey, an optional alternate hotkey and plain Esc. Press and release are
-//! reported separately so push-to-talk can work. The plugin itself must be added to the Tauri
-//! builder in `lib.rs`.
+//! Registers the main hotkey, an optional alternate hotkey, the annotations hotkey (only while
+//! that feature is on) and plain Esc. Press and release are reported separately so push-to-talk
+//! can work. The three configurable keys must differ; each setter refuses a clash with the other
+//! two. The plugin itself must be added to the Tauri builder in `lib.rs`.
 
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -16,6 +17,8 @@ pub enum HotkeyEvent {
     MainUp,
     AlternateDown,
     AlternateUp,
+    /// The annotations hotkey went down (press to start, press again to stop; no release event).
+    Annotations,
     Esc,
 }
 
@@ -35,6 +38,7 @@ type Callback = Arc<dyn Fn(HotkeyEvent) + Send + Sync>;
 struct State {
     main: Option<Shortcut>,
     alternate: Option<Shortcut>,
+    annotations: Option<Shortcut>,
     esc: bool,
     /// While suspended, nothing is registered with the system; `resume` restores it all.
     suspended: bool,
@@ -111,7 +115,7 @@ impl Hotkeys {
     pub fn set_main(&self, accelerator: &str) -> Result<(), HotkeyError> {
         let new = parse_accelerator(accelerator)?;
         let mut state = self.lock();
-        if state.alternate == Some(new) {
+        if state.alternate == Some(new) || state.annotations == Some(new) {
             return Err(HotkeyError::Conflict);
         }
         if state.main == Some(new) {
@@ -131,7 +135,7 @@ impl Hotkeys {
     pub fn set_alternate(&self, accelerator: Option<&str>) -> Result<(), HotkeyError> {
         let new = accelerator.map(parse_accelerator).transpose()?;
         let mut state = self.lock();
-        if new.is_some() && new == state.main {
+        if new.is_some() && (new == state.main || new == state.annotations) {
             return Err(HotkeyError::Conflict);
         }
         if new == state.alternate {
@@ -150,6 +154,29 @@ impl Hotkeys {
             }
         }
         state.alternate = new;
+        Ok(())
+    }
+
+    /// Set or clear the annotations hotkey (cleared while the feature is off). On failure the
+    /// old one stays registered.
+    pub fn set_annotations(&self, accelerator: Option<&str>) -> Result<(), HotkeyError> {
+        let new = accelerator.map(parse_accelerator).transpose()?;
+        let mut state = self.lock();
+        if new.is_some() && (new == state.main || new == state.alternate) {
+            return Err(HotkeyError::Conflict);
+        }
+        if new == state.annotations {
+            return Ok(());
+        }
+        if !state.suspended {
+            if let Some(new) = new {
+                self.register(new, HotkeyEvent::Annotations, None)?;
+            }
+            if let Some(old) = state.annotations {
+                self.unregister(old);
+            }
+        }
+        state.annotations = new;
         Ok(())
     }
 
@@ -208,6 +235,9 @@ impl Hotkeys {
                 HotkeyEvent::AlternateDown,
                 Some(HotkeyEvent::AlternateUp),
             ));
+        }
+        if let Some(annotations) = state.annotations {
+            note(self.register(annotations, HotkeyEvent::Annotations, None));
         }
         if state.esc {
             note(self.register(esc_shortcut(), HotkeyEvent::Esc, None));
