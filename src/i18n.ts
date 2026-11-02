@@ -6,7 +6,14 @@
 //        `src/pill/Pill.tsx`, which pick the language from the settings.
 
 import { createContext, useContext } from "react";
-import type { CaptureError, CopyReason, FailureKind, Language, UiLanguage } from "./ipc";
+import type {
+  AnnotationsRefusal,
+  CaptureError,
+  CopyReason,
+  FailureKind,
+  Language,
+  UiLanguage,
+} from "./ipc";
 
 export type Locale = "en" | "ja";
 
@@ -255,6 +262,25 @@ const en = {
       save: "The settings could not be saved",
     },
     saveFailed: "Could not save",
+    experimental: {
+      title: "Experimental",
+      badge: "Preview",
+      toggle: "Screen annotations",
+      toggleHint:
+        "Talk while you show your screen. Murmur pastes a few pictures and your words into the app in front.",
+      storageNote:
+        "Pictures of your screen are kept on this Mac for the number of days set here. The AI app you paste into receives them. While recording, ⇧ + click does not reach other apps.",
+      hotkey: "Annotation hotkey",
+      hotkeyHint: "Press it to start, press again to stop and paste.",
+      permission: "Screen Recording",
+      permissionHint: "Lets Murmur take pictures of your screen while you record.",
+      retention: "Keep pictures",
+      retentionHint: "Older ones are deleted on their own.",
+      openFolder: "Open folder",
+      folderLabel: "Saved annotations",
+      folderHint: "Pictures and notes of each recording.",
+      folderMissing: "Nothing is saved yet. The folder appears after your first annotation.",
+    },
   },
   hotkey: {
     pressKeys: "Press keys",
@@ -322,6 +348,25 @@ const en = {
       open_timeout: "Microphone did not respond",
       device_error: "Microphone error",
     } satisfies Record<CaptureError, string>,
+    annotation: {
+      screen: "Screen",
+      hint: "Hold ⇧ and drag to draw",
+      screenLost: "Screen capture stopped",
+      pastedWithImages: (n: number) =>
+        n === 1 ? "Pasted 1 image and your words" : `Pasted ${n} images and your words`,
+      copiedWithImages: (n: number) =>
+        n === 1 ? "Copied 1 image and your words" : `Copied ${n} images and your words`,
+      pastedWordsOnly: "Pasted your words only",
+      copiedWordsOnly: "Copied your words only",
+      imagesInFolder: "Images are in the history folder",
+      pressPaste: "Press ⌘V",
+      secureField: "Secure field",
+      empty: "Nothing was recorded",
+      refused: {
+        screen_recording_denied: "Screen Recording permission needed",
+        microphone_denied: "Allow the microphone in Settings",
+      } satisfies Record<AnnotationsRefusal, string>,
+    },
   },
   units: {
     hours: "h",
@@ -576,6 +621,25 @@ const ja: Strings = {
       save: "設定を保存できませんでした",
     },
     saveFailed: "保存できません",
+    experimental: {
+      title: "実験的な機能",
+      badge: "実験中",
+      toggle: "画面アノテーション",
+      toggleHint: "画面を見せながら話すと、数枚の画像と話した内容を、前面のアプリに貼り付けます。",
+      storageNote:
+        "画面の画像は、ここで決めた日数のあいだ、この Mac の中に保存されます。貼り付け先の AI アプリには画像が渡ります。録画中は、⇧ + クリックがほかのアプリに届きません。",
+      hotkey: "アノテーションのホットキー",
+      hotkeyHint: "押すと始まり、もう一度押すと止めて貼り付けます。",
+      permission: "画面収録",
+      permissionHint: "録画中に、画面の画像を撮るために必要です。",
+      retention: "画像の保存期間",
+      retentionHint: "古いものは自動で削除されます。",
+      openFolder: "フォルダを開く",
+      folderLabel: "保存先のフォルダ",
+      folderHint: "録画ごとの画像と文が入っています。",
+      folderMissing:
+        "まだ保存されたものがありません。最初のアノテーションのあとにフォルダができます。",
+    },
   },
   hotkey: {
     pressKeys: "キーを押す",
@@ -642,6 +706,23 @@ const ja: Strings = {
       no_device: "マイクが見つかりません",
       open_timeout: "マイクが応答しません",
       device_error: "マイクのエラー",
+    },
+    annotation: {
+      screen: "画面",
+      hint: "⇧ を押しながらドラッグで描けます",
+      screenLost: "画面の取得が止まりました",
+      pastedWithImages: (n: number) => `画像 ${n} 枚と説明を貼り付けました`,
+      copiedWithImages: (n: number) => `画像 ${n} 枚と説明をコピーしました`,
+      pastedWordsOnly: "説明だけ貼り付けました",
+      copiedWordsOnly: "説明だけコピーしました",
+      imagesInFolder: "画像は履歴のフォルダにあります",
+      pressPaste: "⌘V で貼り付け",
+      secureField: "保護された入力欄",
+      empty: "記録されたものがありません",
+      refused: {
+        screen_recording_denied: "画面収録の許可が必要です",
+        microphone_denied: "設定でマイクを許可してください",
+      },
     },
   },
   units: {

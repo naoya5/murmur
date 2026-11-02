@@ -5,13 +5,19 @@
 // Drive it from the URL or the console:
 //   index.html?view=history&empty=1&onboarding=1&lang=ja&update=available|banner|error|installfail
 //   pill.html?state=recording|cancel|transcribing|delivering|pasted|copied|nospeech|failed|capture
+//   pill.html?state=shot|shot-hint|shot-lost|shot-busy|shot-pasted|shot-copied|shot-secure|
+//             shot-textonly|shot-textonly-copied|shot-empty|shot-denied|shot-mic
+//   overlay.html (draw with the mouse; ?shown=0 starts hidden)
+//   index.html?view=settings#recording&annotations=1|nofolder|nopermission|hotkeyclash
 //   window.__murmurMock.pill("copied"), .cycle(), .failDownloads(true)
 import { emit } from "@tauri-apps/api/event";
 import { mockIPC } from "@tauri-apps/api/mocks";
 import type {
+  AnnotationPill,
   AppInfo,
   Dashboard,
   DayPoint,
+  DeliveryOutcome,
   DictionaryEntry,
   HistoryPage,
   InputDevice,
@@ -30,6 +36,7 @@ export const MOCK_SENTINEL = "murmur-dev-mock-fixture-7f3a";
 
 const params = new URLSearchParams(window.location.search);
 const isPill = window.location.pathname.endsWith("pill.html");
+const isOverlay = window.location.pathname.endsWith("overlay.html");
 
 // ---------- Fixtures ----------
 
@@ -74,7 +81,7 @@ let settings: Settings = {
   unload_model_after_min: null,
   alternate_language_hotkey: null,
   onboarding_completed: !params.has("onboarding"),
-  annotations_enabled: false,
+  annotations_enabled: params.has("annotations"),
   annotations_hotkey: "Option+Shift+KeyS",
   annotations_retention_days: 7,
 };
@@ -336,6 +343,16 @@ const permissions: Permissions = {
   accessibility: !params.has("onboarding"),
 };
 
+/** The permissions as the backend reports them: Screen Recording only while the feature is on. */
+function currentPermissions(): Permissions {
+  return {
+    ...permissions,
+    screen_recording: settings.annotations_enabled
+      ? params.get("annotations") !== "nopermission"
+      : null,
+  };
+}
+
 const devices: InputDevice[] = [
   { name: "MacBook Pro Microphone", is_default: true },
   { name: "AirPods Pro", is_default: false },
@@ -383,13 +400,60 @@ function pillViewFor(name: string): PillView {
       return { kind: "notice", notice: { kind: "failed", failure: "timeout" } };
     case "capture":
       return { kind: "notice", notice: { kind: "capture_failed", error: "permission_denied" } };
+    case "shot":
+    case "shot-hint":
+    case "shot-lost":
+    case "shot-busy":
+      return name === "shot-busy"
+        ? { kind: "transcribing" }
+        : { kind: "recording", elapsed_ms: name === "shot-hint" ? 800 : 12_400, mode: "toggle" };
+    case "shot-pasted":
+      return annotationNotice({ kind: "pasted" }, 3);
+    case "shot-copied":
+      return annotationNotice({ kind: "copied", reason: "no_accessibility" }, 3);
+    case "shot-secure":
+      return annotationNotice({ kind: "copied", reason: "secure_input" }, 1);
+    case "shot-textonly":
+      return annotationNotice({ kind: "pasted" }, 0);
+    case "shot-textonly-copied":
+      return annotationNotice({ kind: "copied", reason: "auto_paste_off" }, 0);
+    case "shot-empty":
+      return { kind: "notice", notice: { kind: "annotation_empty" } };
+    case "shot-denied":
+      return {
+        kind: "notice",
+        notice: { kind: "annotations_refused", reason: "screen_recording_denied" },
+      };
+    case "shot-mic":
+      return {
+        kind: "notice",
+        notice: { kind: "annotations_refused", reason: "microphone_denied" },
+      };
     default:
       return { kind: "hidden" };
   }
 }
 
-function setPill(view: PillView): void {
-  pill = { view, language: settings.language };
+function annotationNotice(outcome: DeliveryOutcome, images: number): PillView {
+  return { kind: "notice", notice: { kind: "annotation_delivered", outcome, images } };
+}
+
+/** The annotation part of the pill for a mock state name; null for dictation states. */
+function annotationFor(name: string): AnnotationPill | null {
+  if (!name.startsWith("shot")) {
+    return null;
+  }
+  if (name === "shot-hint") {
+    return { images: 1, screen_lost: false };
+  }
+  if (name === "shot-lost") {
+    return { images: 4, screen_lost: true };
+  }
+  return { images: name === "shot-busy" ? 5 : 3, screen_lost: false };
+}
+
+function setPill(view: PillView, annotation: AnnotationPill | null = null): void {
+  pill = { view, language: settings.language, annotation };
   void emit("pill-state", pill);
   window.clearInterval(levelTimer);
   if (view.kind === "recording") {
@@ -525,6 +589,17 @@ mockIPC(
         if (next.hotkey === "Cmd+Space") {
           throw { kind: "hotkey", message: "Cmd+Space is taken by Spotlight" };
         }
+        if (
+          next.annotations_enabled &&
+          (next.annotations_hotkey === next.hotkey ||
+            next.annotations_hotkey === next.alternate_language_hotkey ||
+            params.get("annotations") === "hotkeyclash")
+        ) {
+          throw {
+            kind: "invalid",
+            message: "the annotation hotkey is already used by dictation",
+          };
+        }
         saveSettings(next);
         return settings;
       }
@@ -594,7 +669,7 @@ mockIPC(
         return null;
       case "get_permissions":
         // A fresh object, as the real IPC deserializes one each call.
-        return { ...permissions };
+        return currentPermissions();
       case "request_microphone":
         permissions.microphone = "Granted";
         return permissions.microphone;
@@ -605,6 +680,13 @@ mockIPC(
         return null;
       case "open_privacy_pane":
       case "open_url":
+        return null;
+      case "submit_ink_stroke":
+        return null;
+      case "open_annotations_folder":
+        if (params.get("annotations") === "nofolder") {
+          throw { kind: "annotations", message: "the folder does not exist yet" };
+        }
         return null;
       case "suspend_hotkeys":
       case "resume_hotkeys":
@@ -632,7 +714,10 @@ mockIPC(
         }
         return null;
       case "pill_clicked":
-        setPill(pillViewFor(pill.view.kind === "recording" ? "transcribing" : "hidden"));
+        setPill(
+          pillViewFor(pill.view.kind === "recording" ? "transcribing" : "hidden"),
+          pill.annotation ?? null,
+        );
         return null;
       case "set_pill_width": {
         const root = document.getElementById("root");
@@ -652,13 +737,16 @@ mockIPC(
 
 // ---------- Page dressing and console handles ----------
 
-document.documentElement.classList.add("mock", isPill ? "mock-pill" : "mock-main");
+document.documentElement.classList.add(
+  "mock",
+  isPill ? "mock-pill" : isOverlay ? "mock-overlay" : "mock-main",
+);
 
-if (!isPill && params.get("update") === "banner") {
+if (!isPill && !isOverlay && params.get("update") === "banner") {
   window.setTimeout(() => void emit("update-available", { info: updateInfo }), 1200);
 }
 
-if (!isPill && params.has("view")) {
+if (!isPill && !isOverlay && params.has("view")) {
   window.setTimeout(() => void emit("navigate", { view: params.get("view") ?? "home" }), 150);
 }
 
@@ -668,15 +756,23 @@ if (isPill) {
     if (params.has("cycle")) {
       cycle();
     } else if (state) {
-      setPill(pillViewFor(state));
+      setPill(pillViewFor(state), annotationFor(state));
     }
   }, 50);
+}
+
+if (isOverlay && params.get("shown") !== "0") {
+  window.setTimeout(
+    () => void emit("overlay-state", { kind: "shown", recording_started_ms: Date.now() }),
+    50,
+  );
 }
 
 declare global {
   interface Window {
     __murmurMock?: {
       pill: (name: string) => void;
+      overlay: (shown: boolean) => void;
       cycle: () => void;
       failDownloads: (on: boolean) => void;
       navigate: (view: string) => void;
@@ -685,7 +781,12 @@ declare global {
 }
 
 window.__murmurMock = {
-  pill: (name) => setPill(pillViewFor(name)),
+  pill: (name) => setPill(pillViewFor(name), annotationFor(name)),
+  overlay: (shown) =>
+    void emit(
+      "overlay-state",
+      shown ? { kind: "shown", recording_started_ms: Date.now() } : { kind: "hidden" },
+    ),
   cycle,
   failDownloads: (on) => {
     failDownloads = on;
