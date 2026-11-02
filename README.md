@@ -62,6 +62,7 @@ End-to-end tests drive the real debug app with a WAV file as the microphone and 
 
 ```sh
 MURMUR_TEST_MODELS=~/.murmur-dev-models scripts/e2e.sh            # dictation, Esc, crash recovery, failures
+MURMUR_TEST_MODELS=~/.murmur-dev-models scripts/e2e.sh annotations # experimental screen annotations (generated PNG screen, scripted pointer)
 MURMUR_TEST_MODELS=~/.murmur-dev-models cargo test -p murmur with_models -- --ignored --test-threads=1
 ```
 
