@@ -1479,10 +1479,16 @@ impl Controller {
             .map_or_else(|| annotation.clock.recording_now(), |m| m.duration_ms);
         let words = annotation.words.unwrap_or(ComposeWords::Transcribed);
         let sheet_text = sheet.as_ref().map(|p| p.to_string_lossy().into_owned());
+        let frame_count = if sheet.is_some() {
+            annotation.rendered.as_ref().map_or(0, |r| r.frames.len())
+        } else {
+            0
+        };
         let text = ann_session::summary_text(
             ctx.language,
             duration_ms,
             sheet_text.as_deref(),
+            frame_count,
             target,
             &planned,
             &annotation.chunks,
@@ -1578,6 +1584,7 @@ impl Controller {
                 ctx.language,
                 duration_ms,
                 None,
+                0,
                 ann::PasteTarget::Other,
                 &planned,
                 &annotation.chunks,

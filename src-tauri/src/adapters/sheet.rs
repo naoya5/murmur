@@ -10,7 +10,7 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use murmur_core::annotations::{Mark, Point, ink_label};
+use murmur_core::annotations::{Mark, Point};
 use objc2_core_foundation::{
     CFAttributedString, CFDictionary, CFRetained, CFString, CFType, CGFloat, CGPoint, CGRect,
     CGSize,
@@ -26,6 +26,12 @@ pub const LONG_EDGE_PX: f64 = 1568.0;
 pub const GUTTER_PX: f64 = 8.0;
 /// Height of the `#n` chip text on the sheet (smaller was not readable to the models).
 pub const CHIP_PX: f64 = 24.0;
+/// Horizontal padding inside a `#n` chip.
+const CHIP_PAD_PX: f64 = 9.0;
+/// The badge with a stroke's number: a filled circle in the stroke colour with a white digit.
+/// 28 px: the models could not read Hex's 20 px chips, so the badge stays well above that.
+pub const BADGE_PX: f64 = 28.0;
+const BADGE_FONT_PX: f64 = 18.0;
 /// Colour of an ink stroke: `--ink-stroke` in `src/styles.css` (a test keeps them equal).
 pub const INK_STROKE_RGB: (f64, f64, f64) = (1.0, 59.0 / 255.0, 48.0 / 255.0);
 /// Outer edge of a stroke, so it reads on dark screens too: `--ink-stroke-edge`.
@@ -143,7 +149,7 @@ pub fn render(frames: &[FrameInput<'_>], out_dir: &Path) -> Result<Rendered, She
             &format!("#{}", frame.n),
             &fonts.chip,
             CGPoint::new(tile.x + GUTTER_PX, tile.y + GUTTER_PX),
-            5.0,
+            CHIP_PAD_PX,
         );
         let bitmap = canvas.into_bitmap();
         draw_ms += t.elapsed().as_millis() as u64;
@@ -176,7 +182,7 @@ pub fn render(frames: &[FrameInput<'_>], out_dir: &Path) -> Result<Rendered, She
             &format!("#{}", frame.n),
             &fonts.chip,
             CGPoint::new(tile.x + 6.0, tile.y + 6.0),
-            5.0,
+            CHIP_PAD_PX,
         );
     }
     let sheet = canvas.into_bitmap();
@@ -209,14 +215,14 @@ fn ensure_folder(path: &Path) -> Result<(), SheetError> {
 
 struct Fonts {
     chip: CFRetained<CTFont>,
-    label: CFRetained<CTFont>,
+    badge: CFRetained<CTFont>,
 }
 
 impl Fonts {
     fn load() -> Fonts {
         Fonts {
             chip: font("HelveticaNeue-Bold", CHIP_PX),
-            label: font("HiraginoSans-W6", CHIP_PX),
+            badge: font("HelveticaNeue-Bold", BADGE_FONT_PX),
         }
     }
 }
@@ -247,7 +253,7 @@ fn draw_marks(canvas: &Canvas, tile: Tile, marks: &[Mark], fonts: &Fonts, scale:
         match mark {
             Mark::Ink { label, points, .. } => {
                 let pts: Vec<CGPoint> = points.iter().map(|p| at(tile, *p)).collect();
-                draw_ink(ctx, &pts, &ink_label(*label), &fonts.label, scale);
+                draw_ink(ctx, &pts, *label, &fonts.badge, scale);
             }
             Mark::Click { at: p, .. } => {
                 draw_ring(ctx, at(tile, *p), CLICK_RADIUS * scale, false, scale);
@@ -259,8 +265,8 @@ fn draw_marks(canvas: &Canvas, tile: Tile, marks: &[Mark], fonts: &Fonts, scale:
     }
 }
 
-/// A stroke: a white edge under a red core, round joins, and its circled number at the end.
-fn draw_ink(ctx: &CGContext, points: &[CGPoint], label: &str, font: &CTFont, scale: f64) {
+/// A stroke: a white edge under a red core, round joins, and its number badge at the end.
+fn draw_ink(ctx: &CGContext, points: &[CGPoint], label: u32, font: &CTFont, scale: f64) {
     let Some(first) = points.first() else {
         return;
     };
@@ -285,13 +291,57 @@ fn draw_ink(ctx: &CGContext, points: &[CGPoint], label: &str, font: &CTFont, sca
         CGContext::stroke_path(Some(ctx));
     }
     let end = points.last().unwrap_or(first);
-    draw_chip(
+    draw_badge(
         ctx,
-        label,
+        &label.to_string(),
         font,
-        CGPoint::new(end.x + 6.0 * scale, end.y - 30.0 * scale),
-        3.0,
+        CGPoint::new(end.x + 18.0 * scale.max(0.6), end.y - 18.0 * scale.max(0.6)),
     );
+}
+
+/// A filled circle in the stroke colour, a thin white edge, and a white bold number inside.
+fn draw_badge(ctx: &CGContext, text: &str, font: &CTFont, center: CGPoint) {
+    let (r, g, b) = INK_STROKE_RGB;
+    let radius = BADGE_PX / 2.0;
+    let rect = CGRect::new(
+        CGPoint::new(center.x - radius, center.y - radius),
+        CGSize::new(BADGE_PX, BADGE_PX),
+    );
+    CGContext::set_rgb_fill_color(Some(ctx), r, g, b, 1.0);
+    CGContext::fill_ellipse_in_rect(Some(ctx), rect);
+    CGContext::set_line_width(Some(ctx), 1.5);
+    CGContext::set_rgb_stroke_color(Some(ctx), 1.0, 1.0, 1.0, 0.95);
+    CGContext::stroke_ellipse_in_rect(Some(ctx), rect);
+    let white = color(1.0, 1.0, 1.0, 1.0);
+    // SAFETY: the attribute keys are immortal CoreText constants; the values live for the call.
+    let line = unsafe {
+        let attrs: CFRetained<CFDictionary<CFString, CFType>> = CFDictionary::from_slices(
+            &[kCTFontAttributeName, kCTForegroundColorAttributeName],
+            &[font.as_ref(), white.as_ref()],
+        );
+        let string = CFString::from_str(text);
+        let Some(attributed) =
+            CFAttributedString::new(None, Some(&string), Some(attrs.as_opaque()))
+        else {
+            return;
+        };
+        CTLine::with_attributed_string(&attributed)
+    };
+    let (mut ascent, mut descent, mut leading) = (0.0, 0.0, 0.0);
+    // SAFETY: the out-pointers are valid for the call.
+    let width =
+        unsafe { CTLine::typographic_bounds(&line, &mut ascent, &mut descent, &mut leading) };
+    CGContext::save_g_state(Some(ctx));
+    CGContext::translate_ctm(
+        Some(ctx),
+        center.x - width / 2.0,
+        center.y + (ascent - descent) / 2.0,
+    );
+    CGContext::scale_ctm(Some(ctx), 1.0, -1.0);
+    CGContext::set_text_position(Some(ctx), 0.0, 0.0);
+    // SAFETY: the line and the context are valid.
+    unsafe { CTLine::draw(&line, ctx) };
+    CGContext::restore_g_state(Some(ctx));
 }
 
 /// Click: a translucent ring with a centre dot. Dwell: a dotted ring.

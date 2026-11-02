@@ -80,7 +80,9 @@ done
 for model in Haas-616M-ja-v1.0-Q8_0.gguf parakeet-tdt-0.6B-v3-Q8_0.gguf silero-vad-309K-v6.2-F32.gguf; do
   [ -f "$MODELS/$model" ] || die "missing model $MODELS/$model (set MURMUR_TEST_MODELS)"
 done
-SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/murmur-e2e.XXXXXX")" || die "mktemp failed"
+TMP_ROOT="${TMPDIR:-/tmp}"
+TMP_ROOT="${TMP_ROOT%/}" # a trailing slash would show up twice in every path
+SCRATCH="$(mktemp -d "$TMP_ROOT/murmur-e2e.XXXXXX")" || die "mktemp failed"
 DATA="$SCRATCH/data"
 mkdir -p "$DATA/models"
 CLIP_SAVE="$SCRATCH/clipboard.saved"
@@ -774,13 +776,17 @@ events = [
 events += [{"kind": "cursor", "t_ms": 3000 + i * 100, "at": [0.6, 0.6]} for i in range(10)]
 with open(os.path.join(root, "marks.json"), "w", encoding="utf-8") as f:
     json.dump({"events": events}, f)
+# No marks, but still a script: the real pointer monitor stays off and the app name is fixed,
+# so a person at the Mac cannot change a result.
+with open(os.path.join(root, "noop.json"), "w", encoding="utf-8") as f:
+    json.dump({"events": [{"kind": "app", "t_ms": 0, "name": "E2E App"}]}, f)
 PY
 }
 
-annot_env() { # <png-dir|missing> [script]
+annot_env() { # <png-dir|missing> [script]   (no script: the no-op one, never the real pointer)
   export E2E_ANNOTATIONS=1 MURMUR_DEBUG_HOTKEY=annotations
   export MURMUR_DEBUG_SCREEN="png-dir:$1"
-  if [ -n "${2:-}" ]; then export MURMUR_DEBUG_POINTER="$2"; else unset MURMUR_DEBUG_POINTER; fi
+  export MURMUR_DEBUG_POINTER="${2:-$ANNOT_FIX/noop.json}"
 }
 annot_unenv() { unset E2E_ANNOTATIONS MURMUR_DEBUG_HOTKEY MURMUR_DEBUG_SCREEN MURMUR_DEBUG_POINTER MURMUR_DEBUG_COMPOSE_DELAY_MS; }
 switch_off() { kill -INFO "$APP_PID"; }
@@ -877,7 +883,7 @@ case_annot() { # <name> <marks|""> <keep name|"">
   start_app ja "$FIXTURES/ja.wav" || { annot_unenv; return; }
   if annot_record "$FIXTURES/ja.wav"; then
     if [ -n "$script" ]; then
-      expect_bundle "$1" ok yes yes '①,○ クリック,◎'
+      expect_bundle "$1" ok yes yes '①,◉ クリック,◌'
     else
       expect_bundle "$1" ok yes yes
     fi
@@ -900,7 +906,7 @@ case_annot_nospeech() { # <name> <marks|""> ; silence: with marks -> a bundle wi
   start_app ja "$FIXTURES/silence.wav" || { annot_unenv; return; }
   if [ -n "$script" ]; then
     if annot_record "$FIXTURES/silence.wav"; then
-      expect_bundle "$1" ok yes no '①,○ クリック'
+      expect_bundle "$1" ok yes no '①,◉ クリック'
     fi
   else
     begin_recording || { stop_app; annot_unenv; return; }
@@ -1011,7 +1017,7 @@ case_annot_nomodel() {
   annot_env "$ANNOT_FIX/frames" "$ANNOT_FIX/marks.json"
   start_app ja "$FIXTURES/ja.wav" || { annot_unenv; fresh_data; return; }
   if annot_record "$FIXTURES/ja.wav"; then
-    expect_bundle "annot-nomodel" failed yes failed '①,○ クリック'
+    expect_bundle "annot-nomodel" failed yes failed '①,◉ クリック'
     assert_failed_row model_missing "annot-nomodel"
   fi
   no_panic

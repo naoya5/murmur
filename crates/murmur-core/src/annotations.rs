@@ -697,6 +697,8 @@ pub struct Summary<'a> {
     pub duration_ms: Millis,
     /// The contact sheet path, plain. `None` when no picture could be made (words only).
     pub sheet_path: Option<&'a str>,
+    /// How many `frames/<n>.png` exist beside the sheet (0 when there is no sheet).
+    pub frame_count: usize,
     pub target: PasteTarget,
     pub keyframes: &'a [Keyframe],
     pub marks: &'a [Mark],
@@ -732,6 +734,7 @@ struct Wording {
     image: &'static str,
     how_to_read: &'static str,
     numbers_one: &'static str,
+    numbers_two: &'static str,
     numbers_many: &'static str,
     ink: &'static str,
     click_legend: &'static str,
@@ -747,11 +750,12 @@ const JA: Wording = Wording {
     image: "画像",
     how_to_read: "読み方",
     numbers_one: "#1 は画像の番号",
+    numbers_two: "#1 と #2 は画像の番号",
     numbers_many: "#1 から #{n} は画像の番号",
     ink: "①② は手書きの印",
-    click_legend: "○ はクリックした所",
-    dwell_legend: "◎ はカーソルを止めた所",
-    click: "○ クリック",
+    click_legend: "◉ はクリックした所",
+    dwell_legend: "◌ はカーソルを止めた所",
+    click: "◉ クリック",
     failed: "(文字起こしに失敗しました)",
     originals: "元の大きさの画像",
     quote: ("「", "」"),
@@ -762,11 +766,12 @@ const EN: Wording = Wording {
     image: "Image",
     how_to_read: "How to read",
     numbers_one: "#1 is the picture number",
+    numbers_two: "#1 and #2 are the picture numbers",
     numbers_many: "#1 to #{n} are the picture numbers",
     ink: "①② are drawn marks",
-    click_legend: "○ is a click",
-    dwell_legend: "◎ is where the cursor rested",
-    click: "○ click",
+    click_legend: "◉ is a click",
+    dwell_legend: "◌ is where the cursor rested",
+    click: "◉ click",
     failed: "(transcription failed)",
     originals: "Full-size pictures",
     quote: ("\"", "\""),
@@ -805,10 +810,10 @@ pub fn summary_text(s: &Summary<'_>) -> String {
 
     // Legend, only for what the bundle contains.
     if n > 0 {
-        let mut parts: Vec<String> = vec![if n == 1 {
-            w.numbers_one.to_owned()
-        } else {
-            w.numbers_many.replace("{n}", &n.to_string())
+        let mut parts: Vec<String> = vec![match n {
+            1 => w.numbers_one.to_owned(),
+            2 => w.numbers_two.to_owned(),
+            _ => w.numbers_many.replace("{n}", &n.to_string()),
         }];
         if s.marks.iter().any(|m| matches!(m, Mark::Ink { .. })) {
             parts.push(w.ink.to_owned());
@@ -855,17 +860,24 @@ pub fn summary_text(s: &Summary<'_>) -> String {
         write_block(&mut out, &chunks, &marks, w, s.transcription_failed);
     }
 
-    if s.sheet_path.is_some() && n > 0 {
+    // The full-size pictures, as absolute paths (an agent resolves a relative path against its
+    // own folder), spelled like the sheet path.
+    if let Some(sheet) = s.sheet_path
+        && s.frame_count > 0
+    {
+        let folder = sheet.rsplit_once('/').map_or("", |(dir, _)| dir);
+        let first = path_for_paste(&format!("{folder}/frames/1.png"), s.target);
         out.push('\n');
         out.push_str(w.originals);
         out.push_str(": ");
-        match s.language {
-            Language::Ja if n == 1 => out.push_str("frames/1.png (同じフォルダ)"),
-            Language::Ja => {
-                out.push_str(&format!("frames/1.png から frames/{n}.png (同じフォルダ)"))
-            }
-            Language::En if n == 1 => out.push_str("frames/1.png (same folder)"),
-            Language::En => out.push_str(&format!("frames/1.png to frames/{n}.png (same folder)")),
+        out.push_str(&first);
+        let last = s.frame_count;
+        match (s.language, last) {
+            (_, 1) => {}
+            (Language::Ja, 2) => out.push_str(" と 2.png"),
+            (Language::Ja, _) => out.push_str(&format!(" から {last}.png")),
+            (Language::En, 2) => out.push_str(" and 2.png"),
+            (Language::En, _) => out.push_str(&format!(" to {last}.png")),
         }
         out.push('\n');
     }
@@ -924,7 +936,7 @@ fn append_marks(line: &mut String, marks: &[&Mark], w: &Wording) {
         match m {
             Mark::Ink { label, .. } => line.push_str(&ink_label(*label)),
             Mark::Click { .. } => line.push_str(w.click),
-            Mark::Dwell { .. } => line.push('◎'),
+            Mark::Dwell { .. } => line.push('◌'),
         }
     }
 }
@@ -1580,6 +1592,7 @@ mod tests {
             language: Language::Ja,
             duration_ms: 42_000,
             sheet_path: Some(SHEET),
+            frame_count: keyframes.len(),
             target: PasteTarget::Terminal,
             keyframes: &keyframes,
             marks: &marks,
@@ -1589,17 +1602,17 @@ mod tests {
         let expected = "\
 [Murmur Annotations] 画面の説明 (0:42、画像 3 枚)
 画像: /Users/me/Library/Application\\ Support/io.github.naoya5.murmur/annotations/20261102-093015-7f3c/contact-sheet.png
-読み方: #1 から #3 は画像の番号。①② は手書きの印。○ はクリックした所。◎ はカーソルを止めた所。
+読み方: #1 から #3 は画像の番号。①② は手書きの印。◉ はクリックした所。◌ はカーソルを止めた所。
 
 #1 (0:00) Safari
-「この保存ボタンを押したら、」 ○ クリック
+「この保存ボタンを押したら、」 ◉ クリック
 #2 (0:08) Safari
 「一覧の右側が欠けます。」 ①
 「こっちの行も同じです。」 ②
 #3 (0:21) Safari
-「設定の画面では問題ありません。」 ◎
+「設定の画面では問題ありません。」 ◌
 
-元の大きさの画像: frames/1.png から frames/3.png (同じフォルダ)
+元の大きさの画像: /Users/me/Library/Application\\ Support/io.github.naoya5.murmur/annotations/20261102-093015-7f3c/frames/1.png から 3.png
 ";
         assert_eq!(text, expected);
     }
@@ -1618,6 +1631,7 @@ mod tests {
             language: Language::En,
             duration_ms: 42_000,
             sheet_path: Some(SHEET),
+            frame_count: keyframes.len(),
             target: PasteTarget::Other,
             keyframes: &keyframes,
             marks: &marks,
@@ -1627,17 +1641,17 @@ mod tests {
         let expected = "\
 [Murmur Annotations] Screen notes (0:42, 3 images)
 Image: /Users/me/Library/Application Support/io.github.naoya5.murmur/annotations/20261102-093015-7f3c/contact-sheet.png
-How to read: #1 to #3 are the picture numbers. ①② are drawn marks. ○ is a click. ◎ is where the cursor rested.
+How to read: #1 to #3 are the picture numbers. ①② are drawn marks. ◉ is a click. ◌ is where the cursor rested.
 
 #1 (0:00) Safari
-\"After I press save,\" ○ click
+\"After I press save,\" ◉ click
 #2 (0:08) Safari
 \"the right side of the list is cut off.\" ①
 \"Same for this row.\" ②
 #3 (0:21) Safari
-\"The settings screen is fine.\" ◎
+\"The settings screen is fine.\" ◌
 
-Full-size pictures: frames/1.png to frames/3.png (same folder)
+Full-size pictures: /Users/me/Library/Application Support/io.github.naoya5.murmur/annotations/20261102-093015-7f3c/frames/1.png to 3.png
 ";
         assert_eq!(text, expected);
     }
@@ -1649,6 +1663,7 @@ Full-size pictures: frames/1.png to frames/3.png (same folder)
             language: Language::Ja,
             duration_ms: 5_000,
             sheet_path: Some("/tmp/sheet.png"),
+            frame_count: keyframes.len(),
             target: PasteTarget::Other,
             keyframes: &keyframes,
             marks: &[],
@@ -1657,12 +1672,13 @@ Full-size pictures: frames/1.png to frames/3.png (same folder)
         });
         assert_eq!(
             text,
-            "[Murmur Annotations] 画面の説明 (0:05、画像 1 枚)\n画像: /tmp/sheet.png\n読み方: #1 は画像の番号。\n\n#1 (0:00) Safari\n\n元の大きさの画像: frames/1.png (同じフォルダ)\n"
+            "[Murmur Annotations] 画面の説明 (0:05、画像 1 枚)\n画像: /tmp/sheet.png\n読み方: #1 は画像の番号。\n\n#1 (0:00) Safari\n\n元の大きさの画像: /tmp/frames/1.png\n"
         );
         let text = summary_text(&Summary {
             language: Language::En,
             duration_ms: 65_000,
             sheet_path: Some("/tmp/sheet.png"),
+            frame_count: keyframes.len(),
             target: PasteTarget::Other,
             keyframes: &keyframes,
             marks: &[],
@@ -1670,7 +1686,7 @@ Full-size pictures: frames/1.png to frames/3.png (same folder)
             transcription_failed: false,
         });
         assert!(text.starts_with("[Murmur Annotations] Screen notes (1:05, 1 image)\n"));
-        assert!(text.ends_with("Full-size pictures: frames/1.png (same folder)\n"));
+        assert!(text.ends_with("Full-size pictures: /tmp/frames/1.png\n"));
     }
 
     #[test]
@@ -1681,26 +1697,28 @@ Full-size pictures: frames/1.png to frames/3.png (same folder)
             language: Language::Ja,
             duration_ms: 42_000,
             sheet_path: Some("/tmp/sheet.png"),
+            frame_count: keyframes.len(),
             target: PasteTarget::Other,
             keyframes: &keyframes,
             marks: &marks,
             chunks: &[],
             transcription_failed: true,
         });
-        assert!(text.contains("#1 (0:00) Safari\n(文字起こしに失敗しました) ○ クリック\n"));
+        assert!(text.contains("#1 (0:00) Safari\n(文字起こしに失敗しました) ◉ クリック\n"));
         assert!(text.contains("#2 (0:08) Safari\n(文字起こしに失敗しました) ① ②\n"));
-        assert!(text.contains("#3 (0:21) Safari\n(文字起こしに失敗しました) ◎\n"));
+        assert!(text.contains("#3 (0:21) Safari\n(文字起こしに失敗しました) ◌\n"));
         let text = summary_text(&Summary {
             language: Language::En,
             duration_ms: 42_000,
             sheet_path: Some("/tmp/sheet.png"),
+            frame_count: keyframes.len(),
             target: PasteTarget::Other,
             keyframes: &keyframes,
             marks: &marks,
             chunks: &[],
             transcription_failed: true,
         });
-        assert!(text.contains("\n(transcription failed) ○ click\n"));
+        assert!(text.contains("\n(transcription failed) ◉ click\n"));
     }
 
     #[test]
@@ -1713,13 +1731,14 @@ Full-size pictures: frames/1.png to frames/3.png (same folder)
             language: Language::Ja,
             duration_ms: 42_000,
             sheet_path: Some("/tmp/sheet.png"),
+            frame_count: keyframes.len(),
             target: PasteTarget::Other,
             keyframes: &keyframes,
             marks: &marks,
             chunks: &chunks,
             transcription_failed: false,
         });
-        assert!(text.contains("#1 (0:00) Safari\n○ クリック\n#2 (0:08) Safari\n① ②\n#3 (0:21) Safari\n「こちらです。」 ◎\n"));
+        assert!(text.contains("#1 (0:00) Safari\n◉ クリック\n#2 (0:08) Safari\n① ②\n#3 (0:21) Safari\n「こちらです。」 ◌\n"));
     }
 
     #[test]
@@ -1730,6 +1749,7 @@ Full-size pictures: frames/1.png to frames/3.png (same folder)
             language: Language::En,
             duration_ms: 42_000,
             sheet_path: None,
+            frame_count: 0,
             target: PasteTarget::Terminal,
             keyframes: &keyframes,
             marks: &[],
@@ -1749,6 +1769,7 @@ Full-size pictures: frames/1.png to frames/3.png (same folder)
             language: Language::Ja,
             duration_ms: 4_000,
             sheet_path: None,
+            frame_count: 0,
             target: PasteTarget::Other,
             keyframes: &[],
             marks: &[],
@@ -1764,6 +1785,7 @@ Full-size pictures: frames/1.png to frames/3.png (same folder)
             language: Language::En,
             duration_ms: 4_000,
             sheet_path: None,
+            frame_count: 0,
             target: PasteTarget::Other,
             keyframes: &[],
             marks: &[],
@@ -1776,6 +1798,7 @@ Full-size pictures: frames/1.png to frames/3.png (same folder)
             language: Language::En,
             duration_ms: 4_000,
             sheet_path: None,
+            frame_count: 0,
             target: PasteTarget::Other,
             keyframes: &[],
             marks: &[],

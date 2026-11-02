@@ -408,6 +408,7 @@ pub fn compose(
         language,
         duration_ms,
         Some(&rendered.sheet.to_string_lossy()),
+        rendered.frames.len(),
         PasteTarget::Other,
         planned,
         chunks,
@@ -429,10 +430,12 @@ pub fn compose(
 }
 
 /// The text to paste: with the sheet path (plain or `\ ` form) or words only.
+#[allow(clippy::too_many_arguments)]
 pub fn summary_text(
     language: Language,
     duration_ms: u64,
     sheet_path: Option<&str>,
+    frame_count: usize,
     target: PasteTarget,
     planned: &Planned,
     chunks: &[Chunk],
@@ -442,6 +445,7 @@ pub fn summary_text(
         language,
         duration_ms,
         sheet_path,
+        frame_count,
         target,
         keyframes: &planned.selection.keyframes,
         marks: &planned.selection.marks,
