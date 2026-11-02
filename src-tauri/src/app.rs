@@ -25,6 +25,9 @@ pub struct Paths {
     pub db: PathBuf,
     pub settings: PathBuf,
     pub logs: PathBuf,
+    /// Annotation bundles (experimental). Not created at start: the folder appears with the
+    /// first bundle, and never while the feature is off.
+    pub annotations: PathBuf,
 }
 
 impl Paths {
@@ -48,6 +51,7 @@ impl Paths {
             spool: data.join("spool"),
             db: data.join("murmur.db"),
             settings: data.join("settings.json"),
+            annotations: data.join("annotations"),
             data,
             logs,
         };
@@ -79,6 +83,7 @@ impl App {
         let pill_state = PillState {
             view: PillView::Hidden,
             language: settings.language,
+            annotation: None,
         };
         App {
             paths,

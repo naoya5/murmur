@@ -18,7 +18,7 @@ use murmur_core::Language;
 use murmur_core::ports::{CancelToken, RawTranscript};
 use murmur_core::session::{
     self, CaptureError, DeliveryOutcome, Effect, Event, FailureKind, Machine, PillView, SessionId,
-    TranscribeOutcome, TranscriptText,
+    SessionKind, TranscribeOutcome, TranscriptText,
 };
 use murmur_core::text::{self, FormatOptions};
 use serde::Serialize;
@@ -50,6 +50,20 @@ const PERMISSION_PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct PillState {
     pub view: PillView,
     pub language: Language,
+    /// Present while the session is a screen annotation (absent: dictation or idle).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[specta(optional)]
+    pub annotation: Option<AnnotationPill>,
+}
+
+/// The annotation part of the pill: a camera mark, the pictures kept so far, a warning when the
+/// screen capture stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
+pub struct AnnotationPill {
+    /// Candidate pictures kept so far while recording; the keyframe count once chosen.
+    pub images: u32,
+    /// The screen capture failed; the recording goes on with the pictures taken before.
+    pub screen_lost: bool,
 }
 
 /// Audio level for the pill's waveform, about 30 per second while recording.
@@ -712,9 +726,17 @@ impl Controller {
     /// Emits the pill state and shows or hides the pill window.
     fn publish(&mut self) {
         let view = self.machine.view(self.now());
+        let annotation = (self.machine.active_kind() == Some(SessionKind::Annotation)).then(|| {
+            AnnotationPill {
+                // The picture count arrives with the screen adapter (M3).
+                images: 0,
+                screen_lost: self.machine.screen_lost(),
+            }
+        });
         let state = PillState {
             view,
             language: self.last_language,
+            annotation,
         };
         self.services.set_pill_state(state.clone());
         if let Err(error) = state.emit(&self.app) {

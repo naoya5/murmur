@@ -31,6 +31,8 @@ fn main() {
             "open_url",
             "check_for_updates",
             "install_update",
+            "submit_ink_stroke",
+            "open_annotations_folder",
         ]));
     if let Err(error) = tauri_build::try_build(attributes) {
         eprintln!("tauri build failed: {error:#}");

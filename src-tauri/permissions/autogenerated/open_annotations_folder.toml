@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-open-annotations-folder"
+description = "Enables the open_annotations_folder command without any pre-configured scope."
+commands.allow = ["open_annotations_folder"]
+
+[[permission]]
+identifier = "deny-open-annotations-folder"
+description = "Denies the open_annotations_folder command without any pre-configured scope."
+commands.deny = ["open_annotations_folder"]

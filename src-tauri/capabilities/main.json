@@ -32,6 +32,7 @@
     "allow-toggle-recording",
     "allow-open-url",
     "allow-check-for-updates",
-    "allow-install-update"
+    "allow-install-update",
+    "allow-open-annotations-folder"
   ]
 }

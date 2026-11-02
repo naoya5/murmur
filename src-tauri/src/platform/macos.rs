@@ -29,6 +29,7 @@ pub enum Permission {
 pub enum PrivacyPane {
     Microphone,
     Accessibility,
+    ScreenCapture,
 }
 
 impl PrivacyPane {
@@ -39,6 +40,9 @@ impl PrivacyPane {
             }
             PrivacyPane::Accessibility => {
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+            }
+            PrivacyPane::ScreenCapture => {
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
             }
         }
     }
@@ -132,6 +136,12 @@ pub fn request_accessibility() {
     }
 }
 
+/// Whether this process may record the screen (annotations). Never prompts, and does not add the
+/// app to the Screen Recording list.
+pub fn screen_recording_granted() -> bool {
+    core_graphics::access::ScreenCaptureAccess.preflight()
+}
+
 /// Whether some app has enabled secure event input (a password field has focus). While it is
 /// on, synthesized key events are dropped, so pasting with Cmd+V would silently do nothing.
 pub fn secure_input_enabled() -> bool {
@@ -152,7 +162,11 @@ mod tests {
 
     #[test]
     fn privacy_urls_point_to_the_security_pane() {
-        for pane in [PrivacyPane::Microphone, PrivacyPane::Accessibility] {
+        for pane in [
+            PrivacyPane::Microphone,
+            PrivacyPane::Accessibility,
+            PrivacyPane::ScreenCapture,
+        ] {
             assert!(
                 pane.url().starts_with(
                     "x-apple.systempreferences:com.apple.preference.security?Privacy_"
@@ -167,5 +181,6 @@ mod tests {
         let _ = microphone_permission();
         let _ = accessibility_trusted();
         let _ = secure_input_enabled();
+        let _ = screen_recording_granted();
     }
 }

@@ -63,11 +63,17 @@ pub const COMMANDS: &[&str] = &[
     "open_url",
     "check_for_updates",
     "install_update",
+    "submit_ink_stroke",
+    "open_annotations_folder",
 ];
 
 /// Commands the pill window may call (its capability lists exactly these).
 #[cfg(test)]
 pub const PILL_COMMANDS: &[&str] = &["pill_clicked", "set_pill_width", "get_pill_state"];
+
+/// Commands the annotations drawing layer may call (its capability lists exactly these).
+#[cfg(test)]
+pub const OVERLAY_COMMANDS: &[&str] = &["submit_ink_stroke"];
 
 type Services<'a> = State<'a, Arc<App>>;
 
@@ -93,6 +99,8 @@ pub enum IpcError {
     Hotkey(String),
     #[error("this link cannot be opened: {0}")]
     Url(String),
+    #[error("annotations: {0}")]
+    Annotations(String),
 }
 
 fn store_err(error: impl std::fmt::Display) -> IpcError {
@@ -339,15 +347,24 @@ pub fn delete_model(app: AppHandle, services: Services<'_>, id: String) -> Resul
 pub struct Permissions {
     pub microphone: Permission,
     pub accessibility: bool,
+    /// Screen Recording, for the annotations. Absent while the feature is off: nothing of the
+    /// feature runs then, not even this check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[specta(optional)]
+    pub screen_recording: Option<bool>,
 }
 
 /// Uses the same permission functions as recording and pasting (G8).
 #[tauri::command]
 #[specta::specta]
-pub fn get_permissions() -> Permissions {
+pub fn get_permissions(services: Services<'_>) -> Permissions {
     Permissions {
         microphone: macos::microphone_permission(),
         accessibility: macos::accessibility_trusted(),
+        screen_recording: services
+            .settings()
+            .annotations_enabled
+            .then(macos::screen_recording_granted),
     }
 }
 
@@ -490,6 +507,53 @@ pub struct Navigate {
     pub view: String,
 }
 
+// --- annotations (experimental) ---
+
+/// A point of an ink stroke, as a share of the overlay window's width and height (0 to 1). The
+/// overlay covers the recorded display exactly, so these are also shares of the display.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Type)]
+pub struct InkPoint {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// Tells the drawing layer when to accept strokes. Times are epoch milliseconds (`Date.now()`),
+/// the one clock the webview and the backend share; the backend converts them to recording time.
+#[derive(Debug, Clone, Copy, Serialize, Type, tauri_specta::Event)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[allow(dead_code)] // emitted by the controller from the platform milestone on
+pub enum OverlayState {
+    /// An annotation recording runs: show the hint, draw strokes, send each one when it ends.
+    Shown { recording_started_ms: f64 },
+    /// The recording stopped or was cancelled: clear the canvas, accept nothing.
+    Hidden,
+}
+
+/// One finished stroke from the drawing layer. `started_ms` and `ended_ms` are epoch
+/// milliseconds, as in `OverlayState::Shown`. Only the overlay window may call this.
+#[tauri::command]
+#[specta::specta]
+pub fn submit_ink_stroke(points: Vec<InkPoint>, started_ms: f64, ended_ms: f64) {
+    // Wired to the controller with the platform milestone; until then strokes are dropped.
+    let _ = (points, started_ms, ended_ms);
+}
+
+/// Opens the annotations folder in the Finder. The folder is created by the first bundle, never
+/// here (while the feature is off nothing of it exists on disk).
+#[tauri::command]
+#[specta::specta]
+pub fn open_annotations_folder(services: Services<'_>) -> Result<(), IpcError> {
+    let folder = services.paths().annotations.clone();
+    if !folder.is_dir() {
+        return Err(IpcError::Annotations("no annotations yet".to_owned()));
+    }
+    std::process::Command::new("/usr/bin/open")
+        .arg(&folder)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| IpcError::Annotations(e.to_string()))
+}
+
 /// The one specta builder: all commands and events.
 pub fn builder() -> Builder<Wry> {
     Builder::<Wry>::new()
@@ -522,6 +586,8 @@ pub fn builder() -> Builder<Wry> {
             open_url,
             check_for_updates,
             install_update,
+            submit_ink_stroke,
+            open_annotations_folder,
         ])
         .events(collect_events![
             PillState,
@@ -531,7 +597,8 @@ pub fn builder() -> Builder<Wry> {
             ModelProgress,
             ModelsChanged,
             Navigate,
-            UpdateAvailable
+            UpdateAvailable,
+            OverlayState
         ])
 }
 
@@ -568,26 +635,34 @@ mod tests {
         let build = std::fs::read_to_string(format!("{root}/build.rs")).unwrap();
         let main_cap = std::fs::read_to_string(format!("{root}/capabilities/main.json")).unwrap();
         let pill_cap = std::fs::read_to_string(format!("{root}/capabilities/pill.json")).unwrap();
+        let overlay_cap =
+            std::fs::read_to_string(format!("{root}/capabilities/overlay.json")).unwrap();
         for command in COMMANDS {
             assert!(
                 build.contains(&format!("\"{command}\"")),
                 "{command} missing in build.rs"
             );
             let permission = format!("allow-{}", command.replace('_', "-"));
-            if PILL_COMMANDS.contains(command) {
-                assert!(
-                    pill_cap.contains(&permission),
-                    "{permission} missing in pill.json"
-                );
+            let expected = if PILL_COMMANDS.contains(command) {
+                ("pill.json", &pill_cap)
+            } else if OVERLAY_COMMANDS.contains(command) {
+                ("overlay.json", &overlay_cap)
             } else {
-                assert!(
-                    main_cap.contains(&permission),
-                    "{permission} missing in main.json"
-                );
-                assert!(
-                    !pill_cap.contains(&permission),
-                    "{permission} must not be in pill.json"
-                );
+                ("main.json", &main_cap)
+            };
+            for (name, cap) in [
+                ("main.json", &main_cap),
+                ("pill.json", &pill_cap),
+                ("overlay.json", &overlay_cap),
+            ] {
+                if name == expected.0 {
+                    assert!(cap.contains(&permission), "{permission} missing in {name}");
+                } else {
+                    assert!(
+                        !cap.contains(&permission),
+                        "{permission} must not be in {name}"
+                    );
+                }
             }
         }
     }

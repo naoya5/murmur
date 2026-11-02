@@ -182,6 +182,25 @@ async installUpdate() : Promise<Result<null, UpdateError>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * One finished stroke from the drawing layer. `started_ms` and `ended_ms` are epoch
+ * milliseconds, as in `OverlayState::Shown`. Only the overlay window may call this.
+ */
+async submitInkStroke(points: InkPoint[], startedMs: number, endedMs: number) : Promise<void> {
+    await TAURI_INVOKE("submit_ink_stroke", { points, startedMs, endedMs });
+},
+/**
+ * Opens the annotations folder in the Finder. The folder is created by the first bundle, never
+ * here (while the feature is off nothing of it exists on disk).
+ */
+async openAnnotationsFolder() : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("open_annotations_folder") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -194,6 +213,7 @@ historyChanged: HistoryChanged,
 modelProgress: ModelProgress,
 modelsChanged: ModelsChanged,
 navigate: Navigate,
+overlayState: OverlayState,
 pillState: PillState,
 settingsChanged: SettingsChanged,
 updateAvailable: UpdateAvailable
@@ -203,6 +223,7 @@ historyChanged: "history-changed",
 modelProgress: "model-progress",
 modelsChanged: "models-changed",
 navigate: "navigate",
+overlayState: "overlay-state",
 pillState: "pill-state",
 settingsChanged: "settings-changed",
 updateAvailable: "update-available"
@@ -214,6 +235,19 @@ updateAvailable: "update-available"
 
 /** user-defined types **/
 
+/**
+ * The annotation part of the pill: a camera mark, the pictures kept so far, a warning when the
+ * screen capture stopped.
+ */
+export type AnnotationPill = { 
+/**
+ * Candidate pictures kept so far while recording; the keyframe count once chosen.
+ */
+images: number; 
+/**
+ * The screen capture failed; the recording goes on with the pictures taken before.
+ */
+screen_lost: boolean }
 /**
  * Why an annotation recording could not start. Decided by the controller before the event.
  */
@@ -365,11 +399,16 @@ export type Family =
 export type HistoryChanged = null
 export type HistoryPage = { items: TranscriptRow[]; total: number }
 export type HistoryRetention = { kind: "forever" } | { kind: "days"; days: number }
+/**
+ * A point of an ink stroke, as a share of the overlay window's width and height (0 to 1). The
+ * overlay covers the recorded display exactly, so these are also shares of the display.
+ */
+export type InkPoint = { x: number; y: number }
 export type InputDevice = { name: string; is_default: boolean }
 /**
  * The error type of plain commands. It crosses the IPC boundary as a tagged object.
  */
-export type IpcError = { kind: "store"; message: string } | { kind: "model"; message: string } | { kind: "clipboard"; message: string } | { kind: "hotkey"; message: string } | { kind: "url"; message: string }
+export type IpcError = { kind: "store"; message: string } | { kind: "model"; message: string } | { kind: "clipboard"; message: string } | { kind: "hotkey"; message: string } | { kind: "url"; message: string } | { kind: "annotations"; message: string }
 /**
  * A spoken language that Murmur transcribes. Fixed for the length of one recording.
  */
@@ -429,14 +468,36 @@ export type Notice = { kind: "delivered"; outcome: DeliveryOutcome } | { kind: "
  */
 { kind: "annotations_refused"; reason: AnnotationsRefusal }
 /**
+ * Tells the drawing layer when to accept strokes. Times are epoch milliseconds (`Date.now()`),
+ * the one clock the webview and the backend share; the backend converts them to recording time.
+ */
+export type OverlayState = 
+/**
+ * An annotation recording runs: show the hint, draw strokes, send each one when it ends.
+ */
+{ kind: "shown"; recording_started_ms: number } | 
+/**
+ * The recording stopped or was cancelled: clear the canvas, accept nothing.
+ */
+{ kind: "hidden" }
+/**
  * State of one macOS privacy permission.
  */
 export type Permission = "Granted" | "Denied" | "NotDetermined"
-export type Permissions = { microphone: Permission; accessibility: boolean }
+export type Permissions = { microphone: Permission; accessibility: boolean; 
+/**
+ * Screen Recording, for the annotations. Absent while the feature is off: nothing of the
+ * feature runs then, not even this check.
+ */
+screen_recording?: boolean | null }
 /**
  * What the pill window receives after every step.
  */
-export type PillState = { view: PillView; language: Language }
+export type PillState = { view: PillView; language: Language; 
+/**
+ * Present while the session is a screen annotation (absent: dictation or idle).
+ */
+annotation?: AnnotationPill | null }
 /**
  * What the pill shows. Derived from the state; the controller emits it after every step.
  */
@@ -444,7 +505,7 @@ export type PillView = { kind: "hidden" } | { kind: "recording"; elapsed_ms: num
 /**
  * Which pane of System Settings > Privacy & Security to open.
  */
-export type PrivacyPane = "Microphone" | "Accessibility"
+export type PrivacyPane = "Microphone" | "Accessibility" | "ScreenCapture"
 export type RecordMode = 
 /**
  * Press to start, press again to stop.

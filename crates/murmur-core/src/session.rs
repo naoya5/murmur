@@ -602,6 +602,18 @@ impl Machine {
         }
     }
 
+    /// Whether the active annotation recording lost its screen capture (`Event::ScreenFailed`).
+    pub fn screen_lost(&self) -> bool {
+        match &self.state {
+            State::Recording(rec) => rec.screen_failed,
+            State::CancelPending {
+                paused: Paused::Recording(rec),
+                ..
+            } => rec.screen_failed,
+            _ => false,
+        }
+    }
+
     /// Whether the global Esc hotkey must be registered in the current state.
     pub fn wants_esc(&self) -> bool {
         matches!(
@@ -2859,6 +2871,7 @@ mod tests {
             panic!()
         };
         assert!(rec.screen_failed);
+        assert!(h.m.screen_lost());
         assert_eq!(h.m.active_kind(), Some(SessionKind::Annotation));
         h.advance(2_000);
         let fx = h.step(Event::AnnotationsHotkey);
@@ -2875,6 +2888,11 @@ mod tests {
             panic!()
         };
         assert!(rec.screen_failed);
+        assert!(h.m.screen_lost());
+        // Any other state reports no loss.
+        assert!(!recording_annotation().m.screen_lost());
+        assert!(!transcribing_annotation(1_000).m.screen_lost());
+        assert!(!Harness::new().m.screen_lost());
     }
 
     #[test]

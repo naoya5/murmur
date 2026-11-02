@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "overlay",
+  "description": "Capability for the annotations drawing layer: it may only send ink strokes",
+  "windows": [
+    "overlay"
+  ],
+  "permissions": [
+    "core:event:default",
+    "allow-submit-ink-stroke"
+  ]
+}
