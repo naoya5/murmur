@@ -137,7 +137,12 @@ function annotationDelivered(
   if (wordsOnly) {
     sub = a.imagesInFolder;
   } else if (outcome.kind === "copied") {
-    sub = outcome.reason === "secure_input" ? a.secureField : a.pressPaste;
+    sub =
+      outcome.reason === "secure_input"
+        ? a.secureField
+        : outcome.reason === "target_not_in_front"
+          ? a.appNotInFront
+          : a.pressPaste;
   }
   return { icon: wordsOnly ? "warn" : "ok", text, sub };
 }

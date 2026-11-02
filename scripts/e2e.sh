@@ -21,7 +21,8 @@
 #        opt-in: mic (makes sound: real microphone + afplay through the speakers), tenmin (about 12 minutes),
 #                annotations (the annotation group, about 3 minutes; or one of annot annot-marks
 #                annot-nospeech-marks annot-nospeech-nomarks annot-cancel annot-undo annot-disable annot-screenfail
-#                annot-compose-timeout annot-nomodel)
+#                annot-compose-timeout annot-nomodel annot-words), and annot-target (pastes into TextEdit on the
+#                user's screen: a person must be at the Mac, nothing else may hold the keyboard for ~15 s)
 # Exit code: 0 all passed, 1 an assertion failed, 2 the environment is not ready.
 
 set -u -o pipefail
@@ -139,7 +140,7 @@ settings = {
     "onboarding_completed": True,
     "microphone": ("wav:" + wav) if wav else None,  # empty = the system default microphone
     "language": language,
-    "auto_paste": False,
+    "auto_paste": os.environ.get("E2E_AUTO_PASTE") == "1",
     "restore_clipboard": False,
     "annotations_enabled": os.environ.get("E2E_ANNOTATIONS") == "1",
 }
@@ -519,8 +520,11 @@ no_panic() {
 # G7: the log must never carry what the user said or saw: spoken words, app names, window titles.
 # Checks the given substrings plus the name of the app in front during the run (the real one).
 assert_log_private() { # <substring>...
-  local hit="" s
-  for s in "$@" "$(front_app_name)"; do
+  local hit="" s front
+  front="$(front_app_name)"
+  # Murmur itself may be in front (the dev app restarts when its sources change): its own name is in every log.
+  case "$front" in [Mm]urmur*) front="" ;; esac
+  for s in "$@" "$front"; do
     [ -n "$s" ] || continue
     if grep -qF -- "$s" "$LOG" 2> /dev/null; then hit="$s"; break; fi
   done
@@ -529,6 +533,10 @@ assert_log_private() { # <substring>...
   else
     pass "G7: no spoken words, app names or window titles in the log"
   fi
+}
+
+front_bundle_id() {
+  osascript -e 'tell application "System Events" to get bundle identifier of first process whose frontmost is true' 2> /dev/null
 }
 
 front_app_name() {
@@ -809,6 +817,13 @@ with open(os.path.join(root, "marks.json"), "w", encoding="utf-8") as f:
 # so a person at the Mac cannot change a result.
 with open(os.path.join(root, "noop.json"), "w", encoding="utf-8") as f:
     json.dump({"events": [{"kind": "app", "t_ms": 0, "name": "E2E App"}]}, f)
+# One stroke at 10 s and nothing before it: the words spoken earlier must still be pasted.
+late = [
+    {"kind": "app", "t_ms": 0, "name": "E2E App"},
+    {"kind": "stroke", "t0_ms": 10000, "t1_ms": 10600, "points": [[0.2, 0.2], [0.3, 0.3], [0.4, 0.35]]},
+]
+with open(os.path.join(root, "late-stroke.json"), "w", encoding="utf-8") as f:
+    json.dump({"events": late}, f)
 PY
 }
 
@@ -817,7 +832,7 @@ annot_env() { # <png-dir|missing> [script]   (no script: the no-op one, never th
   export MURMUR_DEBUG_SCREEN="png-dir:$1"
   export MURMUR_DEBUG_POINTER="${2:-$ANNOT_FIX/noop.json}"
 }
-annot_unenv() { unset E2E_ANNOTATIONS MURMUR_DEBUG_HOTKEY MURMUR_DEBUG_SCREEN MURMUR_DEBUG_POINTER MURMUR_DEBUG_COMPOSE_DELAY_MS; }
+annot_unenv() { unset E2E_ANNOTATIONS E2E_AUTO_PASTE MURMUR_DEBUG_HOTKEY MURMUR_DEBUG_SCREEN MURMUR_DEBUG_POINTER MURMUR_DEBUG_COMPOSE_DELAY_MS; }
 switch_off() { kill -INFO "$APP_PID"; }
 annot_rows() { sqlite3 "$DATA/murmur.db" "SELECT count(*) FROM annotations" 2> /dev/null || echo 0; }
 last_annot_row() { # status|keyframes|marks|latency_ms|asr_ms|compose_ms|error|folder
@@ -828,12 +843,13 @@ bundle_count() { ls -d "$DATA"/annotations/*/ 2> /dev/null | wc -l | tr -d ' '; 
 newest_bundle() { ls -d "$DATA"/annotations/*/ 2> /dev/null | sort | tail -1 | sed 's#/$##'; }
 spool_count() { ls -A "$DATA/spool" 2> /dev/null | wc -l | tr -d ' '; }
 
-# Records the WAV through the annotations hotkey and waits for the bundle to be saved.
-annot_record() { # <wav> -> 0 when "annotation saved" appeared
+# Records the WAV through the annotations hotkey and waits for the bundle to be saved. The
+# recording lasts the WAV plus half a second, or the seconds given (the WAV, then silence).
+annot_record() { # <wav> [seconds] -> 0 when "annotation saved" appeared
   local length
-  length="$(wav_seconds "$1")"
+  length="${2:-$(python3 -c "print($(wav_seconds "$1") + 0.5)")}"
   begin_recording || return 1
-  sleep "$(python3 -c "print($length + 0.5)")"
+  sleep "$length"
   hotkey
   if wait_for_log 'annotation saved' "$RESULT_TIMEOUT"; then
     pass "annotation saved"
@@ -1062,9 +1078,164 @@ case_annot_nomodel() {
   fresh_data
 }
 
+# The words of the newest bundle as one string: the summary without its headers and marks (both
+# the first and the revised summary shapes), so a word check does not depend on the format.
+bundle_words() {
+  python3 - "$(newest_bundle)/summary.md" <<'PY'
+import re, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+keep = []
+for line in text.splitlines():
+    if re.match(r"^(\[Murmur Annotations\]|画像: |読み方: |#\d+ \(|元の大きさの画像: |Pictures?: |How to read: |Full-size)", line):
+        continue
+    keep.append(line)
+text = "\n".join(keep)
+text = re.sub(r"\[(画像|image) \d+[^\]]*\]", "", text)   # revised marks: [画像 1 ①], [image 1 ①: /path]
+text = re.sub(r"[①-⑳◉◌「」]|クリック|click", "", text)     # first-shape marks and quotes
+print(text)
+PY
+}
+
+# Character coverage of the baseline in the candidate (longest common subsequence over the
+# characters, spaces and punctuation removed) and whether the first sentence of the baseline is
+# in the candidate. Prints "<coverage 0..1> <first yes|no> <baseline chars> <candidate chars>".
+word_coverage() { # <baseline text> <candidate text>
+  python3 - "$1" "$2" <<'PY'
+import re, sys
+def norm(t):
+    return re.sub(r"[\s。、，．,.!?！？「」]", "", t)
+a, b = norm(sys.argv[1]), norm(sys.argv[2])
+if not a:
+    print("0 no 0", len(b)); sys.exit(0)
+prev = [0] * (len(b) + 1)
+for ca in a:
+    cur = [0]
+    for j, cb in enumerate(b):
+        cur.append(prev[j] + 1 if ca == cb else max(prev[j + 1], cur[j]))
+    prev = cur
+first = re.split(r"[。！？!?]", sys.argv[1].strip(), 1)[0]
+first = norm(first)
+print(f"{prev[-1] / len(a):.3f}", "yes" if first and first in b else "no", len(a), len(b))
+PY
+}
+
+# R5: no spoken word may be lost on the annotations path. Two recordings. (1) ja.wav, then
+# silence, the only stroke at 10 s: the words all come before the first picture. (2) ja60.wav
+# through dictation and through annotations with the stroke at 10 s: the annotation words must
+# cover the dictation words (character coverage, LCS) and start with the same first sentence.
+case_annot_words() {
+  say "== annot-words (words before the first stroke; ja60 against dictation)"
+  make_annotation_fixtures
+  local summary
+  set_sentinel
+  annot_env "$ANNOT_FIX/frames" "$ANNOT_FIX/late-stroke.json"
+  start_app ja "$FIXTURES/ja.wav" || { annot_unenv; return; }
+  if annot_record "$FIXTURES/ja.wav" 12; then
+    summary="$(bundle_words)"
+    local w
+    for w in 公園 コーヒー; do
+      case "$summary" in *"$w"*) pass "annot-words: '$w' (spoken before the stroke) is in the summary" ;; *) fail "annot-words: '$w' (spoken before the stroke) missing from the summary" ;; esac
+    done
+    note "row: $(last_annot_row | cut -d'|' -f1-3)"
+  fi
+  assert_log_private 公園 コーヒー "E2E App"
+  no_panic
+  stop_app
+  annot_unenv
+  if [ ! -f "$FIXTURES/ja60.wav" ]; then
+    note "no ja60.wav: the dictation comparison is skipped"
+    return
+  fi
+  local length baseline
+  length="$(python3 -c "print($(wav_seconds "$FIXTURES/ja60.wav") + 0.5)")"
+  set_sentinel
+  start_app ja "$FIXTURES/ja60.wav" || return
+  begin_recording || { stop_app; return; }
+  sleep "$length"
+  hotkey
+  if wait_for_log 'session saved' "$RESULT_TIMEOUT"; then
+    baseline="$(pbpaste)"
+    pass "annot-words: dictation baseline (${#baseline} characters)"
+  else
+    fail "annot-words: no dictation baseline"
+    stop_app
+    return
+  fi
+  stop_app
+  set_sentinel
+  annot_env "$ANNOT_FIX/frames" "$ANNOT_FIX/late-stroke.json"
+  start_app ja "$FIXTURES/ja60.wav" || { annot_unenv; return; }
+  if annot_record "$FIXTURES/ja60.wav" "$length"; then
+    summary="$(bundle_words)"
+    local coverage first na nb
+    read -r coverage first na nb <<< "$(word_coverage "$baseline" "$summary")"
+    note "coverage of the dictation words: $coverage ($na -> $nb characters), first sentence: $first"
+    python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) >= 0.9 else 1)" "$coverage" \
+      && pass "annot-words: annotation words cover the dictation words ($coverage)" \
+      || fail "annot-words: words lost on the annotations path (coverage $coverage)"
+    [ "$first" = yes ] && pass "annot-words: the first sentence is in the summary" || fail "annot-words: the first sentence is missing from the summary"
+    note "row: $(last_annot_row | cut -d'|' -f1-3)"
+  fi
+  assert_log_private 公園 コーヒー "E2E App"
+  no_panic
+  stop_app
+  annot_unenv
+}
+
+# R1: the paste goes to the app that was in front when the recording started, not to the app in
+# front at stop. TextEdit is in front at the hotkey; two seconds into the recording Finder comes
+# to the front (Cmd+V does nothing there); after the stop the TextEdit document must hold the
+# words. Pastes for real (auto_paste on), so a person must be at the Mac and nothing else may
+# use the keyboard for about 15 s. The document is closed without saving.
+case_annot_target() {
+  say "== annot-target (TextEdit in front at start, Finder at stop)"
+  make_annotation_fixtures
+  set_sentinel
+  export E2E_AUTO_PASTE=1
+  annot_env "$ANNOT_FIX/frames" "$ANNOT_FIX/marks.json"
+  start_app ja "$FIXTURES/ja.wav" || { annot_unenv; return; }
+  osascript -e 'tell application "TextEdit" to activate' -e 'tell application "TextEdit" to make new document' > /dev/null
+  sleep 1.5
+  local front
+  front="$(front_bundle_id)"
+  if [ "$front" != com.apple.TextEdit ]; then
+    # Somebody is using the Mac: recording now would paste into their app. Nothing is started.
+    fail "annot-target: '$front' is in front at the hotkey (want com.apple.TextEdit): not recorded"
+    osascript -e 'tell application "TextEdit" to close front document saving no' > /dev/null 2>&1
+    stop_app
+    annot_unenv
+    return
+  fi
+  pass "annot-target: TextEdit is in front at the hotkey"
+  if begin_recording; then
+    sleep 2
+    osascript -e 'tell application "Finder" to activate' > /dev/null
+    sleep 4.5
+    hotkey
+    if wait_for_log 'annotation saved' "$RESULT_TIMEOUT"; then
+      pass "annot-target: annotation saved"
+      sleep 1
+      local doc target
+      doc="$(osascript -e 'tell application "TextEdit" to get text of front document' 2> /dev/null)"
+      target="$(plain_log | grep -E 'bundle delivered' | tail -1 | sed -E 's/.*target=([A-Za-z]+).*/\1/')"
+      note "paste target decided: $target; TextEdit document length: ${#doc}"
+      case "$doc" in *公園*) pass "annot-target: the words landed in the TextEdit document" ;; *) fail "annot-target: the TextEdit document does not hold the words" ;; esac
+      case "$(pbpaste)" in *公園*) pass "annot-target: clipboard holds the words" ;; *) fail "annot-target: clipboard does not hold the words" ;; esac
+    else
+      fail "annot-target: no 'annotation saved' within ${RESULT_TIMEOUT}s"
+      failure_lines | sed 's/^/    log: /'
+    fi
+  fi
+  osascript -e 'tell application "TextEdit" to close front document saving no' > /dev/null 2>&1
+  assert_log_private 公園 コーヒー "E2E App" TextEdit Finder
+  no_panic
+  stop_app
+  annot_unenv
+}
+
 run_annotations() {
   for c in annot annot-marks annot-nospeech-marks annot-nospeech-nomarks annot-cancel annot-undo annot-disable \
-    annot-screenfail annot-compose-timeout annot-nomodel; do
+    annot-screenfail annot-compose-timeout annot-nomodel annot-words; do
     run_case "$c"
   done
 }
@@ -1082,6 +1253,8 @@ run_case() {
     annot-screenfail) case_annot_screenfail ;;
     annot-compose-timeout) case_annot_compose_timeout ;;
     annot-nomodel) case_annot_nomodel ;;
+    annot-words) case_annot_words ;;
+    annot-target) case_annot_target ;;
     ja) case_dictation "ja" ja ja 公園 コーヒー ;;
     en) case_dictation "en" en en settings hotkey ;;
     silence) case_silence ;;

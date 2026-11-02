@@ -175,6 +175,7 @@ pub fn annotation_json(
     language: &str,
     model_id: Option<&str>,
     display: Option<DisplayFacts>,
+    target_bundle_id: Option<&str>,
     keyframes: &[Keyframe],
     marks: &[Mark],
     chunks: &[Chunk],
@@ -266,6 +267,7 @@ pub fn annotation_json(
         "duration_ms": duration_ms,
         "language": language,
         "model_id": model_id,
+        "target_bundle_id": target_bundle_id,
         "display": display.map(|d| json!({
             "width_pt": d.width_pt,
             "height_pt": d.height_pt,
@@ -665,6 +667,7 @@ mod tests {
                 height_pt: 982.0,
                 scale: 2.0,
             }),
+            Some("com.apple.TextEdit"),
             &keyframes,
             &marks,
             &chunks,
@@ -672,6 +675,7 @@ mod tests {
         );
         assert_eq!(json["version"], 1);
         assert_eq!(json["status"], "ok");
+        assert_eq!(json["target_bundle_id"], "com.apple.TextEdit");
         assert_eq!(
             json["keyframes"][0]["reasons"],
             serde_json::json!(["start", "click"])

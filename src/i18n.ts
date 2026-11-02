@@ -327,6 +327,7 @@ const en = {
       no_accessibility: "Copied, press ⌘V",
       secure_input: "Copied, secure field",
       paste_failed: "Copied, press ⌘V",
+      target_not_in_front: "Copied, the app is not in front",
     } satisfies Record<CopyReason, string>,
     unconfirmed: "Probably copied",
     noSpeech: "No speech",
@@ -361,6 +362,8 @@ const en = {
       imagesInFolder: "Images are in the history folder",
       pressPaste: "Press ⌘V",
       secureField: "Secure field",
+      appNotInFront: "The app you started in is not in front",
+
       empty: "Nothing was recorded",
       refused: {
         screen_recording_denied: "Screen Recording permission needed",
@@ -686,6 +689,7 @@ const ja: Strings = {
       no_accessibility: "コピーしました、⌘V で貼り付け",
       secure_input: "コピーしました、保護された入力欄",
       paste_failed: "コピーしました、⌘V で貼り付け",
+      target_not_in_front: "コピーしました、元のアプリが前面にありません",
     },
     unconfirmed: "たぶんコピーしました",
     noSpeech: "話し声がありません",
@@ -718,6 +722,7 @@ const ja: Strings = {
       imagesInFolder: "画像は履歴のフォルダにあります",
       pressPaste: "⌘V で貼り付け",
       secureField: "保護された入力欄",
+      appNotInFront: "開始したアプリが前面にありません",
       empty: "記録されたものがありません",
       refused: {
         screen_recording_denied: "画面収録の許可が必要です",

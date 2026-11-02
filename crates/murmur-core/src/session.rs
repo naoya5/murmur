@@ -156,6 +156,9 @@ pub enum CopyReason {
     NoAccessibility,
     SecureInput,
     PasteFailed,
+    /// The app the annotation was started in is not in front (it quit, or macOS refused to
+    /// bring it back), so nothing was pasted anywhere else.
+    TargetNotInFront,
 }
 
 /// What the output adapter did with the text.

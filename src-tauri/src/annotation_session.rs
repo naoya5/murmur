@@ -21,6 +21,7 @@ use murmur_core::ports::SpeechRegion;
 use murmur_core::session::{ComposeWords, TranscriptText};
 use murmur_core::{Language, pipeline};
 
+use crate::adapters::frontmost::FrontApp;
 use crate::adapters::image::{self, Bitmap};
 use crate::adapters::pointer::{PointerEvent, PointerFeed};
 use crate::adapters::screen::{DisplayInfo, Frame, ScreenCapture};
@@ -49,7 +50,9 @@ pub struct AnnotationCtx {
     pub kept: BTreeSet<usize>,
     pub shift_held: bool,
     pub screen_failed: bool,
-    /// The app in front when the recording stopped (where the bundle is pasted).
+    /// The app in front at the hotkey: where the bundle is pasted (R1). Taken at delivery.
+    pub front: Option<FrontApp>,
+    /// Its bundle id, kept for the paste target rule and `annotation.json`.
     pub target_bundle_id: Option<String>,
     pub plan: Option<Planned>,
     pub chunks: Vec<Chunk>,
@@ -100,6 +103,7 @@ impl AnnotationCtx {
             kept: BTreeSet::new(),
             shift_held: false,
             screen_failed: false,
+            front: None,
             target_bundle_id: None,
             plan: None,
             chunks: Vec::new(),
@@ -366,6 +370,7 @@ pub fn compose(
     created_at_ms: i64,
     model_id: Option<&str>,
     display: Option<DisplayFacts>,
+    target_bundle_id: Option<&str>,
 ) -> Result<Composed, String> {
     let mut pictures: Vec<Bitmap> = Vec::with_capacity(planned.pictures.len());
     for path in &planned.pictures {
@@ -420,6 +425,7 @@ pub fn compose(
         language.code(),
         model_id,
         display,
+        target_bundle_id,
         &planned.selection.keyframes,
         &planned.selection.marks,
         chunks,

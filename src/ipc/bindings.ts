@@ -293,7 +293,12 @@ export type CaptureError = "permission_denied" | "no_device" | "open_timeout" | 
 /**
  * Why the text was only copied and not pasted.
  */
-export type CopyReason = "auto_paste_off" | "no_accessibility" | "secure_input" | "paste_failed"
+export type CopyReason = "auto_paste_off" | "no_accessibility" | "secure_input" | "paste_failed" | 
+/**
+ * The app the annotation was started in is not in front (it quit, or macOS refused to
+ * bring it back), so nothing was pasted anywhere else.
+ */
+"target_not_in_front"
 /**
  * Everything the Home screen shows.
  */

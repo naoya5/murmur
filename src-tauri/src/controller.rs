@@ -30,6 +30,7 @@ use tauri_specta::Event as _;
 use tokio::sync::{mpsc, watch};
 
 use crate::adapters::audio::{self, AudioConfig, AudioError, AudioEvent, CapturedAudio, Recorder};
+use crate::adapters::frontmost::{self, FrontApp};
 use crate::adapters::output::{self, DeliverOptions};
 use crate::adapters::pointer::{self, PointerEvent, PointerFeed};
 use crate::adapters::screen::{
@@ -232,6 +233,8 @@ pub struct Controller {
     language_override: Option<Language>,
     last_language: Language,
     tx: mpsc::UnboundedSender<Msg>,
+    /// The app in front at the annotations hotkey, until its session starts the screen.
+    front_at_hotkey: Option<FrontApp>,
     pill_visible: bool,
 }
 
@@ -247,6 +250,7 @@ pub fn spawn(app: AppHandle, services: Arc<App>) -> ControllerHandle {
         sessions: HashMap::new(),
         language_override: None,
         last_language,
+        front_at_hotkey: None,
         tx: tx.clone(),
         pill_visible: false,
     };
@@ -351,13 +355,15 @@ impl Controller {
     /// Screen Recording and the microphone are checked only when a recording would start; a
     /// press that stops one needs no permission. A press after the feature was switched off
     /// (the key may fire once before it is unregistered) does nothing.
-    fn on_annotations_hotkey(&self) -> Option<Event> {
+    fn on_annotations_hotkey(&mut self) -> Option<Event> {
         if !self.services.settings().annotations_enabled {
             return None;
         }
         if self.machine.active_session().is_some() {
             return Some(Event::AnnotationsHotkey);
         }
+        // The app in front now receives the bundle, whatever is in front at the stop (R1).
+        self.front_at_hotkey = frontmost::capture();
         if !macos::screen_recording_granted() && !macos::request_screen_recording() {
             return Some(Event::AnnotationsRefused {
                 reason: AnnotationsRefusal::ScreenRecordingDenied,
@@ -886,7 +892,7 @@ impl Controller {
         let origin_epoch = now_epoch as f64 - ctx.t_hotkey.elapsed().as_millis() as f64;
         let clock = RecordingClock::new(ctx.t_hotkey, origin_epoch);
         let root = self.services.paths().annotations.clone();
-        let annotation = match AnnotationCtx::new(&root, now_epoch, session.0, clock) {
+        let mut annotation = match AnnotationCtx::new(&root, now_epoch, session.0, clock) {
             Ok(annotation) => annotation,
             Err(error) => {
                 tracing::warn!(session = session.0, %error, "bundle folder not created");
@@ -901,6 +907,8 @@ impl Controller {
             candidates_dir: annotation.candidates_dir.clone(),
             origin: ctx.t_hotkey,
         };
+        annotation.front = self.front_at_hotkey.take();
+        annotation.target_bundle_id = annotation.front.as_ref().and_then(|f| f.bundle_id.clone());
         ctx.annotation = Some(annotation);
         ctx.screen_done = Some(watch::channel(None));
         let tx = self.tx.clone();
@@ -1026,7 +1034,6 @@ impl Controller {
         let Some(annotation) = ctx.annotation.as_mut() else {
             return;
         };
-        annotation.target_bundle_id = pointer::frontmost_bundle_id();
         let pointer = annotation.pointer.take();
         let capture = annotation.screen.take();
         let done = ctx.screen_done.as_ref().map(|(tx, _)| tx.clone());
@@ -1384,6 +1391,7 @@ impl Controller {
         let model_id = ctx.model_id.map(str::to_owned);
         let display = ann_session::display_facts(annotation.display.as_ref());
         let bundle_dir = annotation.bundle_dir.clone();
+        let target_bundle_id = annotation.target_bundle_id.clone();
         let delay = debug::compose_delay();
         tauri::async_runtime::spawn_blocking(move || {
             if let Some(delay) = delay {
@@ -1400,6 +1408,7 @@ impl Controller {
                 created_at_ms,
                 model_id.as_deref(),
                 display,
+                target_bundle_id.as_deref(),
             )
             .map(|c| (c.rendered, started.elapsed().as_millis() as u64));
             let _ = tx.send(Msg::Composed { session, result });
@@ -1495,11 +1504,12 @@ impl Controller {
             words,
         );
         ctx.text = Some(text.clone());
+        let front = annotation.front.take();
         let t_stop = ctx.t_stop;
         let tx = self.tx.clone();
         tauri::async_runtime::spawn(async move {
             let job = tauri::async_runtime::spawn_blocking(move || {
-                output::deliver_bundle(sheet.as_deref(), &text, opts, target)
+                output::deliver_bundle(sheet.as_deref(), &text, opts, target, front)
             });
             let outcome = match tokio::time::timeout(BUNDLE_DELIVER_TIMEOUT, job).await {
                 Ok(Ok(outcome)) => outcome,
@@ -1596,6 +1606,7 @@ impl Controller {
                 ctx.language.code(),
                 ctx.model_id,
                 ann_session::display_facts(annotation.display.as_ref()),
+                annotation.target_bundle_id.as_deref(),
                 &planned.selection.keyframes,
                 &planned.selection.marks,
                 &annotation.chunks,

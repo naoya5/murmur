@@ -4,6 +4,7 @@
 
 pub mod audio;
 pub mod engine;
+pub mod frontmost;
 pub mod hotkeys;
 pub mod image;
 pub mod models;
