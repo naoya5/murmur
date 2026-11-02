@@ -291,6 +291,11 @@ case_dictation() { # <name> <language> <wav name> <expected word>...
   [ -n "$latency" ] && pass "latency_ms recorded" || fail "latency_ms missing"
   [ -n "$asr" ] && pass "asr_ms recorded" || fail "asr_ms missing"
   note "latency (stop -> clipboard): ${latency} ms, asr: ${asr} ms, audio: ${duration} ms, model: ${model}"
+  # The expected words of the fixture, except "hotkey": the debug trigger line names the key.
+  local -a private_words=()
+  local w
+  for w in "$@"; do [ "$w" = hotkey ] || private_words+=("$w"); done
+  assert_log_private 公園 コーヒー "${private_words[@]}"
   stop_app
 }
 
@@ -439,6 +444,11 @@ mic_one() { # <name> <language> <wav name> <word>...
   IFS='|' read -r status latency asr duration model <<< "$row"
   [ "$status" = "ok" ] && pass "row status ok" || fail "row status is '$status'"
   note "latency (stop -> clipboard): ${latency} ms, asr: ${asr} ms, audio: ${duration} ms, model: ${model}"
+  # The expected words of the fixture, except "hotkey": the debug trigger line names the key.
+  local -a private_words=()
+  local w
+  for w in "$@"; do [ "$w" = hotkey ] || private_words+=("$w"); done
+  assert_log_private 公園 コーヒー "${private_words[@]}"
   stop_app
 }
 
@@ -504,6 +514,25 @@ no_panic() {
   else
     pass "no panic in the log"
   fi
+}
+
+# G7: the log must never carry what the user said or saw: spoken words, app names, window titles.
+# Checks the given substrings plus the name of the app in front during the run (the real one).
+assert_log_private() { # <substring>...
+  local hit="" s
+  for s in "$@" "$(front_app_name)"; do
+    [ -n "$s" ] || continue
+    if grep -qF -- "$s" "$LOG" 2> /dev/null; then hit="$s"; break; fi
+  done
+  if [ -n "$hit" ]; then
+    fail "G7: the log contains private text ($hit)"
+  else
+    pass "G7: no spoken words, app names or window titles in the log"
+  fi
+}
+
+front_app_name() {
+  lsappinfo info -only name "$(lsappinfo front 2> /dev/null)" 2> /dev/null | sed -E 's/.*"LSDisplayName"="([^"]*)".*/\1/'
 }
 
 app_alive() {
@@ -889,6 +918,7 @@ case_annot() { # <name> <marks|""> <keep name|"">
     fi
     [ -n "$3" ] && keep_bundle "$3"
   fi
+  assert_log_private 公園 コーヒー "E2E App"
   no_panic
   stop_app
   annot_unenv
@@ -918,6 +948,7 @@ case_annot_nospeech() { # <name> <marks|""> ; silence: with marks -> a bundle wi
     [ "$(pbpaste)" = "$SENTINEL" ] && pass "$1: clipboard unchanged" || fail "$1: clipboard changed"
     [ "$(spool_count)" = 0 ] && pass "$1: spool empty" || fail "$1: spool not empty"
   fi
+  assert_log_private 公園 コーヒー "E2E App"
   no_panic
   stop_app
   annot_unenv
@@ -946,6 +977,7 @@ case_annot_dropped() { # <name> <cancel|disable>
   [ "$(bundle_count)" = "$before_bundles" ] && pass "$1: bundle folder removed" || fail "$1: a bundle folder was left"
   [ "$(pbpaste)" = "$SENTINEL" ] && pass "$1: clipboard unchanged" || fail "$1: clipboard changed"
   [ "$(spool_count)" = 0 ] && pass "$1: spool empty" || fail "$1: spool not empty"
+  assert_log_private 公園 コーヒー "E2E App"
   no_panic
   stop_app
   annot_unenv
@@ -971,6 +1003,7 @@ case_annot_undo() {
   else
     fail "annot-undo: no 'annotation saved'"
   fi
+  assert_log_private 公園 コーヒー "E2E App"
   no_panic
   stop_app
   annot_unenv
@@ -986,6 +1019,7 @@ case_annot_screenfail() {
     grep -q 'screen capture did not start' "$LOG" && pass "annot-screenfail: screen failure logged" || fail "annot-screenfail: no screen failure in the log"
     expect_bundle "annot-screenfail" text_only no yes
   fi
+  assert_log_private 公園 コーヒー "E2E App"
   no_panic
   stop_app
   annot_unenv
@@ -1003,6 +1037,7 @@ case_annot_compose_timeout() {
     sleep 2
     grep -q 'compose finished late' "$LOG" && pass "annot-compose-timeout: late compose dropped" || note "late compose result not seen yet"
   fi
+  assert_log_private 公園 コーヒー "E2E App"
   no_panic
   stop_app
   annot_unenv
@@ -1020,6 +1055,7 @@ case_annot_nomodel() {
     expect_bundle "annot-nomodel" failed yes failed '①,◉ クリック'
     assert_failed_row model_missing "annot-nomodel"
   fi
+  assert_log_private 公園 コーヒー "E2E App"
   no_panic
   stop_app
   annot_unenv
