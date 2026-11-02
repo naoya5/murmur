@@ -41,8 +41,9 @@ pub const MAX_KEYFRAMES: usize = 6;
 pub const SEGMENT_LEAD_MS: Millis = 1_000;
 
 /// Bundle ids of the apps that receive the text alone (the picture paths are inside the marks).
-/// Every other app receives the pictures first, then the text.
-pub const TERMINAL_BUNDLE_IDS: [&str; 7] = [
+/// Every other app receives the pictures first, then the text. Herdr hosts terminals for coding
+/// agents, so it counts as one.
+pub const TERMINAL_BUNDLE_IDS: [&str; 8] = [
     "com.mitchellh.ghostty",
     "com.googlecode.iterm2",
     "com.apple.Terminal",
@@ -50,6 +51,7 @@ pub const TERMINAL_BUNDLE_IDS: [&str; 7] = [
     "net.kovidgoyal.kitty",
     "org.alacritty",
     "dev.warp.Warp-Stable",
+    "dev.herdr.app",
 ];
 
 // --- signals (recorded by the adapters, in recording time) ---
@@ -678,6 +680,8 @@ mod tests {
     fn terminal_bundle_ids() {
         assert!(is_terminal("com.mitchellh.ghostty"));
         assert!(is_terminal(" COM.APPLE.TERMINAL "));
+        assert!(is_terminal("dev.herdr.app"));
+        assert_eq!(paste_target(Some("dev.herdr.app")), PasteTarget::Terminal);
         assert!(!is_terminal("com.google.Chrome"));
         assert_eq!(
             paste_target(Some("com.googlecode.iterm2")),
