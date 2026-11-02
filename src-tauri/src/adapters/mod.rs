@@ -5,8 +5,12 @@
 pub mod audio;
 pub mod engine;
 pub mod hotkeys;
+pub mod image;
 pub mod models;
 pub mod output;
+pub mod pointer;
+pub mod screen;
 pub mod settings_file;
+pub mod sheet;
 pub mod sounds;
 pub mod store;

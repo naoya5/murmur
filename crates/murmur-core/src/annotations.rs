@@ -11,8 +11,9 @@
 //! Where: `src-tauri/src/adapters/screen.rs` turns pictures into `ScreenSample`s (16 x 9 cell
 //!        brightness), `pointer.rs` records clicks and cursor positions, the drawing layer sends
 //!        `InkStroke`s. The controller runs `select_keyframes` on `Effect::PlanKeyframes`, cuts
-//!        the audio with `pipeline::segment_at_boundaries` at `boundaries_in_samples`, assigns each
-//!        segment with `keyframe_for_segment`, and renders the bundle text with `summary_text`.
+//!        the audio with `pipeline::segment_by_keyframes` at `keyframe_starts_in_samples` (each
+//!        segment then names its keyframe; `keyframe_for_segment` is the same rule in
+//!        milliseconds), and renders the bundle text with `summary_text`.
 //!        While recording it may call `candidates` on the signals so far to learn which samples
 //!        to keep as PNGs (the function is pure, so calling it again is cheap). All times are
 //!        milliseconds of recording time: the adapters remove paused time before the core sees
@@ -625,14 +626,14 @@ pub fn samples_to_ms(samples: usize) -> Millis {
     (samples as Millis).saturating_mul(1_000) / SAMPLE_RATE_HZ as Millis
 }
 
-/// Where the audio is cut so that no segment spans two keyframes: the start of every keyframe
-/// but the first, in samples.
-pub fn boundaries_in_samples(keyframes: &[Keyframe]) -> Vec<usize> {
-    keyframes
-        .iter()
-        .skip(1)
-        .map(|k| ms_to_samples(k.t_ms))
-        .collect()
+/// The start of every keyframe in samples, ascending, for `pipeline::segment_by_keyframes`.
+pub fn keyframe_starts_in_samples(keyframes: &[Keyframe]) -> Vec<usize> {
+    keyframes.iter().map(|k| ms_to_samples(k.t_ms)).collect()
+}
+
+/// `SEGMENT_LEAD_MS` in samples, for `pipeline::segment_by_keyframes`.
+pub fn segment_lead_samples() -> usize {
+    ms_to_samples(SEGMENT_LEAD_MS)
 }
 
 /// The keyframe number that receives a segment starting at `start_ms`: the newest keyframe that
@@ -1407,14 +1408,25 @@ mod tests {
     }
 
     #[test]
-    fn boundaries_are_the_starts_of_the_later_keyframes() {
+    fn keyframe_starts_feed_the_pipeline_with_the_same_rule() {
         let k = keyframes_at(&[0, 8_200, 21_000]);
-        assert_eq!(
-            boundaries_in_samples(&k),
-            vec![ms_to_samples(8_200), ms_to_samples(21_000)]
-        );
-        assert!(boundaries_in_samples(&k[..1]).is_empty());
-        assert!(boundaries_in_samples(&[]).is_empty());
+        let starts = keyframe_starts_in_samples(&k);
+        assert_eq!(starts, vec![0, ms_to_samples(8_200), ms_to_samples(21_000)]);
+        assert!(keyframe_starts_in_samples(&[]).is_empty());
+        assert_eq!(segment_lead_samples(), 16_000);
+        // The pipeline's index and the millisecond rule agree on every segment start.
+        for start_ms in [0, 500, 7_000, 7_300, 8_200, 19_999, 20_001, 60_000] {
+            let index = crate::pipeline::keyframe_index(
+                &starts,
+                ms_to_samples(start_ms),
+                segment_lead_samples(),
+            );
+            assert_eq!(
+                Some(k[index].n),
+                keyframe_for_segment(start_ms, &k),
+                "start {start_ms}"
+            );
+        }
     }
 
     #[test]

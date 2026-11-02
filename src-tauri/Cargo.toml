@@ -64,9 +64,19 @@ tauri-nspanel = "2.1"
 core-graphics = "0.25"
 block2 = "0.6"
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSDictionary", "NSValue", "NSObject"] }
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSSound"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSDictionary", "NSValue", "NSObject", "NSArray", "NSError", "NSGeometry"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSSound", "NSEvent", "NSWorkspace", "NSRunningApplication"] }
 objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "AVCaptureDevice", "AVMediaFormat"] }
+# Annotations (experimental): screen pictures (ScreenCaptureKit, adapters/screen.rs only, G2),
+# pointer events (adapters/pointer.rs) and the contact sheet (CoreGraphics + CoreText + ImageIO).
+objc2-screen-capture-kit = "0.3"
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+objc2-core-graphics = "0.3"
+objc2-core-foundation = "0.3"
+objc2-image-io = "0.3"
+objc2-core-text = "0.3"
+dispatch2 = "0.3"
 
 [lints]
 workspace = true

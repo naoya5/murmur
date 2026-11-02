@@ -235,52 +235,40 @@ fn starts_cjk(s: &str) -> bool {
 
 // --- annotation segments ---
 
-/// How far on each side of a keyframe boundary the quietest cut point is looked for (400 ms).
-pub const BOUNDARY_SEARCH_SAMPLES: usize = SAMPLE_RATE_HZ as usize * 2 / 5;
-/// Length of the quiet window whose centre becomes the cut point (20 ms).
-pub const QUIET_WINDOW_SAMPLES: usize = SAMPLE_RATE_HZ as usize / 50;
-/// Hop between two quiet windows tried (5 ms).
-const QUIET_HOP_SAMPLES: usize = QUIET_WINDOW_SAMPLES / 4;
 /// A segment shorter than this (1 s of speech) joins a neighbour.
 pub const MIN_SEGMENT_SAMPLES: usize = SAMPLE_RATE_HZ as usize;
 
 /// One piece of an annotation recording to transcribe on its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment {
-    /// What to give the engine: the speech plus context padding at the edges that VAD found.
-    /// An edge cut inside speech (at a keyframe boundary) gets no padding, so that no word is
-    /// heard twice.
+    /// What to give the engine: the speech plus context padding, as the chunks of `plan`.
     pub audio: Range<usize>,
-    /// The speech itself, without padding. Its start decides which keyframe gets the words.
+    /// The speech itself, without padding (its start is what the keyframe rule looked at).
     pub speech: Range<usize>,
+    /// Index into the keyframe starts the segment belongs to (0 when there is none).
+    pub keyframe: usize,
 }
 
-/// A speech range plus whether each edge came from a cut inside speech rather than from VAD.
-#[derive(Debug, Clone)]
-struct Piece {
-    range: Range<usize>,
-    cut_start: bool,
-    cut_end: bool,
-    /// Number of boundaries at or before the start; pieces in different slots never pack together.
-    slot: usize,
-}
-
-/// Cuts the recording of an annotation session into segments.
+/// Cuts the recording of an annotation session into segments, one keyframe each.
 ///
-/// - The speech regions from VAD are the base, cleaned as in `plan`. No region: no segments.
-/// - A region that crosses a keyframe `boundary` (sample position) is cut at the centre of the
-///   quietest `QUIET_WINDOW_SAMPLES` within `BOUNDARY_SEARCH_SAMPLES` of the boundary, inside
-///   the region. `pcm` supplies the loudness; when it is too short the cut lands on the boundary.
-/// - Consecutive pieces between two boundaries pack greedily into segments of at most
-///   `MAX_CHUNK_SAMPLES`, as `plan` does; a single piece over the limit is split in equal parts.
+/// Speech is never cut inside a VAD region: a region that straddles two keyframes goes whole to
+/// the keyframe of its start (stage 0 showed that cutting inside speech breaks the words).
+///
+/// - The regions from VAD are the base, cleaned as in `plan`. No region: no segments.
+/// - Each region belongs to the newest keyframe whose start (`keyframe_starts`, ascending
+///   samples) lies before `region.start + lead`, else to the first keyframe.
+/// - Consecutive regions of one keyframe pack greedily into segments of at most
+///   `MAX_CHUNK_SAMPLES`, as `plan` does. Regions of different keyframes never pack together.
+/// - A single region over the engine limit is split in equal parts (the model cannot take it
+///   whole; this is the one cut inside speech that cannot be avoided).
 /// - A segment with less than `MIN_SEGMENT_SAMPLES` of speech joins the previous segment, or the
-///   next one when there is no previous or the previous is full, even across a boundary.
-/// - VAD edges are padded by `CHUNK_PAD_SAMPLES` and clamped to the buffer; cut edges are not.
-pub fn segment_at_boundaries(
+///   next one when there is no previous or the previous is full, even across keyframes.
+/// - Every edge is padded by `CHUNK_PAD_SAMPLES` and clamped to the buffer, as in `plan`.
+pub fn segment_by_keyframes(
     total_samples: usize,
     regions: &[SpeechRegion],
-    boundaries: &[usize],
-    pcm: &[f32],
+    keyframe_starts: &[usize],
+    lead: usize,
 ) -> Vec<Segment> {
     let regions: Vec<SpeechRegion> = regions
         .iter()
@@ -294,163 +282,71 @@ pub fn segment_at_boundaries(
     if regions.is_empty() {
         return Vec::new();
     }
-    let mut boundaries: Vec<usize> = boundaries
-        .iter()
-        .copied()
-        .filter(|b| *b > 0 && *b < total_samples)
-        .collect();
-    boundaries.sort_unstable();
-    boundaries.dedup();
-
     let limit = MAX_CHUNK_SAMPLES - 2 * CHUNK_PAD_SAMPLES;
-    let mut pieces: Vec<Piece> = Vec::new();
+
+    // Pieces: regions (split when over the limit) with their keyframe.
+    let mut pieces: Vec<(Range<usize>, usize)> = Vec::new();
     for region in regions {
-        let mut at = region.start;
-        let mut cut_start = false;
-        for &b in boundaries
-            .iter()
-            .filter(|b| region.start < **b && **b < region.end)
-        {
-            let cut = quietest_cut(pcm, b, at, region.end);
-            if cut <= at || cut >= region.end {
-                continue;
-            }
-            push_piece(&mut pieces, at..cut, cut_start, true, &boundaries, limit);
-            at = cut;
-            cut_start = true;
+        let keyframe = keyframe_index(keyframe_starts, region.start, lead);
+        for part in split_long(region) {
+            pieces.push((part, keyframe));
         }
-        push_piece(
-            &mut pieces,
-            at..region.end,
-            cut_start,
-            false,
-            &boundaries,
-            limit,
-        );
     }
 
-    // Pack pieces of one slot greedily, as `plan` packs regions.
-    let mut packed: Vec<Piece> = Vec::new();
-    for piece in pieces {
+    // Pack pieces of one keyframe greedily, as `plan` packs regions.
+    let mut packed: Vec<(Range<usize>, usize)> = Vec::new();
+    for (range, keyframe) in pieces {
         match packed.last_mut() {
-            Some(open)
-                if open.slot == piece.slot && piece.range.end - open.range.start <= limit =>
-            {
-                open.range.end = piece.range.end;
-                open.cut_end = piece.cut_end;
+            Some((open, k)) if *k == keyframe && range.end - open.start <= limit => {
+                open.end = range.end;
             }
-            _ => packed.push(piece),
+            _ => packed.push((range, keyframe)),
         }
     }
 
-    // Short segments join a neighbour (the previous when there is one).
-    let mut merged: Vec<Piece> = Vec::new();
+    // Short segments join a neighbour (the previous when there is one and it fits).
+    let mut merged: Vec<(Range<usize>, usize)> = Vec::new();
     let mut i = 0;
-    while i < packed.len() {
-        let piece = packed[i].clone();
-        let short = piece.range.end - piece.range.start < MIN_SEGMENT_SAMPLES;
+    while let Some((range, keyframe)) = packed.get(i).cloned() {
+        let short = range.end - range.start < MIN_SEGMENT_SAMPLES;
         if short {
-            if let Some(prev) = merged.last_mut()
-                && piece.range.end - prev.range.start <= limit
+            if let Some((prev, _)) = merged.last_mut()
+                && range.end - prev.start <= limit
             {
-                prev.range.end = piece.range.end;
-                prev.cut_end = piece.cut_end;
+                prev.end = range.end;
                 i += 1;
                 continue;
             }
-            if let Some(next) = packed.get(i + 1)
-                && next.range.end - piece.range.start <= limit
+            if let Some((next, next_keyframe)) = packed.get(i + 1)
+                && next.end - range.start <= limit
             {
-                merged.push(Piece {
-                    range: piece.range.start..next.range.end,
-                    cut_start: piece.cut_start,
-                    cut_end: next.cut_end,
-                    slot: piece.slot,
-                });
+                merged.push((range.start..next.end, *next_keyframe));
                 i += 2;
                 continue;
             }
         }
-        merged.push(piece);
+        merged.push((range, keyframe));
         i += 1;
     }
 
     merged
         .into_iter()
-        .map(|p| {
-            let start = if p.cut_start {
-                p.range.start
-            } else {
-                p.range.start.saturating_sub(CHUNK_PAD_SAMPLES)
-            };
-            let end = if p.cut_end {
-                p.range.end
-            } else {
-                (p.range.end + CHUNK_PAD_SAMPLES).min(total_samples)
-            };
-            Segment {
-                audio: start..end,
-                speech: p.range,
-            }
+        .map(|(speech, keyframe)| Segment {
+            audio: pad(speech.clone(), total_samples),
+            speech,
+            keyframe,
         })
         .collect()
 }
 
-fn push_piece(
-    pieces: &mut Vec<Piece>,
-    range: Range<usize>,
-    cut_start: bool,
-    cut_end: bool,
-    boundaries: &[usize],
-    limit: usize,
-) {
-    if range.end <= range.start {
-        return;
-    }
-    let slot = boundaries.iter().filter(|b| **b <= range.start).count();
-    let parts = split_long(SpeechRegion {
-        start: range.start,
-        end: range.end,
-    });
-    let last = parts.len().saturating_sub(1);
-    for (i, part) in parts.into_iter().enumerate() {
-        debug_assert!(part.end - part.start <= limit);
-        pieces.push(Piece {
-            range: part,
-            cut_start: if i == 0 { cut_start } else { true },
-            cut_end: if i == last { cut_end } else { true },
-            slot,
-        });
-    }
-}
-
-/// The centre of the quietest window near `boundary`, kept inside `(lo, hi)`. Falls back to the
-/// boundary itself when the audio is too short to judge.
-fn quietest_cut(pcm: &[f32], boundary: usize, lo: usize, hi: usize) -> usize {
-    let search_start = boundary.saturating_sub(BOUNDARY_SEARCH_SAMPLES).max(lo);
-    let search_end = (boundary + BOUNDARY_SEARCH_SAMPLES).min(hi).min(pcm.len());
-    if search_end <= search_start || search_end - search_start < QUIET_WINDOW_SAMPLES {
-        return boundary.clamp(lo, hi);
-    }
-    let mut best_start = search_start;
-    let mut best_energy = f32::INFINITY;
-    let mut start = search_start;
-    while start + QUIET_WINDOW_SAMPLES <= search_end {
-        let energy = window_energy(pcm, start..start + QUIET_WINDOW_SAMPLES);
-        if energy < best_energy {
-            best_energy = energy;
-            best_start = start;
-        }
-        start += QUIET_HOP_SAMPLES;
-    }
-    (best_start + QUIET_WINDOW_SAMPLES / 2).clamp(lo, hi)
-}
-
-/// Sum of squares over `range` (out-of-range samples count as silence).
-pub fn window_energy(pcm: &[f32], range: Range<usize>) -> f32 {
-    pcm.get(range)
-        .map(|w| w.iter().map(|s| s * s).sum())
-        .unwrap_or(0.0)
+/// The keyframe a region starting at `start` belongs to: the newest start before `start + lead`,
+/// else the first (index 0, also when there is no keyframe at all).
+pub fn keyframe_index(keyframe_starts: &[usize], start: usize, lead: usize) -> usize {
+    let limit = start.saturating_add(lead);
+    keyframe_starts
+        .iter()
+        .rposition(|k| *k < limit)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -820,34 +716,22 @@ mod tests {
         assert_eq!(stream(total, &regions, 0), plan(total, &regions));
     }
 
-    // --- segment_at_boundaries ---
-
-    /// A loud tone with a 20 ms quiet dip at `dip_start` samples.
-    fn pcm_with_dip(total: usize, dip_start: usize) -> Vec<f32> {
-        (0..total)
-            .map(|i| {
-                if (dip_start..dip_start + QUIET_WINDOW_SAMPLES).contains(&i) {
-                    0.001
-                } else {
-                    0.5
-                }
-            })
-            .collect()
-    }
+    // --- segment_by_keyframes ---
 
     fn speech_of(segments: &[Segment]) -> Vec<Range<usize>> {
         segments.iter().map(|s| s.speech.clone()).collect()
     }
 
-    /// Segments are ordered, non-empty, under the model limit, and inside the buffer; the audio
-    /// contains the speech.
+    fn keyframes_of(segments: &[Segment]) -> Vec<usize> {
+        segments.iter().map(|s| s.keyframe).collect()
+    }
+
+    /// Segments are ordered, non-empty, under the model limit, inside the buffer, and padded
+    /// like the chunks of `plan`.
     fn check_segments(segments: &[Segment], total: usize) {
         for s in segments {
             assert!(s.speech.start < s.speech.end, "{s:?}");
-            assert!(
-                s.audio.start <= s.speech.start && s.speech.end <= s.audio.end,
-                "{s:?}"
-            );
+            assert_eq!(s.audio, pad(s.speech.clone(), total), "{s:?} padding");
             assert!(s.audio.end <= total, "{s:?} exceeds {total}");
             assert!(
                 s.audio.end - s.audio.start <= MAX_CHUNK_SAMPLES,
@@ -862,151 +746,124 @@ mod tests {
         }
     }
 
+    const LEAD: usize = SAMPLE_RATE_HZ as usize;
+
     #[test]
     fn segment_constants() {
-        assert_eq!(BOUNDARY_SEARCH_SAMPLES, 6_400);
-        assert_eq!(QUIET_WINDOW_SAMPLES, 320);
         assert_eq!(MIN_SEGMENT_SAMPLES, 16_000);
     }
 
     #[test]
-    fn segments_without_regions_are_empty() {
-        assert!(segment_at_boundaries(secs(10.0), &[], &[secs(5.0)], &[]).is_empty());
-        let bad = [SpeechRegion { start: 20, end: 10 }, region(11.0, 12.0)];
-        assert!(segment_at_boundaries(secs(10.0), &bad, &[], &[]).is_empty());
+    fn keyframe_index_looks_one_second_ahead() {
+        let starts = [0, secs(8.2), secs(21.0)];
+        assert_eq!(keyframe_index(&starts, 0, LEAD), 0);
+        assert_eq!(keyframe_index(&starts, secs(7.0), LEAD), 0);
+        assert_eq!(keyframe_index(&starts, secs(7.3), LEAD), 1);
+        assert_eq!(keyframe_index(&starts, secs(20.0), LEAD), 1);
+        assert_eq!(keyframe_index(&starts, secs(20.1), LEAD), 2);
+        // Before the first keyframe, or without keyframes: the first.
+        assert_eq!(keyframe_index(&[secs(3.0)], secs(1.0), LEAD), 0);
+        assert_eq!(keyframe_index(&[], secs(5.0), LEAD), 0);
     }
 
     #[test]
-    fn segments_without_boundaries_pack_the_regions_padded() {
+    fn segments_without_regions_are_empty() {
+        assert!(segment_by_keyframes(secs(10.0), &[], &[0, secs(5.0)], LEAD).is_empty());
+        let bad = [SpeechRegion { start: 20, end: 10 }, region(11.0, 12.0)];
+        assert!(segment_by_keyframes(secs(10.0), &bad, &[0], LEAD).is_empty());
+    }
+
+    #[test]
+    fn regions_of_one_keyframe_pack_into_one_padded_segment() {
         let total = secs(20.0);
         let regions = [region(1.0, 4.0), region(6.0, 9.0)];
-        let got = segment_at_boundaries(total, &regions, &[], &[]);
+        let got = segment_by_keyframes(total, &regions, &[0], LEAD);
         check_segments(&got, total);
         assert_eq!(
             got,
             vec![Segment {
                 audio: secs(1.0) - CHUNK_PAD_SAMPLES..secs(9.0) + CHUNK_PAD_SAMPLES,
                 speech: secs(1.0)..secs(9.0),
+                keyframe: 0,
             }]
         );
+        // No keyframes at all: everything is keyframe 0.
+        let got = segment_by_keyframes(total, &regions, &[], LEAD);
+        assert_eq!(keyframes_of(&got), vec![0]);
         // Padding is clamped to the buffer.
-        let got = segment_at_boundaries(secs(5.0), &[region(0.0, 5.5)], &[], &[]);
+        let got = segment_by_keyframes(secs(5.0), &[region(0.0, 5.5)], &[0], LEAD);
         assert_eq!(got[0].audio, 0..secs(5.0));
     }
 
     #[test]
-    fn a_boundary_inside_speech_cuts_at_the_quietest_window() {
+    fn a_region_straddling_a_keyframe_is_not_cut() {
         let total = secs(20.0);
-        let boundary = secs(10.0);
-        // The dip sits 300 ms after the boundary, inside the 400 ms search range.
-        let dip = boundary + secs(0.3);
-        let pcm = pcm_with_dip(total, dip);
-        let got = segment_at_boundaries(total, &[region(2.0, 18.0)], &[boundary], &pcm);
-        check_segments(&got, total);
-        assert_eq!(got.len(), 2);
-        let cut = got[0].speech.end;
-        assert_eq!(got[1].speech.start, cut);
-        let centre = dip + QUIET_WINDOW_SAMPLES / 2;
-        assert!(
-            cut.abs_diff(centre) <= QUIET_WINDOW_SAMPLES / 4,
-            "cut {cut} is not at the dip centre {centre}"
-        );
-        // No padding across the cut; padding at the VAD edges.
-        assert_eq!(got[0].audio.end, cut);
-        assert_eq!(got[1].audio.start, cut);
-        assert_eq!(got[0].audio.start, secs(2.0) - CHUNK_PAD_SAMPLES);
-        assert_eq!(got[1].audio.end, secs(18.0) + CHUNK_PAD_SAMPLES);
-    }
-
-    #[test]
-    fn a_boundary_without_audio_cuts_at_the_boundary() {
-        let total = secs(20.0);
-        let got = segment_at_boundaries(total, &[region(2.0, 18.0)], &[secs(10.0)], &[]);
+        let got = segment_by_keyframes(total, &[region(2.0, 18.0)], &[0, secs(10.0)], LEAD);
+        assert_eq!(speech_of(&got), vec![secs(2.0)..secs(18.0)]);
         assert_eq!(
-            speech_of(&got),
-            vec![secs(2.0)..secs(10.0), secs(10.0)..secs(18.0)]
+            keyframes_of(&got),
+            vec![0],
+            "the whole sentence goes to its start"
         );
     }
 
     #[test]
-    fn a_boundary_in_a_silence_keeps_the_regions_apart() {
+    fn regions_of_different_keyframes_never_pack_together() {
         let total = secs(20.0);
-        let regions = [region(1.0, 4.0), region(6.0, 9.0)];
-        let got = segment_at_boundaries(total, &regions, &[secs(5.0)], &[]);
+        let regions = [region(1.0, 4.0), region(6.0, 9.0), region(11.0, 14.0)];
+        let got = segment_by_keyframes(total, &regions, &[0, secs(5.0)], LEAD);
         check_segments(&got, total);
         assert_eq!(
             speech_of(&got),
-            vec![secs(1.0)..secs(4.0), secs(6.0)..secs(9.0)]
+            vec![secs(1.0)..secs(4.0), secs(6.0)..secs(14.0)]
         );
-        // Both edges of each segment are VAD edges: padded.
-        assert_eq!(
-            got[0].audio,
-            secs(1.0) - CHUNK_PAD_SAMPLES..secs(4.0) + CHUNK_PAD_SAMPLES
-        );
-        assert_eq!(
-            got[1].audio,
-            secs(6.0) - CHUNK_PAD_SAMPLES..secs(9.0) + CHUNK_PAD_SAMPLES
-        );
+        assert_eq!(keyframes_of(&got), vec![0, 1]);
     }
 
     #[test]
-    fn boundaries_outside_speech_or_buffer_are_ignored() {
+    fn the_lead_moves_a_region_that_starts_just_before_a_keyframe() {
         let total = secs(20.0);
-        let regions = [region(2.0, 8.0)];
-        let got = segment_at_boundaries(
-            total,
-            &regions,
-            &[0, secs(1.0), secs(9.0), total, total + 5],
-            &[],
-        );
-        assert_eq!(speech_of(&got), vec![secs(2.0)..secs(8.0)]);
-        // Several boundaries at the same place cut once.
-        let got = segment_at_boundaries(total, &regions, &[secs(5.0), secs(5.0)], &[]);
-        assert_eq!(
-            speech_of(&got),
-            vec![secs(2.0)..secs(5.0), secs(5.0)..secs(8.0)]
-        );
+        // Speech starts 0.6 s before the keyframe: the words belong to it.
+        let regions = [region(1.0, 3.0), region(4.4, 8.0)];
+        let got = segment_by_keyframes(total, &regions, &[0, secs(5.0)], LEAD);
+        assert_eq!(keyframes_of(&got), vec![0, 1]);
+        // 1.2 s before: they stay with the previous keyframe and pack with it.
+        let regions = [region(1.0, 3.0), region(3.8, 8.0)];
+        let got = segment_by_keyframes(total, &regions, &[0, secs(5.0)], LEAD);
+        assert_eq!(speech_of(&got), vec![secs(1.0)..secs(8.0)]);
+        assert_eq!(keyframes_of(&got), vec![0]);
     }
 
     #[test]
-    fn a_short_piece_joins_the_previous_segment() {
+    fn a_short_region_joins_the_previous_segment_even_across_keyframes() {
         let total = secs(20.0);
-        // The boundary leaves 0.5 s of speech after the cut.
-        let got = segment_at_boundaries(total, &[region(2.0, 8.0)], &[secs(7.5)], &[]);
-        assert_eq!(speech_of(&got), vec![secs(2.0)..secs(8.0)]);
-        // The joined segment ends at a VAD edge again: padded.
-        assert_eq!(got[0].audio.end, secs(8.0) + CHUNK_PAD_SAMPLES);
+        let regions = [region(1.0, 4.0), region(6.0, 6.5)];
+        let got = segment_by_keyframes(total, &regions, &[0, secs(5.0)], LEAD);
+        assert_eq!(speech_of(&got), vec![secs(1.0)..secs(6.5)]);
+        assert_eq!(keyframes_of(&got), vec![0]);
     }
 
     #[test]
-    fn a_short_first_piece_joins_the_next_segment() {
+    fn a_short_first_region_joins_the_next_segment() {
         let total = secs(20.0);
-        let got = segment_at_boundaries(total, &[region(2.0, 8.0)], &[secs(2.5)], &[]);
-        assert_eq!(speech_of(&got), vec![secs(2.0)..secs(8.0)]);
-        assert_eq!(got[0].audio.start, secs(2.0) - CHUNK_PAD_SAMPLES);
-    }
-
-    #[test]
-    fn a_short_region_between_boundaries_joins_across_the_boundary() {
-        let total = secs(30.0);
-        let regions = [region(1.0, 5.0), region(10.0, 10.5), region(20.0, 25.0)];
-        let got = segment_at_boundaries(total, &regions, &[secs(8.0), secs(15.0)], &[]);
-        check_segments(&got, total);
+        let regions = [region(1.0, 1.5), region(6.0, 9.0)];
+        let got = segment_by_keyframes(total, &regions, &[0, secs(5.0)], LEAD);
+        assert_eq!(speech_of(&got), vec![secs(1.0)..secs(9.0)]);
         assert_eq!(
-            speech_of(&got),
-            vec![secs(1.0)..secs(10.5), secs(20.0)..secs(25.0)]
+            keyframes_of(&got),
+            vec![1],
+            "it takes the keyframe of the segment it joined"
         );
     }
 
     #[test]
-    fn long_speech_between_boundaries_is_split_under_the_limit() {
+    fn long_speech_is_split_under_the_limit_and_keeps_its_keyframe() {
         let total = secs(100.0);
-        let got = segment_at_boundaries(total, &[region(0.0, 100.0)], &[], &[]);
+        let got = segment_by_keyframes(total, &[region(0.0, 100.0)], &[0, secs(50.0)], LEAD);
         check_segments(&got, total);
         assert_eq!(got.len(), 4);
-        // Inner edges are cuts inside speech: no padding, no gap.
+        assert!(got.iter().all(|s| s.keyframe == 0));
         for pair in got.windows(2) {
-            assert_eq!(pair[0].audio.end, pair[1].audio.start);
             assert_eq!(pair[0].speech.end, pair[1].speech.start);
         }
         assert_eq!(got[0].audio.start, 0);
@@ -1014,15 +871,15 @@ mod tests {
     }
 
     #[test]
-    fn pieces_in_one_slot_pack_like_plan() {
+    fn packing_within_a_keyframe_follows_plan() {
         let total = secs(60.0);
-        // 10 s of speech, 2 s of silence, repeated; one boundary at 30 s inside the silence.
+        // 10 s of speech, 2 s of silence, repeated; the second keyframe starts in the silence
+        // at 35 s, so 36-46 and 48-58 belong to it.
         let regions: Vec<SpeechRegion> = (0..5)
             .map(|i| region(i as f64 * 12.0, i as f64 * 12.0 + 10.0))
             .collect();
-        let got = segment_at_boundaries(total, &regions, &[secs(35.0)], &[]);
+        let got = segment_by_keyframes(total, &regions, &[0, secs(35.0)], LEAD);
         check_segments(&got, total);
-        // 0-22 fits, 24-34 does not join it; 24-34 is alone before the boundary; 36-58 after.
         assert_eq!(
             speech_of(&got),
             vec![
@@ -1031,6 +888,7 @@ mod tests {
                 secs(36.0)..secs(58.0)
             ]
         );
+        assert_eq!(keyframes_of(&got), vec![0, 0, 1]);
     }
 
     #[test]
@@ -1039,13 +897,12 @@ mod tests {
             let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
             let total = secs(5.0) + rng.below(secs(90.0) as u64) as usize;
             let regions = random_regions(&mut rng, total);
-            let boundaries: Vec<usize> = (0..rng.below(8))
-                .map(|_| rng.below(total as u64 + 10) as usize)
+            let mut starts: Vec<usize> = (0..rng.below(6))
+                .map(|_| rng.below(total as u64) as usize)
                 .collect();
-            let pcm: Vec<f32> = (0..total)
-                .map(|i| ((i as f32) * 0.37).sin() * 0.5)
-                .collect();
-            let got = segment_at_boundaries(total, &regions, &boundaries, &pcm);
+            starts.sort_unstable();
+            starts.dedup();
+            let got = segment_by_keyframes(total, &regions, &starts, LEAD);
             check_segments(&got, total);
             // Every speech sample is in exactly one segment, and a segment starts and ends on
             // speech (it may span the silences between regions, as a chunk of `plan` does).
@@ -1069,6 +926,7 @@ mod tests {
                     assert!(!covered[i], "seed {seed}: sample {i} in two segments");
                     covered[i] = true;
                 }
+                assert!(s.keyframe < starts.len().max(1), "seed {seed}: {s:?}");
             }
             let missed = is_speech
                 .iter()
@@ -1079,6 +937,23 @@ mod tests {
                 missed, 0,
                 "seed {seed}: {missed} speech samples in no segment"
             );
+            // A segment with at least a second of speech never mixes keyframes: every region
+            // it holds maps to its keyframe (short joins are the one exception).
+            for s in &got {
+                if s.speech.end - s.speech.start >= MIN_SEGMENT_SAMPLES {
+                    let inside = regions
+                        .iter()
+                        .filter(|r| r.start >= s.speech.start && r.start < s.speech.end)
+                        .filter(|r| r.end - r.start >= MIN_SEGMENT_SAMPLES);
+                    for r in inside {
+                        let k = keyframe_index(&starts, r.start, LEAD);
+                        assert!(
+                            k == s.keyframe || r.end - r.start < MIN_SEGMENT_SAMPLES,
+                            "seed {seed}: region {r:?} (keyframe {k}) inside {s:?}"
+                        );
+                    }
+                }
+            }
         }
     }
 }

@@ -216,6 +216,7 @@ pub fn create_overlay(app: &AppHandle) -> Result<(), WindowError> {
 /// Main thread only.
 fn build_overlay(app: &AppHandle) -> Result<(), WindowError> {
     if app.get_webview_window(OVERLAY_LABEL).is_some() {
+        tracing::info!("annotations drawing layer already exists");
         return Ok(());
     }
     let window =
@@ -255,6 +256,7 @@ fn build_overlay(app: &AppHandle) -> Result<(), WindowError> {
     panel.set_ignores_mouse_events(true);
     // Never part of a screen capture: not Murmur's own, not another app's screen share.
     panel.as_panel().setSharingType(NSWindowSharingType::None);
+    tracing::info!("annotations drawing layer created");
     Ok(())
 }
 
@@ -262,8 +264,24 @@ fn build_overlay(app: &AppHandle) -> Result<(), WindowError> {
 pub fn destroy_overlay(app: &AppHandle) {
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
-        if let Some(window) = handle.get_webview_window(OVERLAY_LABEL) {
-            let _ = window.destroy();
+        // A panel must become a plain window again before Tauri closes it (tauri-nspanel's own
+        // close path); closing the panel directly throws inside the run loop.
+        let window = match handle.get_webview_panel(OVERLAY_LABEL) {
+            Ok(panel) => {
+                panel.hide();
+                panel.to_window()
+            }
+            Err(_) => handle.get_webview_window(OVERLAY_LABEL),
+        };
+        match window {
+            Some(window) => {
+                if let Err(error) = window.close() {
+                    tracing::warn!(%error, "annotations drawing layer could not be closed");
+                } else {
+                    tracing::info!("annotations drawing layer destroyed");
+                }
+            }
+            None => tracing::info!("annotations drawing layer was not there"),
         }
     });
 }

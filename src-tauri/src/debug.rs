@@ -1,30 +1,50 @@
 //! Debug-build-only triggers for end-to-end tests without real keys (ARCHITECTURE, deviations):
 //! SIGUSR1 acts as the main hotkey (toggle), SIGUSR2 as Esc. Combined with the `wav:<path>`
 //! microphone, a test drives a full dictation: `kill -USR1 <pid>`, wait, `kill -USR1 <pid>`.
+//! SIGINFO flips the experimental annotations switch (the setting), SIGWINCH acts as the
+//! annotations hotkey.
+
+use std::sync::Arc;
 
 use murmur_core::session::Event;
 use murmur_core::settings::RecordMode;
 use tokio::signal::unix::{SignalKind, signal};
 
-use crate::controller::ControllerHandle;
+use crate::app::App;
+use crate::controller::{ControllerHandle, Msg};
 
-pub fn install(controller: ControllerHandle) {
+pub fn install(app: tauri::AppHandle, services: Arc<App>, controller: ControllerHandle) {
     tauri::async_runtime::spawn(async move {
-        let (Ok(mut hotkey), Ok(mut esc)) = (
+        let (Ok(mut hotkey), Ok(mut esc), Ok(mut toggle), Ok(mut annotations)) = (
             signal(SignalKind::user_defined1()),
             signal(SignalKind::user_defined2()),
+            signal(SignalKind::info()),
+            signal(SignalKind::window_change()),
         ) else {
             tracing::warn!("debug signal triggers unavailable");
             return;
         };
         tracing::info!(
             pid = std::process::id(),
-            "debug triggers: SIGUSR1 = hotkey, SIGUSR2 = Esc"
+            "debug triggers: SIGUSR1 = hotkey, SIGUSR2 = Esc, SIGINFO = annotations on/off, SIGWINCH = annotations hotkey"
         );
         loop {
             tokio::select! {
                 Some(()) = hotkey.recv() => controller.event(Event::HotkeyDown { mode: RecordMode::Toggle }),
                 Some(()) = esc.recv() => controller.event(Event::Esc),
+                Some(()) = annotations.recv() => controller.send(Msg::AnnotationsHotkey),
+                Some(()) = toggle.recv() => {
+                    let (app, services) = (app.clone(), services.clone());
+                    tauri::async_runtime::spawn_blocking(move || {
+                        let mut settings = services.settings();
+                        settings.annotations_enabled = !settings.annotations_enabled;
+                        let enabled = settings.annotations_enabled;
+                        match crate::settings_apply::update(&app, &services, settings) {
+                            Ok(_) => tracing::info!(enabled, "debug: annotations switch flipped"),
+                            Err(error) => tracing::warn!(%error, "debug: annotations switch failed"),
+                        }
+                    });
+                }
                 else => break,
             }
         }

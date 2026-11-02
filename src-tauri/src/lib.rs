@@ -142,7 +142,7 @@ fn start(handle: &AppHandle) -> Result<Arc<App>, Box<dyn std::error::Error>> {
     });
     #[cfg(debug_assertions)]
     {
-        debug::install(controller);
+        debug::install(handle.clone(), services.clone(), controller);
         debug::show_initial_view(handle);
     }
     Ok(services)
