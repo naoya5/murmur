@@ -8,7 +8,9 @@ on:
 
 jobs:
   release:
-    runs-on: macos-latest # Apple silicon (arm64)
+    # macOS 26 image (Apple silicon): each Xcode on it is 26.x, and the sidecar's tensor
+    # metallib needs the macOS 26 SDK (scripts/build-sidecar.sh). macos-latest moves on its own.
+    runs-on: macos-26
     timeout-minutes: 90
     permissions:
       contents: write
