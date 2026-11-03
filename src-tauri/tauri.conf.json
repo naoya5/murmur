@@ -63,6 +63,10 @@
     "externalBin": [
       "binaries/murmur-llm"
     ],
+    "resources": {
+      "binaries/default.metallib": "default.metallib",
+      "binaries/ggml-tensor.metallib": "ggml-tensor.metallib"
+    },
     "macOS": {
       "minimumSystemVersion": "14.0",
       "hardenedRuntime": true,

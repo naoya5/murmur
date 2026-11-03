@@ -29,7 +29,12 @@
 //!
 //! - `load`: required `model` (local GGUF path string), optional `ctx` (u32, default 2048,
 //!   inclusive range 128..=32768). Replaces the previous model and clears its warm state. A failed
-//!   replacement leaves no model loaded. Success: `load_ms` (acceptance through model/context
+//!   replacement leaves no model loaded. Both `default.metallib` and `ggml-tensor.metallib`
+//!   must be readable in ggml's bundle-resource/argv-directory lookup before native init.
+//!   A Metal backend must initialize successfully; missing or unusable libraries never select
+//!   CPU or source compilation. Tensor use remains ggml's device decision; a corrupt tensor
+//!   library on a tensor-capable GPU can still trigger ggml's own tensor-disable path.
+//!   Success: `load_ms` (acceptance through model/context
 //!   creation), `ctx` (effective context size), `gpu_offload_supported` (backend capability bool,
 //!   not a claim that every layer was placed on GPU). Requests all layers on Metal.
 //! - `warm`: chat input as below, ending in a system or assistant turn. Clears the old snapshot,
@@ -67,10 +72,13 @@
 //! # Fixed errors
 //! Reader/startup errors (no total_ms): `invalid_request` (schema/JSON), `invalid_id` (not u64 or
 //! string), `request_too_large` (line limit, then teardown), `stdin_read_failed` (read/UTF-8,
-//! then teardown), `worker_start_failed` (thread spawn, then exit), `backend_init_failed`
-//! (native initialization, worker exits), `worker_unavailable` (lock/channel failure), `busy`.
+//! then teardown), `worker_start_failed` (thread spawn, then exit),
+//! `worker_unavailable` (lock/channel failure), `busy`.
 //! Worker errors (with total_ms): `model_not_loaded` (warm/generate before successful load),
 //! `invalid_ctx` (range), `model_load_failed` (file/load/progress abort), `context_create_failed`,
+//! `backend_init_failed` (native initialization),
+//! `metal_library_missing` (a required metallib is absent/unreadable),
+//! `metal_library_load_failed` (the GPU backend could not initialize, including corrupt default),
 //! `cancelled`, `timeout`, `ambiguous_chat_input`, `missing_system_or_messages`,
 //! `invalid_user_turn` (legacy fields inconsistent with operation), `empty_messages`,
 //! `invalid_message_order`, `invalid_final_role`, `only_temperature_zero_supported`,
@@ -99,6 +107,7 @@ use serde_json::{Value, json};
 use std::{
     io::{self, BufRead, Read, Write},
     num::NonZeroU32,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -292,19 +301,71 @@ unsafe extern "C" fn drop_log(
 ) {
 }
 
+const METAL_LIBRARIES: &[&str] = &["default.metallib", "ggml-tensor.metallib"];
+
+/// Match ggml's lookup: the app bundle's Resources first, then argv[0]'s directory. Do not
+/// consult source-kernel paths or the build machine's output directory at runtime.
+fn metallib_roots(executable: &Path, argv0: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(macos) = executable.parent()
+        && macos.file_name().is_some_and(|name| name == "MacOS")
+        && let Some(contents) = macos.parent()
+        && contents.file_name().is_some_and(|name| name == "Contents")
+    {
+        roots.push(contents.join("Resources"));
+    }
+    if let Some(directory) = argv0.parent() {
+        roots.push(directory.to_path_buf());
+    }
+    roots
+}
+
+fn require_metallibs(roots: &[PathBuf]) -> Result<()> {
+    for name in METAL_LIBRARIES {
+        if !roots.iter().any(|root| {
+            let path = root.join(name);
+            path.is_file() && std::fs::File::open(path).is_ok()
+        }) {
+            return Err("metal_library_missing");
+        }
+    }
+    Ok(())
+}
+
+fn initialize_backend() -> Result<LlamaBackend> {
+    let executable = std::env::current_exe().map_err(|_| "metal_library_missing")?;
+    let argv0 = std::env::args_os()
+        .next()
+        .map(PathBuf::from)
+        .ok_or("metal_library_missing")?;
+    require_metallibs(&metallib_roots(&executable, &argv0))?;
+    let backend = LlamaBackend::init().map_err(|_| "backend_init_failed")?;
+    // GPU registration/support alone does not imply its library loaded. Creating a backend
+    // exercises ggml_metal_init; failure must not silently leave model loading on the CPU.
+    let metal = unsafe {
+        llama_cpp_sys_2::ggml_backend_init_by_type(
+            llama_cpp_sys_2::GGML_BACKEND_DEVICE_TYPE_GPU,
+            std::ptr::null(),
+        )
+    };
+    if metal.is_null() {
+        return Err("metal_library_load_failed");
+    }
+    // SAFETY: a successful init returns one owned backend; the device's shared library stays
+    // cached while this temporary backend context is released before loading any model.
+    unsafe { llama_cpp_sys_2::ggml_backend_free(metal) };
+    Ok(backend)
+}
+
 fn worker(rx: mpsc::Receiver<Job>, active: Active) {
     // Install callbacks before backend initialization, including ggml's independent logger.
     unsafe {
         llama_cpp_sys_2::llama_log_set(Some(drop_log), std::ptr::null_mut());
         llama_cpp_sys_2::ggml_log_set(Some(drop_log), std::ptr::null_mut());
     }
-    let backend = match LlamaBackend::init() {
-        Ok(backend) => backend,
-        Err(_) => {
-            emit(json!({"id":null,"ok":false,"error":"backend_init_failed"}));
-            return;
-        }
-    };
+    // Keep initialization errors for the load response so the app receives a fixed, correlated
+    // error rather than an unsolicited failure followed by a dead worker.
+    let backend_result = initialize_backend();
     let mut pending = None;
     loop {
         let job = match pending.take() {
@@ -332,6 +393,13 @@ fn worker(rx: mpsc::Receiver<Job>, active: Active) {
             finish(&job, Err("model_load_failed"), &active);
             continue;
         }
+        let backend = match &backend_result {
+            Ok(backend) => backend,
+            Err(error) => {
+                finish(&job, Err(error), &active);
+                continue;
+            }
+        };
         let started = job.started;
         let cancel = job.cancel.clone();
         let params = LlamaModelParams::default()
@@ -339,7 +407,7 @@ fn worker(rx: mpsc::Receiver<Job>, active: Active) {
             .with_progress_callback(move |_| {
                 !cancel.load(Ordering::Relaxed) && started.elapsed() < Duration::from_secs(60)
             });
-        let model = match LlamaModel::load_from_file(&backend, path, &params) {
+        let model = match LlamaModel::load_from_file(backend, path, &params) {
             Ok(model) => model,
             Err(_) => {
                 finish(&job, Err("model_load_failed"), &active);
@@ -352,7 +420,7 @@ fn worker(rx: mpsc::Receiver<Job>, active: Active) {
             .with_n_ubatch(64)
             .with_n_threads(4)
             .with_n_threads_batch(4);
-        let mut context = match model.new_context(&backend, ctx_params) {
+        let mut context = match model.new_context(backend, ctx_params) {
             Ok(context) => context,
             Err(_) => {
                 finish(&job, Err("context_create_failed"), &active);
@@ -766,6 +834,23 @@ mod tests {
     fn non_thinking_rejects_unrecognized_prefix_without_stripping_text() {
         assert!(disable_qwen_thinking("no assistant prefix".into()).is_err());
         assert!(disable_qwen_thinking("<|im_start|>assistant\nactual content".into()).is_err());
+    }
+
+    #[test]
+    fn metallib_lookup_matches_dev_and_bundle_layouts() {
+        let dev = Path::new("/work/target/debug/murmur-llm");
+        assert_eq!(
+            metallib_roots(dev, dev),
+            vec![PathBuf::from("/work/target/debug")]
+        );
+        let bundled = Path::new("/Applications/Murmur.app/Contents/MacOS/murmur-llm");
+        assert_eq!(
+            metallib_roots(bundled, bundled),
+            vec![
+                PathBuf::from("/Applications/Murmur.app/Contents/Resources"),
+                PathBuf::from("/Applications/Murmur.app/Contents/MacOS"),
+            ]
+        );
     }
 
     #[test]

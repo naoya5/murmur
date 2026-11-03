@@ -169,7 +169,9 @@ enum Why {
 enum CallError {
     /// The process ended (or its pipes broke).
     Exited,
-    /// The sidecar reported a fatal error that no request id carries (`backend_init_failed`).
+    /// The sidecar reported an error that no request id carries (`worker_start_failed`, or
+    /// `invalid_request` for a line it could not read). Backend and Metal failures are not this:
+    /// they come back as the load request's own error.
     Fatal(String),
     /// The sidecar answered the cancel; the process is still usable.
     Interrupted(Why),
@@ -997,10 +999,11 @@ mod tests {
     /// `ok`, `runaway` (stops at max_tokens), `nostop` / `badstop` (no or an unknown stop reason),
     /// `slow` (answers a generation only when cancelled), `hang` (ignores the cancel too),
     /// `crash` (exits on a generation), `deaf` (stops reading its input after a warm-up),
-    /// `initfail` (reports `backend_init_failed` without an id at the load), `slowload` (the load
-    /// waits for `<log>.go`, reading nothing meanwhile). Every start, load and warm-up is appended
-    /// to `log`; while `<log>.fail` exists the load fails, while `<log>.warmfail` exists the
-    /// warm-up fails.
+    /// `initfail` (reports `worker_start_failed` without an id at startup, then exits), `nometal`
+    /// (the load fails with its id and `metal_library_missing`), `slowload` (the load waits for
+    /// `<log>.go`, reading nothing meanwhile). Every start (with a `pid` line), load, warm-up and
+    /// generation is appended to `log`; while `<log>.fail` exists the load fails, while
+    /// `<log>.warmfail` exists the warm-up fails.
     fn fake_sidecar(name: &str, mode: &str) -> (PathBuf, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "murmur-refiner-{}-{name}-{}",
@@ -1015,6 +1018,11 @@ mod tests {
 MODE={mode}
 LOG='{log}'
 echo start >> "$LOG"
+echo "pid $$" >> "$LOG"
+if [ "$MODE" = initfail ]; then
+  printf '{{"id":null,"ok":false,"error":"worker_start_failed"}}\n'
+  exit 0
+fi
 # Sets n to the number after a key, without starting a process per line.
 number() {{
   n=
@@ -1033,8 +1041,8 @@ while IFS= read -r line; do
       fi ;;
     *'"op":"load"'*)
       echo load >> "$LOG"
-      if [ "$MODE" = initfail ]; then
-        printf '{{"id":null,"ok":false,"error":"backend_init_failed"}}\n'
+      if [ "$MODE" = nometal ]; then
+        printf '{{"id":%s,"ok":false,"error":"metal_library_missing","total_ms":1}}\n' "$id"
         continue
       fi
       if [ "$MODE" = slowload ]; then
@@ -1057,6 +1065,7 @@ while IFS= read -r line; do
         exec sleep 30
       fi ;;
     *'"op":"generate"'*)
+      echo generate >> "$LOG"
       case "$MODE" in
         ok) printf '{{"id":%s,"ok":true,"error":null,"text":"The meeting is at four.","stop_reason":"eos","total_ms":1}}\n' "$id" ;;
         runaway) printf '{{"id":%s,"ok":true,"error":null,"text":"The the the","stop_reason":"max_tokens","total_ms":1}}\n' "$id" ;;
@@ -1105,6 +1114,36 @@ done
             .output()
             .unwrap();
         String::from_utf8_lossy(&out.stdout).trim().is_empty()
+    }
+
+    /// The process ids of every start of the fake.
+    fn pids(log: &Path) -> Vec<u32> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.strip_prefix("pid ")?.parse().ok())
+            .collect()
+    }
+
+    /// Collects the log output of the test thread.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
     }
 
     fn refiner(script: PathBuf) -> Refiner {
@@ -1344,15 +1383,72 @@ done
         let started = Instant::now();
         assert_eq!(
             r.handle().warm(RefineKind::Translate, &[]),
-            Err(RefineError::Unavailable("backend_init_failed".to_owned()))
+            Err(RefineError::Unavailable("worker_start_failed".to_owned()))
         );
-        // At once: not after the 60 s load budget.
-        assert!(started.elapsed() < Duration::from_secs(5));
+        // At once: not after the start timeout, and with its own code, not as an exit.
+        assert!(started.elapsed() < ms(refine::REFINER_START_TIMEOUT_MS));
         assert_eq!(
             r.status().translate_error.as_deref(),
-            Some("backend_init_failed")
+            Some("worker_start_failed")
         );
         assert_eq!(r.pid(RefineKind::Translate), None);
+    }
+
+    #[test]
+    fn a_metal_library_load_error_is_unavailable_and_tried_once_per_call() {
+        let (script, log) = fake_sidecar("nometal", "nometal");
+        let r = refiner(script);
+        let mut h = r.handle();
+        let refused = || Err(RefineError::Unavailable("metal_library_missing".to_owned()));
+        // More calls than the restart budget allows after crashes.
+        let calls = refine::REFINER_MAX_RESTARTS + 2;
+        let started = Instant::now();
+        // The first call is not captured. It registers this path's log call sites before the
+        // test subscriber exists, so creating the subscriber includes them. A call site that a
+        // parallel test registers first, while this is the only subscriber, can stay disabled.
+        assert_eq!(generate(&mut h, 2_000), refused());
+        let logs = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer({
+                let logs = logs.clone();
+                move || logs.clone()
+            })
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 1..calls {
+                assert_eq!(generate(&mut h, 2_000), refused());
+            }
+        });
+        // Each call fails at once (not after the 60 s load budget) with one start and one load:
+        // no retry inside a call. A load error is not a crash, so it does not use the restart
+        // budget, and nothing starts the sidecar again without a call.
+        assert!(started.elapsed() < Duration::from_secs(5));
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(count(&log, "start"), calls);
+        assert_eq!(count(&log, "load"), calls);
+        assert_eq!(count(&log, "generate"), 0, "the text is never sent");
+        assert_eq!(
+            r.status(),
+            RefinerStatus {
+                translate_error: Some("metal_library_missing".to_owned()),
+                clean_error: None,
+            }
+        );
+        assert_eq!(r.pid(RefineKind::Translate), None);
+        let started = pids(&log);
+        assert_eq!(started.len(), calls);
+        for pid in started {
+            assert!(
+                wait_until(Duration::from_secs(2), || reaped(pid)),
+                "pid {pid}"
+            );
+        }
+        // The code is logged; the text to translate is not.
+        let logged = logs.text();
+        assert!(logged.contains("metal_library_missing"), "{logged}");
+        assert!(!logged.contains("会議"), "{logged}");
     }
 
     #[test]

@@ -18,6 +18,13 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Install Metal Toolchain when missing
+        run: |
+          if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun -sdk macosx metal --version
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

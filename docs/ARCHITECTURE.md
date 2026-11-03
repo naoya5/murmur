@@ -29,7 +29,7 @@ Read in this order. Each step names where to go next.
 |---|---|---|---|
 | Core | `crates/murmur-core` | std, serde, specta, unicode-segmentation | Tauri, files, network, OS APIs, SDKs |
 | Speech FFI | `crates/speech-sys` | speech.cpp (git submodule, pinned tag) | anything else |
-| LLM sidecar | `crates/murmur-llm` (its own executable, bundled as `externalBin`) | llama.cpp | the app's code; it only speaks JSON Lines |
+| LLM sidecar | `crates/murmur-llm` (its own executable, bundled as `externalBin`; its precompiled `default.metallib` and `ggml-tensor.metallib` are bundle resources) | llama.cpp | the app's code; it only speaks JSON Lines |
 | Adapters | `src-tauri/src/adapters`, `src-tauri/src/platform` | core, one SDK each | other adapters' internals |
 | Assembly | `src-tauri/src/{lib,controller,inference,ipc,windows,tray,settings_apply,annotation_session,bundles,refine_session}.rs` | core, adapters | business rules |
 | UI | `src/` | the backend through `src/ipc/` only | `invoke` directly, business rules |

@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use std::{
     error::Error,
     io::{BufRead, BufReader, Read, Write},
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc::{self, Receiver},
     time::{Duration, Instant},
@@ -19,7 +20,11 @@ struct Client {
 
 impl Client {
     fn start() -> TestResult<Self> {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_murmur-llm"))
+        Self::start_from(Path::new(env!("CARGO_BIN_EXE_murmur-llm")))
+    }
+
+    fn start_from(binary: &Path) -> TestResult<Self> {
+        let mut child = Command::new(binary)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -138,4 +143,69 @@ fn loading_failures_leave_worker_available_and_no_model_loaded() -> TestResult {
 #[test]
 fn idle_stdin_eof_terminates_without_a_request() -> TestResult {
     Client::start()?.close()
+}
+
+struct LibraryFixture {
+    root: PathBuf,
+    binary: PathBuf,
+    model: PathBuf,
+}
+
+impl LibraryFixture {
+    fn new(case: &str) -> TestResult<Self> {
+        let root =
+            std::env::temp_dir().join(format!("murmur-metallib-{}-{case}", std::process::id()));
+        std::fs::create_dir(&root)?;
+        let binary = root.join("murmur-llm");
+        std::fs::copy(env!("CARGO_BIN_EXE_murmur-llm"), &binary)?;
+        // A regular file passes the path precheck. No GGUF is parsed unless Metal setup
+        // incorrectly succeeds, in which case the error assertion below fails.
+        let model = root.join("fixture.gguf");
+        std::fs::write(&model, [])?;
+        Ok(Self {
+            root,
+            binary,
+            model,
+        })
+    }
+
+    fn reject_load(&self, error: &str) -> TestResult {
+        let mut client = Client::start_from(&self.binary)?;
+        let reply = client.request(&json!({"id":1,"op":"load","model":self.model}).to_string())?;
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error"], error);
+        // Failure is correlated and the reader/worker stay usable without a model.
+        let reply = client.request(r#"{"id":2,"op":"warm","system":"s"}"#)?;
+        assert_eq!(reply["error"], "model_not_loaded");
+        client.close()
+    }
+}
+
+impl Drop for LibraryFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn missing_default_metallib_fails_before_native_initialization() -> TestResult {
+    let fixture = LibraryFixture::new("missing-default")?;
+    std::fs::write(fixture.root.join("ggml-tensor.metallib"), b"fixture")?;
+    fixture.reject_load("metal_library_missing")
+}
+
+#[test]
+fn missing_tensor_metallib_is_an_error_even_on_a_non_tensor_gpu() -> TestResult {
+    let fixture = LibraryFixture::new("missing-tensor")?;
+    std::fs::write(fixture.root.join("default.metallib"), b"fixture")?;
+    fixture.reject_load("metal_library_missing")
+}
+
+#[test]
+fn corrupt_default_metallib_does_not_fall_back_to_cpu_or_source() -> TestResult {
+    let fixture = LibraryFixture::new("corrupt-default")?;
+    for name in ["default.metallib", "ggml-tensor.metallib"] {
+        std::fs::write(fixture.root.join(name), b"not a Metal library")?;
+    }
+    fixture.reject_load("metal_library_load_failed")
 }

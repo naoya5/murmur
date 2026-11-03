@@ -204,3 +204,199 @@ the numeric-only benchmark runner are additions. Build profiles in this crate's 
 cleaned after tuning, leaving about 176 MiB before rebuilding the final checks; the final target
 footprint is about 2.0 GiB, below the 3 GiB budget. No app build, model download, commit, push or
 change outside the assigned ownership was performed.
+
+## M4: precompiled Metal libraries (2026-11-04)
+
+### Change and build provenance
+
+The native source remains the official crates.io 0.1.160 release; no fork or new dependency is
+used. The root `.cargo/config.toml` supplies `GGML_METAL_EMBED_LIBRARY=OFF` and
+`MACOSX_DEPLOYMENT_TARGET=14.0`. A forced rebuild of the native dependency in this crate's own
+existing target directory confirmed the root configuration reaches `build.rs` even when Cargo
+is invoked from the repository root with `--manifest-path`. The native CMake cache records:
+
+```text
+CMAKE_BUILD_TYPE:STRING=Release
+CMAKE_OSX_DEPLOYMENT_TARGET:STRING=14.0
+GGML_METAL_EMBED_LIBRARY:BOOL=OFF
+GGML_METAL_MACOSX_VERSION_MIN:STRING=
+```
+
+Do not set GGML_METAL_MACOSX_VERSION_MIN to 14.0 with this pinned CMake version: that adds
+`-mmacosx-version-min=14.0` to the tensor compile command, which also adds
+`-mtargetos=macos26.0`, and Metal rejects that combination. The inherited deployment-target
+environment alone correctly gives default shaders macOS 14 and lets the explicit tensor target
+select macOS 26. Actual output verification with `xcrun -sdk macosx metal-vtool --show`:
+
+| Linked library | Bytes | PlatformMajor / Minor | Minimum OS |
+| --- | ---: | --- | --- |
+| default.metallib | 15,094,049 | 14 / 0 | macOS 14.0 |
+| ggml-tensor.metallib | 2,251,442 | 26 / 0 | macOS 26.0 |
+
+All 37 input AIR modules were also checked: 35 ordinary modules report OS Version 14.0, and the
+two tensor modules report 26.0. The compiler was Apple metal 32023.883 with macOS SDK 26.5.
+This verifies compiled minimum-OS metadata, not execution on an actual macOS 14/15 machine.
+
+The tensor loader is guarded by ggml's has_tensor device property. That property first requires
+Metal family 4 support and is disabled by default on pre-M5/pre-A19 devices. Older macOS releases
+do not advertise that family. A present tensor file therefore is not loaded on those systems;
+its macOS 26 minimum does not force ordinary shaders to require 26. No Metal kernel-source path
+or CPU fallback is used when a required library is missing or default cannot initialize.
+
+### Before/after method
+
+`metallib_bench.py` is tracked alongside the 10x10 benchmark runner. It uses existing E2E GGUF
+files, synthetic Japanese text, and the current core cleanup system/six-shot prefix with an
+empty glossary. No prompt, output or captured stderr is persisted. Both binary versions use the
+same script, models, context 2048 and generation cap. OS/driver caches are not deleted.
+
+1. Start four processes successively, alternating ENJP/Qwen, and keep all earlier processes
+   alive until the fourth load completes. The embedded baseline uses a fresh executable copy;
+   the precompiled case uses the newly built executable with adjacent metallibs.
+2. Three new solo processes per model, each closed before the next starts.
+3. A fresh process per model: load, warm the fixed prefix, then the first user prefill/generation.
+   The fixture has 167 characters; the uncached prompt parts contain 113 ENJP tokens and 111
+   Qwen tokens, both exceeding the requested 84-token minimum.
+
+CPU is the largest observed aggregate `ps %cpu` across MTLCompilerService processes while a case
+runs. It is a sampled system observation, not a per-child attribution; desktop activity can
+contribute. All timings below are milliseconds. These are small operational samples, not new
+100-request latency distributions.
+
+### Four simultaneously resident sidecars
+
+| Start | Model | Embedded load_ms | Precompiled load_ms | Peak compiler CPU before / after |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | ENJP | 10368.95 | 407.92 | 756.7% / 0% |
+| 2 | Qwen | 10345.28 | 1168.00 | 723.9% / 0% |
+| 3 | ENJP | 9471.99 | 128.83 | 668.8% / 0% |
+| 4 | Qwen | 9111.11 | 418.34 | 643.3% / 0% |
+
+The repeated approximately ten-second source-compilation stall is absent from these precompiled
+loads, including later processes kept alive together. Warm/solo load measurements:
+
+| Model | Three embedded load_ms | Three precompiled load_ms | Median before / after |
+| --- | --- | --- | ---: |
+| ENJP | 177.05, 159.63, 152.74 | 108.40, 112.86, 120.85 | 159.63 / 112.86 |
+| Qwen | 433.63, 552.87, 413.27 | 402.50, 389.08, 400.81 | 433.63 / 400.81 |
+
+### First prefill: remaining first-use cost
+
+| Model | Prefix warm before / after | prompt_ms before / after | gen_ms before / after | New prompt tokens |
+| --- | ---: | ---: | ---: | ---: |
+| ENJP | 31.49 / 653.40 | 23.43 / 328.11 | 385.01 / 413.60 | 113 |
+| Qwen | 310.72 / 1066.23 | 60.08 / 56.88 | 1643.89 / 1315.02 | 111 |
+
+Both answers reached EOS (94 ENJP output tokens, 93 Qwen tokens). The first new precompiled
+library use still produced compiler activity, up to 86.3% for ENJP and 71.7% for Qwen, consistent
+with first-use GPU pipeline preparation. Pipeline caches differ between the previously exercised
+embedded library and the new artifact, so these n=1 values do not isolate a prefill speedup or
+regression. In particular, this change does **not** establish that first prefill is always fast
+or eliminate all MTLCompilerService work. It fixes the measured repeated source-compile load
+stall; warming at recording start remains important.
+
+### Required-resource failure behavior and checks
+
+The sidecar requires the two literal filenames before native initialization. Missing or
+unreadable resources yield a correlated `load` error `metal_library_missing`. A successful GPU
+backend registration is not sufficient: a temporary GPU backend must actually initialize;
+failure, including a corrupt default library, yields `metal_library_load_failed` rather than
+continuing with a CPU model. Backend initialization failure is now also a correlated load error,
+not an unsolicited null-ID message followed by a dead worker.
+
+`pnpm check:sidecar` passed: fmt, warnings-denied clippy, 11 unit tests and six process tests.
+The three new black-box cases verify missing default, corrupt default and missing tensor. The
+missing-tensor case fails before backend initialization even on this non-tensor M4 setup. Error
+responses retain the request ID, the worker remains responsive, and stderr stays empty.
+
+Local checks used `LLAMA_LIB_PROFILE=Release`, verified in both check/test native CMake caches.
+That compiles native test/clippy dependencies as C++ Release instead of RelWithDebInfo, saving
+disk. Rust test assertions remain enabled. It does not change shipping behavior: the sidecar's
+ordinary `--release` build already selects native Release. No debug native build, second target
+directory or app/DMG build was made. Free disk was checked before each build and remained above
+the two-GiB stop threshold.
+
+The real-model protocol/privacy/cache suites and Qwen non-thinking checks also passed against
+the new release binary. Cancellation was 13.91 ms, busy stdin-EOF exit 13.56 ms, stderr zero
+bytes, and `lsof -a -p PID -i` found no sockets. Qwen produced the three exact READY answers and
+the explicit thinking control still behaved differently.
+
+Known limit approved for this change: if a tensor file is present but cannot load on a
+tensor-capable device, ggml can disable its tensor path. There is no extra digest manifest or
+new dependency to override that upstream behavior. Bundled resources are sealed by the app's
+code signature. A future test on an M5-class device would be needed to exercise that branch.
+
+### Resource placement and signed minimal-bundle check
+
+Required resource mappings are:
+
+```json
+{
+  "binaries/default.metallib": "default.metallib",
+  "binaries/ggml-tensor.metallib": "ggml-tensor.metallib"
+}
+```
+
+The script stages sources next to the suffixed binary in `src-tauri/binaries/`. Tauri places the
+mapped files next to the executable in dev (`target/debug/default.metallib` and
+`target/debug/ggml-tensor.metallib`) and under `Contents/Resources/` in the macOS bundle.
+`Contents/MacOS/` contains code only. The native loader first searches bundle resources and then
+the directory of argv[0]; the sidecar's presence check uses the same supported placements.
+
+Source verification, pinned to the tauri-build 2.7.4 tag:
+
+- [macOS app bundler, lines 75 and 97](https://github.com/tauri-apps/tauri/blob/tauri-build-v2.7.4/crates/tauri-bundler/src/bundle/macos/app.rs#L75-L97)
+  creates Contents/Resources and passes it to settings.copy_resources.
+- [resource-map copying, lines 1223 to 1228](https://github.com/tauri-apps/tauri/blob/tauri-build-v2.7.4/crates/tauri-bundler/src/bundle/settings.rs#L1223-L1228)
+  joins each resource.target() to that directory, so a filename target is at its root.
+- [dev copy helper](https://github.com/tauri-apps/tauri/blob/tauri-build-v2.7.4/crates/tauri-build/src/lib.rs#L171-L185)
+  and [map call at line 761](https://github.com/tauri-apps/tauri/blob/tauri-build-v2.7.4/crates/tauri-build/src/lib.rs#L755-L763)
+  copy mapped resources into the Cargo target profile directory.
+
+Without running tauri build, a minimal app was assembled only under this crate's ignored target.
+Its main executable was a copied /usr/bin/true named Murmur; the separately named sidecar was
+Contents/MacOS/murmur-llm, matching the real app/child layout. Info.plist names Murmur as the
+main executable. Both metallibs were placed only in Contents/Resources.
+
+The nested sidecar was signed first and the enclosing app second, both ad-hoc with hardened
+runtime and no new entitlements. These commands returned zero for both executable and bundle:
+
+```sh
+codesign --verify --deep --strict --verbose=2 <path>
+codesign -dv --verbose=4 <path>
+```
+
+The signature descriptions included adhoc and runtime. Executing the bundled sidecar path
+successfully loaded ENJP on the GPU (748.98 ms), warmed its ten-token prefix (575.75 ms) and
+reached EOS with a nonempty ten-token answer (prompt 210.12 ms, generation 70.39 ms). Stderr was
+empty. Removing either default or tensor resource, then re-signing the negative-case bundle,
+produced the expected correlated `metal_library_missing` (0.030 ms and 0.089 ms). Restoring the
+resources and re-signing returned the bundle to a valid sealed state. The main stub/app was not
+launched, no permissions/keychains were changed, and no claim about TCC continuity, notarization
+or the actual updater follows from this check.
+
+The active speech.cpp build explicitly uses EMBED=ON, does not forward the new GGML environment
+setting, and has no newDefaultLibrary call in its source. Its embedded branch therefore does not
+consult the sidecar's default.metallib resource.
+
+### Build/CI behavior and reproduction
+
+The build script fails before Cargo if `xcrun metal --version` is unavailable, names
+`xcodebuild -downloadComponent MetalToolchain`, validates the active native build's EMBED=OFF
+cache and both expected artifacts, and uses cmp-before-install so identical staged files are not
+rewritten. It reads the active dependency output directory from Cargo JSON, not stale glob hits.
+CI and release workflows install the Metal Toolchain only when its version probe fails.
+
+```sh
+export MURMUR_SIDECAR_BINARY="$PWD/src-tauri/binaries/murmur-llm-$(rustc --print host-tuple)"
+PYTHONDONTWRITEBYTECODE=1 python3 crates/murmur-llm/metallib_bench.py \
+  --label precompiled --output crates/murmur-llm/target/metallib-loads.json
+```
+
+The benchmark requires the two existing model files under `$MURMUR_TEST_MODELS/llm` (default
+`~/.murmur-dev-models/llm`, as for the app's real-sidecar test) and does not download them. Local evidence: target/m4-before.json, m4-after.json, m4-platform-versions.json,
+m4-bundle-check.json and m4-{checks,messages,qwen}.json. The benchmark runner is tracked; the
+numeric reports and minimal signed bundle remain ignored under target. Final src-tauri staging
+and the resource-map edit are delegated to the orchestrator's explicit staging slot, not done
+by this agent while the user's dev app is running. Actual dev resource copying and the user's
+post-restart E2E remain to be checked at that staging step.
