@@ -1963,6 +1963,11 @@ button {
   color: var(--ink-2);
 }
 
+/* The quiet button's icon lines up with the text above it; its hover fill still has room. */
+.hist__before .btn--sm {
+  margin-left: calc(var(--u) * -9);
+}
+
 .hist__actions {
   display: flex;
   gap: calc(var(--u) * 2);

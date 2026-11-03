@@ -24,9 +24,12 @@ import {
   type ModelInfo,
   type Permissions,
   type RecordMode,
+  type RefinerStatus,
   type Settings as SettingsType,
   type UiLanguage,
+  useEvent,
 } from "../ipc";
+import { formatBytes } from "../lib/format";
 
 type Field = keyof SettingsType | "permissions" | "stats";
 
@@ -57,6 +60,7 @@ export function Settings() {
   const [permissions, setPermissions] = useState<Permissions | null>(null);
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
+  const [refiner, setRefiner] = useState<RefinerStatus | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
   const [folderNote, setFolderNote] = useState(false);
   const [tab, setTab] = useState<SettingsTab>(() => asTab(target.anchor) ?? "general");
@@ -80,6 +84,19 @@ export function Settings() {
       .catch(() => undefined);
   }, []);
 
+  // The translation models and their last start failure (experimental). Reading never starts them.
+  const refreshTranslation = useCallback(() => {
+    commands
+      .listModels()
+      .then(setModels)
+      .catch(() => undefined);
+    commands
+      .getRefinerStatus()
+      .then(setRefiner)
+      .catch(() => undefined);
+  }, []);
+  useEvent("modelsChanged", refreshTranslation);
+
   useEffect(() => {
     commands
       .listInputDevices()
@@ -89,15 +106,15 @@ export function Settings() {
       .appInfo()
       .then(setInfo)
       .catch(() => undefined);
-    commands
-      .listModels()
-      .then(setModels)
-      .catch(() => undefined);
+    refreshTranslation();
     refreshPermissions();
-    const onFocus = () => refreshPermissions();
+    const onFocus = () => {
+      refreshPermissions();
+      refreshTranslation();
+    };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-  }, [refreshPermissions]);
+  }, [refreshPermissions, refreshTranslation]);
 
   const set = useCallback(
     async (field: keyof SettingsType, patch: Partial<SettingsType>) => {
@@ -123,6 +140,18 @@ export function Settings() {
   const modelName = (language: Language) =>
     models.find((m) => m.entry.id === settings.models[language])?.entry.display_name ??
     settings.models[language];
+
+  const translationModels = models.filter((m) => m.entry.role === "refinement");
+  const missingModels = translationModels.filter((m) => !m.status.installed);
+  const translationReady = translationModels.length > 0 && missingModels.length === 0;
+  const missingBytes = missingModels.reduce((sum, m) => sum + m.entry.bytes, 0);
+  const startFailures = [
+    refiner?.translate_error &&
+      t.settings.experimental.translateStartFailed(refiner.translate_error),
+    refiner?.clean_error && t.settings.experimental.cleanStartFailed(refiner.clean_error),
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   const permissionLabel = (p: Permissions["microphone"]) =>
     p === "Granted"
@@ -430,6 +459,71 @@ export function Settings() {
               </>
             )}
             <Row label={<span className="row__note">{t.settings.experimental.storageNote}</span>} />
+          </Group>
+        )}
+
+        {tab === "recording" && (
+          <Group>
+            <Row
+              label={t.settings.experimental.translate}
+              hint={t.settings.experimental.translateHint}
+              error={errors.translate_enabled}
+            >
+              <Toggle
+                label={t.settings.experimental.translate}
+                checked={settings.translate_enabled}
+                onChange={async (translate_enabled) => {
+                  await set("translate_enabled", { translate_enabled });
+                  refreshTranslation();
+                }}
+              />
+            </Row>
+            {settings.translate_enabled && (
+              <>
+                <Row
+                  label={t.settings.experimental.translateHotkey}
+                  hint={t.settings.experimental.translateHotkeyHint}
+                  error={errors.translate_hotkey}
+                >
+                  <KeyRecorder
+                    label={t.settings.experimental.translateHotkey}
+                    value={settings.translate_hotkey}
+                    onListenStart={() => commands.suspendHotkeys().catch(() => undefined)}
+                    onListenEnd={() => commands.resumeHotkeys().catch(() => undefined)}
+                    onChange={(translate_hotkey) => {
+                      if (translate_hotkey) {
+                        set("translate_hotkey", { translate_hotkey });
+                      }
+                    }}
+                  />
+                </Row>
+                <Row
+                  label={
+                    <span className="perm">
+                      <Dot tone={translationReady && !startFailures ? "ok" : "warn"} />
+                      {t.settings.experimental.translateModels}
+                    </span>
+                  }
+                  hint={
+                    translationReady
+                      ? t.settings.experimental.translateModelsReady
+                      : t.settings.experimental.translateModelsMissing(
+                          formatBytes(missingBytes, t.locale),
+                        )
+                  }
+                  error={startFailures || null}
+                >
+                  {!translationReady && (
+                    <Button size="sm" onClick={() => navigate("models", "refine")}>
+                      {t.settings.experimental.openModels}
+                    </Button>
+                  )}
+                </Row>
+              </>
+            )}
+            <Row
+              label={<span className="row__note">{t.settings.experimental.translateNote}</span>}
+            />
           </Group>
         )}
 

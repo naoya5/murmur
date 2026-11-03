@@ -309,7 +309,7 @@ const en = {
       translateHotkey: "Translation hotkey",
       translateHotkeyHint: "Records like the main hotkey. Speak Japanese with it.",
       translateModels: "Models",
-      translateModelsReady: "Both models are ready.",
+      translateModelsReady: "Both models are downloaded.",
       translateModelsMissing: (size: string) =>
         `Download the translation and cleanup models (${size}) first.`,
       openModels: "Open Models",
@@ -703,7 +703,7 @@ const ja: Strings = {
       translateHotkey: "翻訳のホットキー",
       translateHotkeyHint: "録音の仕方はメインのホットキーと同じです。日本語で話してください。",
       translateModels: "モデル",
-      translateModelsReady: "2 つのモデルの準備ができています。",
+      translateModelsReady: "2 つのモデルはダウンロード済みです。",
       translateModelsMissing: (size) =>
         `先に翻訳と整形のモデル (${size}) をダウンロードしてください。`,
       openModels: "モデルの画面へ",

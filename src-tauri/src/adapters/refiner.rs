@@ -180,7 +180,7 @@ enum CallError {
 impl CallError {
     fn into_refine_error(self) -> RefineError {
         match self {
-            CallError::Exited => RefineError::Unavailable("sidecar exited".to_owned()),
+            CallError::Exited => RefineError::Unavailable("sidecar_exited".to_owned()),
             CallError::Fatal(code) => RefineError::Unavailable(code),
             CallError::Interrupted(why) | CallError::Killed(why) => match why {
                 Why::Cancelled => RefineError::Cancelled,
@@ -336,13 +336,16 @@ impl Process {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| RefineError::Unavailable(format!("could not start: {}", e.kind())))?;
+            .map_err(|e| {
+                tracing::warn!(kind = ?e.kind(), "could not start the refine sidecar");
+                RefineError::Unavailable("spawn_failed".to_owned())
+            })?;
         let pid = child.id();
         let (stdin, stdout) = (child.stdin.take(), child.stdout.take());
         let shared: SharedChild = Arc::new(Mutex::new(Box::new(child)));
         let (Some(mut stdin), Some(stdout)) = (stdin, stdout) else {
             kill_and_reap(&shared, REAP_WAIT);
-            return Err(RefineError::Unavailable("no pipes".to_owned()));
+            return Err(RefineError::Unavailable("no_pipes".to_owned()));
         };
         let (line_tx, lines) = mpsc::sync_channel(LINE_QUEUE);
         let reader = thread::Builder::new()
@@ -383,7 +386,7 @@ impl Process {
             });
         if reader.is_err() || writer_thread.is_err() {
             kill_and_reap(&shared, REAP_WAIT);
-            return Err(RefineError::Unavailable("no pipe threads".to_owned()));
+            return Err(RefineError::Unavailable("no_pipe_threads".to_owned()));
         }
         Ok(Process {
             child: shared,
@@ -800,12 +803,10 @@ impl RefinerHandle {
             .inner
             .binary
             .as_deref()
-            .ok_or_else(|| RefineError::Unavailable("sidecar missing".to_owned()))?;
+            .ok_or_else(|| RefineError::Unavailable("sidecar_missing".to_owned()))?;
         if slot.crashed {
             if !slot.restarts.try_restart(self.inner.now_ms()) {
-                return Err(RefineError::Unavailable(
-                    "paused after repeated crashes".to_owned(),
-                ));
+                return Err(RefineError::Unavailable("paused_after_crashes".to_owned()));
             }
             slot.crashed = false;
         }
@@ -851,7 +852,7 @@ impl RefinerHandle {
                 self.inner.drop_process(step, slot, crashed);
                 return Err(match error {
                     CallError::Interrupted(Why::Deadline) | CallError::Killed(Why::Deadline) => {
-                        RefineError::Unavailable("start or load timed out".to_owned())
+                        RefineError::Unavailable("start_timeout".to_owned())
                     }
                     other => other.into_refine_error(),
                 });
@@ -1271,9 +1272,7 @@ done
         // The fourth crash is refused a restart.
         assert_eq!(
             generate(&mut h, 2_000),
-            Err(RefineError::Unavailable(
-                "paused after repeated crashes".to_owned()
-            ))
+            Err(RefineError::Unavailable("paused_after_crashes".to_owned()))
         );
         assert_eq!(count(&log, "start"), 4);
         // The other step has its own budget.
@@ -1306,7 +1305,7 @@ done
         assert_eq!(
             r.status(),
             RefinerStatus {
-                translate_error: Some("sidecar missing".to_owned()),
+                translate_error: Some("sidecar_missing".to_owned()),
                 clean_error: None,
             }
         );

@@ -1,5 +1,6 @@
 import { Download, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import { useNavigation } from "../app/navigation";
 import { useSettings } from "../app/settings";
 import { Badge } from "../components/Badge";
 import { Button } from "../components/Button";
@@ -48,7 +49,9 @@ function ModelRow({
   const usedHere = language !== null && info.selected_for.includes(language);
   const progress = status.downloading;
   const error = pendingError ?? status.error;
-  const tier = entry.tier === "internal" ? null : t.models.tier[entry.tier];
+  // A refine model is named by its task, not by a tier.
+  const tier =
+    entry.tier === "internal" || entry.role === "refinement" ? null : t.models.tier[entry.tier];
 
   return (
     <div className="model">
@@ -57,6 +60,9 @@ function ModelRow({
           <div className="model__name">
             <span>{entry.display_name}</span>
             {tier && <Badge>{tier}</Badge>}
+            {entry.tasks.map((task) => (
+              <Badge key={task}>{t.models.task[task]}</Badge>
+            ))}
             {inUse && entry.tier !== "internal" && (
               <Badge tone="accent">
                 {info.selected_for.map((l) => t.models.usedFor(languageName(t, l))).join(", ")}
@@ -68,6 +74,13 @@ function ModelRow({
             <span>{entry.license}</span>
             <span>{status.installed ? t.models.installed : t.models.notInstalled}</span>
           </div>
+          {entry.memory_bytes !== null && (
+            <div className="model__meta">
+              <span className="tnum">
+                {t.models.memory(formatBytes(entry.memory_bytes, t.locale))}
+              </span>
+            </div>
+          )}
         </div>
         <div className="model__actions">
           {progress ? (
@@ -132,6 +145,7 @@ export function Models() {
   const t = useT();
   const toast = useToast();
   const { settings, update } = useSettings();
+  const { target } = useNavigation();
   const [models, setModels] = useState<ModelInfo[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [pendingErrors, setPendingErrors] = useState<Record<string, string>>({});
@@ -210,11 +224,26 @@ export function Models() {
       (m) => m.entry.role === "recognition" && m.entry.languages.includes(language),
     );
   const helpers = (models ?? []).filter((m) => m.entry.role === "voice_detection");
+  // The translation models (experimental): shown while translation is on, or while one is on
+  // this Mac (to delete it after switching off).
+  const refiners = (models ?? []).filter((m) => m.entry.role === "refinement");
+  const showRefiners =
+    refiners.length > 0 &&
+    (settings?.translate_enabled === true ||
+      refiners.some((m) => m.status.installed || m.status.downloading !== null));
+
+  // "models#refine" (the translation settings) brings that section into view once it is there.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: models arriving is what makes the section exist
+  useEffect(() => {
+    if (target.anchor === "refine") {
+      document.getElementById("models-refine")?.scrollIntoView({ block: "start" });
+    }
+  }, [target, models !== null]);
 
   const renderRows = (list: ModelInfo[], language: Language | null) =>
     list.map((info) => (
       <ModelRow
-        key={`${language ?? "helper"}-${info.entry.id}`}
+        key={`${language ?? "other"}-${info.entry.id}`}
         info={info}
         language={language}
         onDownload={download}
@@ -243,6 +272,12 @@ export function Models() {
         <div className="settings">
           <Group title={t.models.forJapanese}>{renderRows(section("ja"), "ja")}</Group>
           <Group title={t.models.forEnglish}>{renderRows(section("en"), "en")}</Group>
+          {showRefiners && (
+            <Group title={t.models.refine} id="models-refine">
+              <p className="row__hint model__hint">{t.models.refineHint}</p>
+              {renderRows(refiners, null)}
+            </Group>
+          )}
           {helpers.length > 0 && (
             <Group title={t.models.helper}>
               <p className="row__hint model__hint">{t.models.helperHint}</p>

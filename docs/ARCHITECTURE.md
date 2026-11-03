@@ -96,7 +96,8 @@ New parts:
 | `crates/murmur-core/src/refine.rs` | Pure rules: marker gating, prompts and example turns, output cap, post-processing, validation (stage 0 calibration in its tests), time budgets, sidecar timings, the restart budget, and `Run`, which says which model call comes next. |
 | `crates/murmur-core/src/{session,catalog,settings,ports}.rs` | The `Refining` state and its rows, the two LLM catalog rows, the two `Translate*` settings, the `TextRefiner` port. |
 | `src-tauri/src/refine_session.rs` | Makes the calls that `Run` asks for (on a blocking thread) and warms the models at recording start. |
-| `adapters/refiner.rs` | The `TextRefiner`: one sidecar process per model, JSON Lines (protocol SOT: `crates/murmur-llm/src/main.rs`), every wait bounded, cancel then kill, three restarts per ten minutes after crashes, stopped after five idle minutes. |
+| `adapters/refiner.rs` | The `TextRefiner`: one sidecar process per model, JSON Lines (protocol SOT: `crates/murmur-llm/src/main.rs`) through a writer and a reader thread, every wait bounded, cancel then kill, children reaped (also when dropped), three restarts per ten minutes after crashes, stopped after five idle minutes. A lifecycle token ends the calls of a switched-off feature before its processes stop. |
+| `src/views/{Settings,Models,History}.tsx`, `src/pill/Pill.tsx`, `tray.rs` | The translation block under Experimental (hotkey, model state, start failures from `get_refiner_status`), the "Cleanup and translation" models section (size, memory, license), the pill's `JA → EN` mark and "Translating", the history's badges and the Japanese to open and copy, and a menu bar item that copies a translation's Japanese. |
 
 Flow at a glance:
 

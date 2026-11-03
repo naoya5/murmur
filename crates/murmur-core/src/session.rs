@@ -625,8 +625,10 @@ pub struct Composing {
 /// What `Delivering` hands over, and which save follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delivery {
-    /// A dictation. `refine` is how its refine step ended, when it had one.
-    Text { refine: Option<RefineStatus> },
+    /// A dictation. `refine` is its refine kind and how that step ended, when it had one.
+    Text {
+        refine: Option<(RefineKind, RefineStatus)>,
+    },
     /// An annotation without ink: the words alone, shown like a dictation, saved as a bundle.
     Words,
     /// `images` is 0 when the compose failed and only the words go out.
@@ -730,14 +732,22 @@ impl Machine {
         }
     }
 
-    /// The refine kind of the active session until it is delivered (the pill shows "JA -> EN"
-    /// while a translation records).
+    /// The refine kind of the active session, through its delivery (the pill shows "JA -> EN"
+    /// for a translation from the hotkey press until the notice). `None` once the kind's feature
+    /// was switched off under it.
     pub fn active_refine(&self) -> Option<RefineKind> {
         match &self.state {
             State::Recording(rec) => rec.refine,
             State::Transcribing(tx) => tx.refine.filter(|_| !tx.refine_off),
             State::Refining(refining) => Some(refining.kind),
             State::CancelPending { paused, .. } => paused_refine(paused),
+            State::Delivering {
+                delivery:
+                    Delivery::Text {
+                        refine: Some((kind, _)),
+                    },
+                ..
+            } => Some(*kind),
             State::Idle { .. } | State::Composing(_) | State::Delivering { .. } => None,
         }
     }
@@ -963,7 +973,13 @@ impl Machine {
                         self.deliver_unrefined(session, kind, text, RefineStatus::Failed, fx)
                     }
                     Some(RefineKind::Clean) if refine::clean_gate(&text.0) != CleanGate::Run => {
-                        self.deliver_text(session, text, None, Some(RefineStatus::Skipped), fx)
+                        self.deliver_text(
+                            session,
+                            text,
+                            None,
+                            Some((RefineKind::Clean, RefineStatus::Skipped)),
+                            fx,
+                        )
                     }
                     Some(kind) => self.start_refining(session, kind, text, fx),
                 },
@@ -1002,7 +1018,7 @@ impl Machine {
         session: SessionId,
         text: TranscriptText,
         copy_only: Option<CopyReason>,
-        refine: Option<RefineStatus>,
+        refine: Option<(RefineKind, RefineStatus)>,
         fx: &mut Vec<Effect>,
     ) -> State {
         fx.push(Effect::SetEscCapture(false));
@@ -1069,7 +1085,13 @@ impl Machine {
         let session = refining.session;
         let status = match outcome {
             RefineOutcome::Text(text) => {
-                return self.deliver_text(session, text, None, Some(RefineStatus::Ok), fx);
+                return self.deliver_text(
+                    session,
+                    text,
+                    None,
+                    Some((refining.kind, RefineStatus::Ok)),
+                    fx,
+                );
             }
             RefineOutcome::Failed => RefineStatus::Failed,
             RefineOutcome::TimedOut => RefineStatus::Timeout,
@@ -1091,7 +1113,7 @@ impl Machine {
             RefineKind::Clean => None,
             RefineKind::Translate => Some(CopyReason::RefineFailed),
         };
-        self.deliver_text(session, text, copy_only, Some(status), fx)
+        self.deliver_text(session, text, copy_only, Some((kind, status)), fx)
     }
 
     fn compose(&mut self, session: SessionId, words: ComposeWords, fx: &mut Vec<Effect>) -> State {
@@ -1145,7 +1167,7 @@ impl Machine {
                 fx.push(Effect::SaveSuccess {
                     session,
                     outcome,
-                    refine,
+                    refine: refine.map(|(_, status)| status),
                 });
                 self.idle_with(Some(Notice::Delivered { outcome }), fx)
             }
@@ -4466,7 +4488,7 @@ mod tests {
                     session: S1,
                     timer: timer_for(&fx, DELIVERY_TIMEOUT_MS),
                     delivery: Delivery::Text {
-                        refine: Some(status)
+                        refine: Some((RefineKind::Clean, status))
                     },
                 }
             );
@@ -4523,7 +4545,7 @@ mod tests {
             h.state(),
             State::Delivering {
                 delivery: Delivery::Text {
-                    refine: Some(RefineStatus::Timeout)
+                    refine: Some((_, RefineStatus::Timeout))
                 },
                 ..
             }
@@ -4632,7 +4654,7 @@ mod tests {
             h.state(),
             State::Delivering {
                 delivery: Delivery::Text {
-                    refine: Some(RefineStatus::Timeout)
+                    refine: Some((_, RefineStatus::Timeout))
                 },
                 ..
             }
@@ -4686,7 +4708,7 @@ mod tests {
             h.state(),
             State::Delivering {
                 delivery: Delivery::Text {
-                    refine: Some(RefineStatus::Failed)
+                    refine: Some((RefineKind::Translate, RefineStatus::Failed))
                 },
                 ..
             }
@@ -4740,6 +4762,8 @@ mod tests {
         // A delivery in flight finishes; plain dictation ignores it.
         let mut h = refining(RefineKind::Translate, MARKED);
         h.step(refined(S1, RefineOutcome::Text(text("refined"))));
+        // The pill keeps the translation mark through the delivery.
+        assert_eq!(h.m.active_refine(), Some(RefineKind::Translate));
         assert_eq!(h.step(off(RefineKind::Translate)), vec![]);
         assert!(matches!(h.state(), State::Delivering { .. }));
         let mut h = recording(RecordMode::Toggle);
