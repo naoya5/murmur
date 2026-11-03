@@ -27,6 +27,7 @@ import type {
   Permissions,
   PillState,
   PillView,
+  RefineKind,
   Settings,
   TranscriptRow,
   UpdateInfo,
@@ -112,6 +113,40 @@ const EN_TEXTS = [
   "Sounds good, let's ship it.",
 ];
 
+/** Translations in the mock history: (Japanese, English). */
+const TRANSLATIONS = [
+  [
+    "来週の定例は木曜の10時からに変更になりました。議事録は前日までに共有します。",
+    "Next week's regular meeting moved to Thursday at 10. I will share the minutes the day before.",
+  ],
+  [
+    "見積もりは今日中に送ります。もし金額に問題があれば、明日の午前中に連絡をください。",
+    "I will send the estimate today. If the price is a problem, please contact me tomorrow morning.",
+  ],
+] as const;
+
+/** A translated row (i = 1, 4) or a translation that failed and copied the Japanese (i = 7). */
+function translationRow(i: number): Partial<TranscriptRow> | null {
+  const failed = i === 7;
+  if (i !== 1 && i !== 4 && !failed) {
+    return null;
+  }
+  const [japanese, english] = TRANSLATIONS[i === 4 ? 1 : 0];
+  return {
+    language: "ja",
+    text: failed ? japanese : english,
+    raw_text: japanese,
+    latin_words: 0,
+    cjk_chars: japanese.length,
+    refine_kind: "translate",
+    refine_status: failed ? "timeout" : "ok",
+    pre_refine_text: japanese,
+    refine_model_id:
+      i === 4 ? "qwen3.5-0.8b-q4_k_m+lfm2-350m-enjp-mt-q4_k_m" : "lfm2-350m-enjp-mt-q4_k_m",
+    refine_ms: failed ? 4_100 : 420,
+  };
+}
+
 function makeHistory(): TranscriptRow[] {
   const rows: TranscriptRow[] = [];
   const now = Date.now();
@@ -137,6 +172,7 @@ function makeHistory(): TranscriptRow[] {
       audio_path: failed ? "/tmp/spool/x.pcm" : null,
       error: failed ? (i === 2 ? "timeout" : "model_missing") : null,
       ...NO_REFINE,
+      ...translationRow(i),
     });
   }
   return rows;
@@ -229,6 +265,7 @@ const catalog: ModelEntry[] = [
       language_id: false,
     },
     tasks: [],
+    memory_bytes: null,
   },
   {
     id: "haas-ja-v1.0-q5_k",
@@ -251,6 +288,7 @@ const catalog: ModelEntry[] = [
       language_id: false,
     },
     tasks: [],
+    memory_bytes: null,
   },
   {
     id: "parakeet-tdt-0.6b-v3-q8_0",
@@ -274,6 +312,7 @@ const catalog: ModelEntry[] = [
       language_id: false,
     },
     tasks: [],
+    memory_bytes: null,
   },
   {
     id: "qwen3-asr-0.6b-q8_0",
@@ -296,6 +335,7 @@ const catalog: ModelEntry[] = [
       language_id: true,
     },
     tasks: [],
+    memory_bytes: null,
   },
   {
     id: "silero-vad-v6.2",
@@ -318,13 +358,70 @@ const catalog: ModelEntry[] = [
       language_id: false,
     },
     tasks: [],
+    memory_bytes: null,
+  },
+  {
+    id: "lfm2-350m-enjp-mt-q4_k_m",
+    display_name: "LFM2-350M-ENJP-MT (Q4_K_M)",
+    family: "llm",
+    role: "refinement",
+    tier: "standard",
+    languages: ["ja", "en"],
+    repository: "LiquidAI/LFM2-350M-ENJP-MT-GGUF",
+    revision: "main",
+    file: "LFM2-350M-ENJP-MT-Q4_K_M.gguf",
+    bytes: 229_310_240,
+    sha256: "",
+    license: "LFM Open License v1.0",
+    attribution: "LFM2-350M-ENJP-MT by Liquid AI, LFM Open License v1.0",
+    capabilities: {
+      custom_vocabulary: false,
+      prompt_vocabulary: false,
+      punctuation: false,
+      language_id: false,
+    },
+    tasks: ["translate"],
+    memory_bytes: 355 * 1024 * 1024,
+  },
+  {
+    id: "qwen3.5-0.8b-q4_k_m",
+    display_name: "Qwen3.5-0.8B (Q4_K_M)",
+    family: "llm",
+    role: "refinement",
+    tier: "standard",
+    languages: ["ja"],
+    repository: "unsloth/Qwen3.5-0.8B-GGUF",
+    revision: "main",
+    file: "Qwen3.5-0.8B-Q4_K_M.gguf",
+    bytes: 532_517_120,
+    sha256: "",
+    license: "Apache-2.0",
+    attribution: "Qwen3.5-0.8B by the Qwen team, Apache-2.0. GGUF by Unsloth.",
+    capabilities: {
+      custom_vocabulary: false,
+      prompt_vocabulary: false,
+      punctuation: false,
+      language_id: false,
+    },
+    tasks: ["clean"],
+    memory_bytes: 741 * 1024 * 1024,
   },
 ];
+
+/** `?translate=ready` has both translation models installed; `?translate` alone has none. */
+const TRANSLATION_MODELS = ["lfm2-350m-enjp-mt-q4_k_m", "qwen3.5-0.8b-q4_k_m"];
 
 const installed = new Set<string>(
   params.has("empty") || params.has("onboarding")
     ? []
-    : ["haas-ja-v1.0-q8_0", "parakeet-tdt-0.6b-v3-q8_0", "silero-vad-v6.2"],
+    : [
+        "haas-ja-v1.0-q8_0",
+        "parakeet-tdt-0.6b-v3-q8_0",
+        "silero-vad-v6.2",
+        ...(["ready", "startfail"].includes(params.get("translate") ?? "")
+          ? TRANSLATION_MODELS
+          : []),
+      ],
 );
 const downloads = new Map<string, { received: number; timer: number }>();
 const downloadErrors = new Map<string, string>();
@@ -402,6 +499,19 @@ function pillViewFor(name: string): PillView {
       return { kind: "cancel_pending", remaining_ms: 3_000, from_recording: true };
     case "transcribing":
       return { kind: "transcribing" };
+    case "translate":
+      return { kind: "recording", elapsed_ms: 6_200, mode: "toggle" };
+    case "translate-transcribing":
+      return { kind: "transcribing" };
+    case "translating":
+      return { kind: "refining", task: "translate" };
+    case "translate-pasted":
+      return { kind: "notice", notice: { kind: "delivered", outcome: { kind: "pasted" } } };
+    case "translate-failed":
+      return {
+        kind: "notice",
+        notice: { kind: "delivered", outcome: { kind: "copied", reason: "refine_failed" } },
+      };
     case "delivering":
       return { kind: "delivering" };
     case "pasted":
@@ -451,6 +561,18 @@ function pillViewFor(name: string): PillView {
   }
 }
 
+/** The mock state name last shown; translation states start with "translat". */
+let currentPillName = "";
+
+function showPill(name: string): void {
+  currentPillName = name;
+  setPill(pillViewFor(name), annotationFor(name));
+}
+
+function refineFor(name: string): RefineKind | null {
+  return name.startsWith("translat") ? "translate" : null;
+}
+
 function annotationNotice(outcome: DeliveryOutcome, images: number): PillView {
   return { kind: "notice", notice: { kind: "annotation_delivered", outcome, images } };
 }
@@ -470,7 +592,8 @@ function annotationFor(name: string): AnnotationPill | null {
 }
 
 function setPill(view: PillView, annotation: AnnotationPill | null = null): void {
-  pill = { view, language: settings.language, annotation };
+  const refine = refineFor(currentPillName);
+  pill = { view, language: refine ? "ja" : settings.language, annotation, refine };
   void emit("pill-state", pill);
   window.clearInterval(levelTimer);
   if (view.kind === "recording") {
@@ -496,7 +619,7 @@ function cycle(): void {
   let i = 0;
   const step = () => {
     const name = CYCLE[i % CYCLE.length];
-    setPill(pillViewFor(name));
+    showPill(name);
     i += 1;
     const wait =
       name === "recording" ? 3000 : name === "cancel" ? 3200 : name === "pasted" ? 1200 : 1200;
@@ -701,6 +824,11 @@ mockIPC(
         return null;
       case "submit_ink_stroke":
         return null;
+      case "get_refiner_status":
+        return {
+          translate_error: params.get("translate") === "startfail" ? "model_load_failed" : null,
+          clean_error: null,
+        };
       case "open_annotations_folder":
         if (params.get("annotations") === "nofolder") {
           throw { kind: "annotations", message: "the folder does not exist yet" };
@@ -711,10 +839,10 @@ mockIPC(
       case "reset_stats":
         return null;
       case "toggle_recording":
-        setPill(pillViewFor("recording"));
-        window.setTimeout(() => setPill(pillViewFor("transcribing")), 1800);
-        window.setTimeout(() => setPill(pillViewFor("pasted")), 2200);
-        window.setTimeout(() => setPill(pillViewFor("hidden")), 3200);
+        showPill("recording");
+        window.setTimeout(() => showPill("transcribing"), 1800);
+        window.setTimeout(() => showPill("pasted"), 2200);
+        window.setTimeout(() => showPill("hidden"), 3200);
         simulateDictation();
         return null;
       case "check_for_updates": {
@@ -778,7 +906,7 @@ if (isPill) {
     if (params.has("cycle")) {
       cycle();
     } else if (state) {
-      setPill(pillViewFor(state), annotationFor(state));
+      showPill(state);
     }
   }, 50);
 }
@@ -803,7 +931,7 @@ declare global {
 }
 
 window.__murmurMock = {
-  pill: (name) => setPill(pillViewFor(name), annotationFor(name)),
+  pill: showPill,
   overlay: (shown) =>
     void emit(
       "overlay-state",

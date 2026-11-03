@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-refiner-status"
+description = "Enables the get_refiner_status command without any pre-configured scope."
+commands.allow = ["get_refiner_status"]
+
+[[permission]]
+identifier = "deny-get-refiner-status"
+description = "Denies the get_refiner_status command without any pre-configured scope."
+commands.deny = ["get_refiner_status"]

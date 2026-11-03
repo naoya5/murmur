@@ -12,6 +12,7 @@ import type {
   CopyReason,
   FailureKind,
   Language,
+  RefineKind,
   UiLanguage,
 } from "./ipc";
 
@@ -118,6 +119,23 @@ const en = {
       audio: "The audio could not be read",
     } satisfies Record<FailureKind, string>,
     loadError: "The history could not be loaded.",
+    refine: { translate: "Translated", clean: "Cleaned up" } satisfies Record<RefineKind, string>,
+    refineFailed: {
+      translate: "Not translated",
+      clean: "Not cleaned up",
+    } satisfies Record<RefineKind, string>,
+    showBefore: {
+      translate: "Show the Japanese",
+      clean: "Show the text before cleanup",
+    } satisfies Record<RefineKind, string>,
+    hideBefore: {
+      translate: "Hide the Japanese",
+      clean: "Hide the text before cleanup",
+    } satisfies Record<RefineKind, string>,
+    copyBefore: {
+      translate: "Copy the Japanese",
+      clean: "Copy the text before cleanup",
+    } satisfies Record<RefineKind, string>,
   },
   dictionary: {
     title: "Dictionary",
@@ -170,6 +188,11 @@ const en = {
     errorGeneric: "The download did not finish.",
     rate: (perSec: string) => `${perSec}/s`,
     loadError: "The model list could not be loaded.",
+    refine: "Cleanup and translation",
+    refineHint:
+      "For the experimental translation. A spoken text with fillers or a correction is cleaned up before it is translated.",
+    task: { translate: "Translation", clean: "Cleanup" } satisfies Record<RefineKind, string>,
+    memory: (size: string) => `About ${size} of memory in use`,
   },
   settings: {
     title: "Settings",
@@ -280,6 +303,22 @@ const en = {
       folderLabel: "Saved annotations",
       folderHint: "Pictures and notes of each recording.",
       folderMissing: "Nothing is saved yet. The folder appears after your first annotation.",
+      translate: "Translation (Japanese → English)",
+      translateHint:
+        "Speak Japanese with its own hotkey, and the English is pasted. Models on this Mac do the translation.",
+      translateHotkey: "Translation hotkey",
+      translateHotkeyHint: "Records like the main hotkey. Speak Japanese with it.",
+      translateModels: "Models",
+      translateModelsReady: "Both models are ready.",
+      translateModelsMissing: (size: string) =>
+        `Download the translation and cleanup models (${size}) first.`,
+      openModels: "Open Models",
+      translateStartFailed: (code: string) =>
+        `The translation model could not start (${code}). Translations copy the Japanese until it starts.`,
+      cleanStartFailed: (code: string) =>
+        `The cleanup model could not start (${code}). Texts are translated without cleanup until it starts.`,
+      translateNote:
+        "Only Japanese to English. When a translation fails, nothing is pasted and the Japanese is copied. The models stop after 5 minutes without use.",
     },
   },
   hotkey: {
@@ -336,6 +375,11 @@ const en = {
     escToUndo: "Esc to undo",
     recording: "Recording",
     transcribing: "Transcribing",
+    refining: { translate: "Translating", clean: "Cleaning up" } satisfies Record<
+      RefineKind,
+      string
+    >,
+    translateMark: "Japanese to English",
     failure: {
       timeout: "Took too long",
       empty_result: "No text",
@@ -481,6 +525,11 @@ const ja: Strings = {
       audio: "音声を読めませんでした",
     },
     loadError: "履歴を読み込めませんでした。",
+    refine: { translate: "翻訳", clean: "整形" },
+    refineFailed: { translate: "翻訳できず", clean: "整形できず" },
+    showBefore: { translate: "日本語を表示", clean: "整形前の文を表示" },
+    hideBefore: { translate: "日本語を隠す", clean: "整形前の文を隠す" },
+    copyBefore: { translate: "日本語をコピー", clean: "整形前の文をコピー" },
   },
   dictionary: {
     title: "辞書",
@@ -532,6 +581,11 @@ const ja: Strings = {
     errorGeneric: "ダウンロードが完了しませんでした。",
     rate: (perSec) => `${perSec}/秒`,
     loadError: "モデルの一覧を読み込めませんでした。",
+    refine: "整形と翻訳",
+    refineHint:
+      "実験的な機能の翻訳で使います。言いよどみや言い直しのある文は、整形してから訳します。",
+    task: { translate: "翻訳", clean: "整形" },
+    memory: (size) => `使用中のメモリ 約 ${size}`,
   },
   settings: {
     title: "設定",
@@ -643,6 +697,22 @@ const ja: Strings = {
       folderHint: "録画ごとの画像と文が入っています。",
       folderMissing:
         "まだ保存されたものがありません。最初のアノテーションのあとにフォルダができます。",
+      translate: "翻訳 (日本語 → 英語)",
+      translateHint:
+        "専用のホットキーで日本語を話すと、英語に訳して貼り付けます。訳すのはこの Mac の中のモデルです。",
+      translateHotkey: "翻訳のホットキー",
+      translateHotkeyHint: "録音の仕方はメインのホットキーと同じです。日本語で話してください。",
+      translateModels: "モデル",
+      translateModelsReady: "2 つのモデルの準備ができています。",
+      translateModelsMissing: (size) =>
+        `先に翻訳と整形のモデル (${size}) をダウンロードしてください。`,
+      openModels: "モデルの画面へ",
+      translateStartFailed: (code) =>
+        `翻訳のモデルを起動できませんでした (${code})。起動できるまで、翻訳の代わりに日本語をコピーします。`,
+      cleanStartFailed: (code) =>
+        `整形のモデルを起動できませんでした (${code})。起動できるまで、整形しないで訳します。`,
+      translateNote:
+        "訳すのは日本語から英語だけです。翻訳に失敗したときは貼り付けず、日本語をコピーします。モデルは 5 分使わないと止まります。",
     },
   },
   hotkey: {
@@ -699,6 +769,8 @@ const ja: Strings = {
     escToUndo: "Esc で元に戻す",
     recording: "録音中",
     transcribing: "文字起こし中",
+    refining: { translate: "翻訳中", clean: "整形中" },
+    translateMark: "日本語から英語",
     failure: {
       timeout: "時間がかかりすぎました",
       empty_result: "文字になりませんでした",

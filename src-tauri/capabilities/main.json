@@ -33,6 +33,7 @@
     "allow-open-url",
     "allow-check-for-updates",
     "allow-install-update",
-    "allow-open-annotations-folder"
+    "allow-open-annotations-folder",
+    "allow-get-refiner-status"
   ]
 }

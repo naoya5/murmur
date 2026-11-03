@@ -209,6 +209,13 @@ async openAnnotationsFolder() : Promise<Result<null, IpcError>> {
  */
 async overlayReady() : Promise<void> {
     await TAURI_INVOKE("overlay_ready");
+},
+/**
+ * The last failure to start each translation model, for the settings (experimental). Reading it
+ * never starts anything.
+ */
+async getRefinerStatus() : Promise<RefinerStatus> {
+    return await TAURI_INVOKE("get_refiner_status");
 }
 }
 
@@ -446,7 +453,13 @@ attribution: string; capabilities: Capabilities;
 /**
  * What a `Role::Refinement` model does. Empty for every other role.
  */
-tasks: RefineKind[] }
+tasks: RefineKind[]; 
+/**
+ * About how much memory the model takes while it runs (the peak resident size of its sidecar
+ * in the stage 0 / M2 measurements, the mapped file included). Shown for the refine models;
+ * `None` where it was not measured.
+ */
+memory_bytes: number | null }
 /**
  * A catalog entry with its state on this Mac.
  */
@@ -580,6 +593,11 @@ export type RefineStatus =
  * The time budget ran out.
  */
 "timeout"
+/**
+ * What the settings show about the sidecars: the last failure to start a step's sidecar or load
+ * its model, until a start succeeds. A missing model is not listed (the Models screen shows it).
+ */
+export type RefinerStatus = { translate_error: string | null; clean_error: string | null }
 export type RetryError = { kind: "not_found" } | { kind: "audio_missing" } | { kind: "model_missing" } | { kind: "no_speech" } | { kind: "failed"; message: string }
 export type Role = "recognition" | "voice_detection" | 
 /**

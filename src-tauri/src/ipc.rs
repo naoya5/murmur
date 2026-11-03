@@ -23,6 +23,7 @@ use tauri_specta::{Builder, Event as _, collect_commands, collect_events};
 use crate::adapters::audio::{self, InputDevice};
 use crate::adapters::models::{DownloadProgress, ModelStatus};
 use crate::adapters::output;
+use crate::adapters::refiner::RefinerStatus;
 use crate::adapters::store::{self, TranscriptRow};
 use crate::app::App;
 use crate::controller::{AudioLevel, HistoryChanged, PillState};
@@ -66,6 +67,7 @@ pub const COMMANDS: &[&str] = &[
     "submit_ink_stroke",
     "open_annotations_folder",
     "overlay_ready",
+    "get_refiner_status",
 ];
 
 /// Commands the pill window may call (its capability lists exactly these).
@@ -566,6 +568,14 @@ pub fn overlay_ready(services: Services<'_>) {
     }
 }
 
+/// The last failure to start each translation model, for the settings (experimental). Reading it
+/// never starts anything.
+#[tauri::command]
+#[specta::specta]
+pub fn get_refiner_status(services: Services<'_>) -> RefinerStatus {
+    services.refiner().status()
+}
+
 /// Opens the annotations folder in the Finder. The folder is created by the first bundle, never
 /// here (while the feature is off nothing of it exists on disk).
 #[tauri::command]
@@ -617,6 +627,7 @@ pub fn builder() -> Builder<Wry> {
             submit_ink_stroke,
             open_annotations_folder,
             overlay_ready,
+            get_refiner_status,
         ])
         .events(collect_events![
             PillState,

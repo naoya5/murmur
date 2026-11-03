@@ -8,18 +8,25 @@
 //!
 //! Every wait has a timeout (G5): the start (a cancel with no target answers at once, since the
 //! protocol has no greeting), the model load, the warm-up, the generation (the step's budget), and
-//! the reply to a cancel, after which the process is killed. A process that ends by itself is a
-//! crash; `refine::RestartBudget` decides whether it may start again. No prompt or answer text
-//! reaches the log (G7): only ids, error codes, token counts and times.
+//! the reply to a cancel, after which the process is killed. Requests go through a writer thread,
+//! so a sidecar that stops reading cannot hold a caller past its deadline. A process that ends by
+//! itself is a crash; `refine::RestartBudget` decides whether it may start again. Killed and
+//! dropped processes are reaped within a short wait, or later on a reaper thread. No prompt or
+//! answer text reaches the log (G7): only ids, error codes, token counts and times.
+//!
+//! Lifecycle: `Refiner::handle` gives a `RefinerHandle` (the `ports::TextRefiner`) bound to the
+//! current lifecycle. `stop_all` and `shutdown` end that lifecycle before they stop anything: the
+//! handles taken before can start nothing more, and their calls in progress stop at once. Handles
+//! taken afterwards (a later recording) belong to the next lifecycle.
 //!
 //! Only transport lives here. Prompts, validation and the order of the steps are in
 //! `murmur_core::refine`; `crate::refine_session` makes the calls.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,10 +39,14 @@ use serde_json::{Map, Value, json};
 /// The sidecar's file name next to the app executable (Tauri `bundle.externalBin`).
 pub const SIDECAR_NAME: &str = "murmur-llm";
 
-/// How often a wait looks at the cancel token.
+/// How often a wait looks at the cancel tokens.
 const POLL: Duration = Duration::from_millis(20);
 /// A stopped sidecar exits within 0.5 s of the end of its input; then it is killed.
 const STOP_GRACE: Duration = Duration::from_millis(1_000);
+/// How long a kill waits to reap the process before a reaper thread takes over.
+const REAP_WAIT: Duration = Duration::from_millis(200);
+/// How long a reaper thread keeps trying before it gives up (and logs).
+const REAPER_LIMIT: Duration = Duration::from_secs(30);
 /// The longest a call waits for the process slot that another call holds: a warm-up that has
 /// to start the process and load the model holds it that long at most.
 const SLOT_WAIT: Duration = Duration::from_millis(
@@ -43,9 +54,18 @@ const SLOT_WAIT: Duration = Duration::from_millis(
         + refine::REFINER_LOAD_TIMEOUT_MS
         + refine::REFINER_WARM_TIMEOUT_MS,
 );
-
-/// How long the exit waits for a busy process slot.
+/// How long `stop_all` waits for a busy slot. The ended lifecycle stops its calls within a cancel
+/// reply and a reap, so this is a safety margin; past it the process is killed directly.
+const STOP_WAIT: Duration = Duration::from_millis(3_000);
+/// The same for the exit.
 const SHUTDOWN_WAIT: Duration = Duration::from_millis(1_500);
+/// The longest output line accepted. A generation is capped at 8192 tokens, far below this; a
+/// longer line means the process is broken, and it is stopped.
+const MAX_LINE_BYTES: usize = 1_048_576;
+/// Output lines waiting for the caller; the reader waits when they are not taken.
+const LINE_QUEUE: usize = 64;
+/// The error a call gets when its lifecycle ended (`stop_all`, `shutdown`).
+const STOPPED: &str = "stopped";
 
 /// Finds the model file of a step; `None` while it is not downloaded.
 pub type ModelPaths = Box<dyn Fn(RefineKind) -> Option<PathBuf> + Send + Sync>;
@@ -61,10 +81,24 @@ fn ms(millis: Millis) -> Duration {
     Duration::from_millis(millis)
 }
 
-/// The refine models behind `ports::TextRefiner`. Cheap to clone; all clones share the processes.
+fn lock_ignoring_poison<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The refine models: their processes, lifecycle and status. Cheap to clone; all clones share the
+/// processes. Calls go through a `RefinerHandle`.
 #[derive(Clone)]
 pub struct Refiner {
     inner: Arc<Inner>,
+}
+
+/// The `ports::TextRefiner` of one lifecycle (see the module comment).
+#[derive(Clone)]
+pub struct RefinerHandle {
+    inner: Arc<Inner>,
+    lifecycle: CancelToken,
 }
 
 struct Inner {
@@ -73,13 +107,28 @@ struct Inner {
     origin: Instant,
     clean: Sidecar,
     translate: Sidecar,
+    /// Cancelled when the lifecycle ends; replaced by a fresh token at once.
+    lifecycle: Mutex<CancelToken>,
 }
 
 #[derive(Default)]
 struct Sidecar {
     slot: Mutex<Slot>,
-    /// The process runs with its model loaded. Read without the lock (`ready`).
+    /// The process runs with its model loaded. Read without the slot (`ready`).
     loaded: AtomicBool,
+    /// Why the last start or model load failed, until a start succeeds (`status`).
+    last_error: Mutex<Option<String>>,
+    /// The running process, reachable without the slot, so a stop can kill it while a call
+    /// holds the slot.
+    child: Mutex<Option<SharedChild>>,
+}
+
+/// What the settings show about the sidecars: the last failure to start a step's sidecar or load
+/// its model, until a start succeeds. A missing model is not listed (the Models screen shows it).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, specta::Type)]
+pub struct RefinerStatus {
+    pub translate_error: Option<String>,
+    pub clean_error: Option<String>,
 }
 
 struct Slot {
@@ -104,35 +153,180 @@ impl Default for Slot {
     }
 }
 
-/// Why a call ended without its response.
-#[derive(Debug)]
-enum CallError {
-    /// The process ended (or its pipes broke) by itself.
-    Exited,
-    /// The cancel token was set; the sidecar answered the cancel.
+/// Why a call stopped waiting for its response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Why {
+    /// The session's cancel token.
     Cancelled,
-    /// The deadline passed; the sidecar answered the cancel.
+    /// The call's deadline.
     Deadline,
+    /// The lifecycle ended.
+    Stopped,
+}
+
+/// Why a call ended without its response.
+#[derive(Debug, PartialEq, Eq)]
+enum CallError {
+    /// The process ended (or its pipes broke).
+    Exited,
+    /// The sidecar reported a fatal error that no request id carries (`backend_init_failed`).
+    Fatal(String),
+    /// The sidecar answered the cancel; the process is still usable.
+    Interrupted(Why),
     /// The sidecar did not answer the cancel in time and was killed.
-    Killed { cancelled: bool },
+    Killed(Why),
 }
 
 impl CallError {
     fn into_refine_error(self) -> RefineError {
         match self {
             CallError::Exited => RefineError::Unavailable("sidecar exited".to_owned()),
-            CallError::Cancelled | CallError::Killed { cancelled: true } => RefineError::Cancelled,
-            CallError::Deadline | CallError::Killed { cancelled: false } => RefineError::Timeout,
+            CallError::Fatal(code) => RefineError::Unavailable(code),
+            CallError::Interrupted(why) | CallError::Killed(why) => match why {
+                Why::Cancelled => RefineError::Cancelled,
+                Why::Deadline => RefineError::Timeout,
+                Why::Stopped => RefineError::Unavailable(STOPPED.to_owned()),
+            },
+        }
+    }
+}
+
+// --- the child process ---
+
+/// What reaping needs from a child process; a test double injects kill and wait failures.
+trait Reapable: Send {
+    fn kill(&mut self) -> std::io::Result<()>;
+    /// Whether the exit status has been collected (the process is gone, not a zombie).
+    fn try_wait(&mut self) -> std::io::Result<bool>;
+}
+
+impl Reapable for Child {
+    fn kill(&mut self) -> std::io::Result<()> {
+        Child::kill(self)
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<bool> {
+        Child::try_wait(self).map(|status| status.is_some())
+    }
+}
+
+/// A child process shared by its owner and the stop path. The lock is held only for a kill or a
+/// non-blocking wait.
+type SharedChild = Arc<Mutex<Box<dyn Reapable>>>;
+
+/// Polls the child until its exit status is collected, at most `wait`.
+fn poll_reaped(child: &SharedChild, wait: Duration) -> bool {
+    let until = Instant::now() + wait;
+    loop {
+        match lock_ignoring_poison(child).try_wait() {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(error) => {
+                // No such child any more: nothing is left to reap.
+                tracing::warn!(kind = ?error.kind(), "waiting for a refine sidecar failed");
+                return true;
+            }
+        }
+        let now = Instant::now();
+        if now >= until {
+            return false;
+        }
+        thread::sleep(POLL.min(until - now));
+    }
+}
+
+/// Reaps the child on its own thread, so no caller waits for it.
+fn reap_later(child: SharedChild, grace: Duration) {
+    let spawned = thread::Builder::new()
+        .name("murmur-llm-reaper".to_owned())
+        .spawn(move || {
+            if poll_reaped(&child, grace) {
+                return;
+            }
+            if let Err(error) = lock_ignoring_poison(&child).kill() {
+                tracing::warn!(kind = ?error.kind(), "could not kill a refine sidecar");
+            }
+            if !poll_reaped(&child, REAPER_LIMIT) {
+                tracing::warn!("a refine sidecar could not be reaped");
+            }
+        });
+    if spawned.is_err() {
+        tracing::warn!("no reaper thread for a refine sidecar");
+    }
+}
+
+/// Kills the child and reaps it within `wait`; past that a reaper thread finishes the job.
+/// Returns whether it was reaped here.
+fn kill_and_reap(child: &SharedChild, wait: Duration) -> bool {
+    if let Err(error) = lock_ignoring_poison(child).kill() {
+        // Also when it has exited already; the wait below tells.
+        tracing::info!(kind = ?error.kind(), "kill of a refine sidecar failed");
+    }
+    if poll_reaped(child, wait) {
+        return true;
+    }
+    reap_later(Arc::clone(child), Duration::ZERO);
+    false
+}
+
+/// How reading one output line ended.
+#[derive(Debug, PartialEq, Eq)]
+enum LineRead {
+    Line,
+    Eof,
+    TooLong,
+}
+
+/// Reads one line without its newline into `buf`, at most `max` bytes.
+fn read_line_bounded(
+    reader: &mut impl BufRead,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<LineRead> {
+    buf.clear();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(if buf.is_empty() {
+                LineRead::Eof
+            } else {
+                LineRead::Line
+            });
+        }
+        let (take, end) = match available.iter().position(|b| *b == b'\n') {
+            Some(i) => (i, true),
+            None => (available.len(), false),
+        };
+        if buf.len() + take > max {
+            return Ok(LineRead::TooLong);
+        }
+        buf.extend_from_slice(&available[..take]);
+        reader.consume(if end { take + 1 } else { take });
+        if end {
+            return Ok(LineRead::Line);
         }
     }
 }
 
 /// One running sidecar.
 struct Process {
-    child: Child,
-    stdin: Option<ChildStdin>,
+    child: SharedChild,
+    pid: u32,
+    /// Request lines for the writer thread; `None` once the input is closed.
+    writer: Option<Sender<Vec<u8>>>,
     lines: Receiver<String>,
     next_id: u64,
+    /// Stopped or killed and reaped (or handed to a reaper): nothing left for `Drop`.
+    done: bool,
+}
+
+/// How an output line relates to a request.
+enum Reply {
+    /// The response to the request.
+    Response(Map<String, Value>),
+    /// A fatal error without a request id.
+    Fatal(String),
+    Other,
 }
 
 impl Process {
@@ -143,171 +337,215 @@ impl Process {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| RefineError::Unavailable(format!("could not start: {}", e.kind())))?;
-        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-            kill_and_reap(&mut child);
+        let pid = child.id();
+        let (stdin, stdout) = (child.stdin.take(), child.stdout.take());
+        let shared: SharedChild = Arc::new(Mutex::new(Box::new(child)));
+        let (Some(mut stdin), Some(stdout)) = (stdin, stdout) else {
+            kill_and_reap(&shared, REAP_WAIT);
             return Err(RefineError::Unavailable("no pipes".to_owned()));
         };
-        let (tx, lines) = mpsc::channel();
+        let (line_tx, lines) = mpsc::sync_channel(LINE_QUEUE);
         let reader = thread::Builder::new()
             .name("murmur-llm-reader".to_owned())
             .spawn(move || {
                 let mut reader = BufReader::new(stdout);
-                let mut line = String::new();
+                let mut buf = Vec::new();
                 loop {
-                    line.clear();
-                    match reader.read_line(&mut line) {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {
-                            if tx.send(line.trim_end().to_owned()).is_err() {
+                    match read_line_bounded(&mut reader, &mut buf, MAX_LINE_BYTES) {
+                        Ok(LineRead::Line) => {
+                            // A line that is not UTF-8 is not a response; skip it.
+                            let Ok(line) = String::from_utf8(std::mem::take(&mut buf)) else {
+                                continue;
+                            };
+                            if line_tx.send(line).is_err() {
                                 break;
                             }
                         }
+                        Ok(LineRead::TooLong) => {
+                            tracing::warn!("refine sidecar wrote an overlong line");
+                            break;
+                        }
+                        Ok(LineRead::Eof) | Err(_) => break,
                     }
                 }
             });
-        if reader.is_err() {
-            kill_and_reap(&mut child);
-            return Err(RefineError::Unavailable("no reader thread".to_owned()));
+        let (writer, requests) = mpsc::channel::<Vec<u8>>();
+        let writer_thread = thread::Builder::new()
+            .name("murmur-llm-writer".to_owned())
+            .spawn(move || {
+                // Ends when the owner closes the input, or when the pipe breaks (the process
+                // ended or was killed); dropping stdin then gives the sidecar its end of input.
+                for line in requests {
+                    if stdin.write_all(&line).and_then(|()| stdin.flush()).is_err() {
+                        break;
+                    }
+                }
+            });
+        if reader.is_err() || writer_thread.is_err() {
+            kill_and_reap(&shared, REAP_WAIT);
+            return Err(RefineError::Unavailable("no pipe threads".to_owned()));
         }
         Ok(Process {
-            child,
-            stdin: Some(stdin),
+            child: shared,
+            pid,
+            writer: Some(writer),
             lines,
             next_id: 1,
+            done: false,
         })
     }
 
-    /// Writes one request line. Requests are far below the pipe buffer, and the sidecar reads its
-    /// input all the time (to see cancels), so the write does not block.
-    fn send(&mut self, body: &Value) -> Result<(), CallError> {
-        let stdin = self.stdin.as_mut().ok_or(CallError::Exited)?;
-        let mut line = body.to_string();
-        line.push('\n');
-        stdin
-            .write_all(line.as_bytes())
-            .and_then(|()| stdin.flush())
-            .map_err(|_| CallError::Exited)
+    fn take_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
     }
 
-    /// Sends `op` with `fields` and waits for its response until `deadline`, or until `cancel` is
-    /// set. Either of those cancels the request on the sidecar.
+    /// Hands one request line to the writer thread. Never blocks.
+    fn send(&mut self, body: &Value) -> Result<(), CallError> {
+        let writer = self.writer.as_ref().ok_or(CallError::Exited)?;
+        let mut line = body.to_string().into_bytes();
+        line.push(b'\n');
+        writer.send(line).map_err(|_| CallError::Exited)
+    }
+
+    fn reply(line: &str, id: u64) -> Reply {
+        let Ok(Value::Object(map)) = serde_json::from_str::<Value>(line) else {
+            return Reply::Other;
+        };
+        match map.get("id") {
+            Some(Value::Null) if error_code(&map).is_some() => {
+                Reply::Fatal(error_code(&map).unwrap_or_default())
+            }
+            Some(value) if value.as_u64() == Some(id) => Reply::Response(map),
+            _ => Reply::Other,
+        }
+    }
+
+    /// Sends `op` with `fields` and waits for its response until `deadline`, the session's cancel
+    /// or the end of the lifecycle. Each of those cancels the request on the sidecar.
     fn call(
         &mut self,
         op: &str,
         fields: Map<String, Value>,
         deadline: Instant,
-        cancel: Option<&CancelToken>,
+        session: Option<&CancelToken>,
+        lifecycle: &CancelToken,
     ) -> Result<Map<String, Value>, CallError> {
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.take_id();
         let mut body = fields;
         body.insert("id".to_owned(), json!(id));
         body.insert("op".to_owned(), json!(op));
         self.send(&Value::Object(body))?;
         loop {
-            if cancel.is_some_and(CancelToken::is_cancelled) {
-                return Err(self.abort(id, true));
-            }
             let now = Instant::now();
-            if now >= deadline {
-                return Err(self.abort(id, false));
+            let why = if session.is_some_and(CancelToken::is_cancelled) {
+                Some(Why::Cancelled)
+            } else if lifecycle.is_cancelled() {
+                Some(Why::Stopped)
+            } else if now >= deadline {
+                Some(Why::Deadline)
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                return Err(self.abort(id, why));
             }
             match self.lines.recv_timeout((deadline - now).min(POLL)) {
-                Ok(line) => {
-                    if let Some(response) = response_to(&line, id) {
-                        return Ok(response);
-                    }
-                }
+                Ok(line) => match Self::reply(&line, id) {
+                    Reply::Response(response) => return Ok(response),
+                    Reply::Fatal(code) => return Err(CallError::Fatal(code)),
+                    Reply::Other => {}
+                },
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return Err(CallError::Exited),
             }
         }
     }
 
-    /// Cancels request `id` and waits `REFINER_CANCEL_REPLY_MS` for its response; a sidecar that
-    /// does not answer is killed.
-    fn abort(&mut self, id: u64, cancelled: bool) -> CallError {
-        let cancel_id = self.next_id;
-        self.next_id += 1;
+    /// Cancels request `id` and waits for its response, `REFINER_CANCEL_REPLY_MS` in all
+    /// (sending included); a sidecar that does not answer is killed.
+    fn abort(&mut self, id: u64, why: Why) -> CallError {
+        let until = Instant::now() + ms(refine::REFINER_CANCEL_REPLY_MS);
+        let cancel_id = self.take_id();
         let answered = self
             .send(&json!({"id": cancel_id, "op": "cancel", "target": id}))
             .is_ok()
-            && {
-                let until = Instant::now() + ms(refine::REFINER_CANCEL_REPLY_MS);
-                loop {
-                    let now = Instant::now();
-                    if now >= until {
-                        break false;
-                    }
-                    match self.lines.recv_timeout(until - now) {
-                        Ok(line) if response_to(&line, id).is_some() => break true,
-                        Ok(_) => {}
-                        Err(_) => break false,
-                    }
+            && loop {
+                let now = Instant::now();
+                if now >= until {
+                    break false;
+                }
+                match self.lines.recv_timeout(until - now) {
+                    Ok(line) => match Self::reply(&line, id) {
+                        Reply::Response(_) => break true,
+                        Reply::Fatal(_) => break false,
+                        Reply::Other => {}
+                    },
+                    Err(_) => break false,
                 }
             };
         if answered {
-            if cancelled {
-                CallError::Cancelled
-            } else {
-                CallError::Deadline
-            }
+            CallError::Interrupted(why)
         } else {
             self.kill();
-            CallError::Killed { cancelled }
+            CallError::Killed(why)
         }
     }
 
-    fn alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+    fn alive(&self) -> bool {
+        matches!(lock_ignoring_poison(&self.child).try_wait(), Ok(false))
     }
 
+    /// Kills the process now; it is reaped within `REAP_WAIT` or by a reaper thread.
     fn kill(&mut self) {
-        self.stdin = None;
-        kill_and_reap(&mut self.child);
+        self.writer = None;
+        kill_and_reap(&self.child, REAP_WAIT);
+        self.done = true;
     }
 
-    /// Closes the input (the sidecar cancels its work and exits) and waits a little for the
+    /// Closes the input (the sidecar cancels its work and exits), waits `STOP_GRACE` for the
     /// exit, then kills it.
     fn stop(mut self) {
-        self.stdin = None;
-        let until = Instant::now() + STOP_GRACE;
-        while Instant::now() < until {
-            if !matches!(self.child.try_wait(), Ok(None)) {
-                return;
-            }
-            thread::sleep(POLL);
+        if self.done {
+            return;
         }
-        kill_and_reap(&mut self.child);
+        self.writer = None;
+        if !poll_reaped(&self.child, STOP_GRACE) {
+            kill_and_reap(&self.child, REAP_WAIT);
+        }
+        self.done = true;
     }
 }
 
-fn kill_and_reap(child: &mut Child) {
-    let _ = child.kill();
-    // After a kill the wait returns at once; it reaps the process (no zombie).
-    let _ = child.wait();
+impl Drop for Process {
+    /// A process dropped without `stop` or `kill` (its last owner went away, an early return, a
+    /// panic): the input closes, and a reaper thread gives it the stop grace, then kills and reaps
+    /// it. Never blocks.
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        self.writer = None;
+        reap_later(Arc::clone(&self.child), STOP_GRACE);
+    }
 }
 
-/// The response to request `id` in one output line, if it is one.
-fn response_to(line: &str, id: u64) -> Option<Map<String, Value>> {
-    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(line) else {
-        return None;
-    };
-    (map.get("id").and_then(Value::as_u64) == Some(id)).then_some(map)
-}
-
-/// The sidecar's error code of a failed response (`None` when it succeeded).
+/// The sidecar's error code of a failed response (`None` when it succeeded). Only plain codes are
+/// kept; anything else becomes `unknown` (the log never carries free text).
 fn error_code(response: &Map<String, Value>) -> Option<String> {
     if response.get("ok").and_then(Value::as_bool) == Some(true) {
         return None;
     }
-    Some(
-        response
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_owned(),
-    )
+    let code = response.get("error").and_then(Value::as_str);
+    Some(match code {
+        Some(code) if is_plain_code(code) => code.to_owned(),
+        _ => "unknown".to_owned(),
+    })
+}
+
+fn is_plain_code(code: &str) -> bool {
+    (1..=48).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
 }
 
 fn number(response: &Map<String, Value>, key: &str) -> Option<f64> {
@@ -323,6 +561,8 @@ fn messages_json(messages: &[ChatMessage]) -> Value {
     )
 }
 
+// --- the service ---
+
 impl Refiner {
     /// `binary` is the sidecar (`bundled_sidecar`); `model_paths` finds each step's model file.
     pub fn new(binary: Option<PathBuf>, model_paths: ModelPaths) -> Refiner {
@@ -333,52 +573,143 @@ impl Refiner {
                 origin: Instant::now(),
                 clean: Sidecar::default(),
                 translate: Sidecar::default(),
+                lifecycle: Mutex::new(CancelToken::new()),
             }),
         }
     }
 
+    /// A `TextRefiner` for the current lifecycle. Take one per recording.
+    pub fn handle(&self) -> RefinerHandle {
+        RefinerHandle {
+            inner: Arc::clone(&self.inner),
+            lifecycle: lock_ignoring_poison(&self.inner.lifecycle).clone(),
+        }
+    }
+
+    /// The last start failures of both steps.
+    pub fn status(&self) -> RefinerStatus {
+        let error = |step| lock_ignoring_poison(&self.inner.sidecar(step).last_error).clone();
+        RefinerStatus {
+            translate_error: error(RefineKind::Translate),
+            clean_error: error(RefineKind::Clean),
+        }
+    }
+
+    /// Stops the processes that have not been used for `REFINER_IDLE_STOP_MS` (D3). A busy
+    /// process is left alone.
+    pub fn stop_idle(&self) {
+        for step in [RefineKind::Clean, RefineKind::Translate] {
+            let Ok(mut slot) = self.inner.sidecar(step).slot.try_lock() else {
+                continue;
+            };
+            if slot.process.is_some()
+                && slot.last_used.elapsed() >= ms(refine::REFINER_IDLE_STOP_MS)
+            {
+                tracing::info!(step = step.code(), "stopping an idle refine sidecar");
+                self.inner.drop_process(step, &mut slot, false);
+            }
+        }
+    }
+
+    /// Ends the lifecycle and stops both processes (the feature was switched off, or a model was
+    /// deleted).
+    pub fn stop_all(&self) {
+        self.stop_processes(STOP_WAIT);
+    }
+
+    /// The same as the app quits, with a shorter wait. A process left busy also exits by itself
+    /// once Murmur's end closes its input.
+    pub fn shutdown(&self) {
+        self.stop_processes(SHUTDOWN_WAIT);
+    }
+
+    fn stop_processes(&self, wait: Duration) {
+        // First end the lifecycle: the handles taken before start nothing more, and their calls
+        // in progress stop. Later handles belong to the fresh lifecycle.
+        let ended = std::mem::take(&mut *lock_ignoring_poison(&self.inner.lifecycle));
+        ended.cancel();
+        let deadline = Instant::now() + wait;
+        for step in [RefineKind::Clean, RefineKind::Translate] {
+            let sidecar = self.inner.sidecar(step);
+            match lock_slot(&sidecar.slot, deadline, None, None) {
+                Ok(mut slot) => {
+                    if slot.process.is_some() {
+                        self.inner.drop_process(step, &mut slot, false);
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        step = step.code(),
+                        "a refine sidecar stayed busy; killing it"
+                    );
+                    if let Some(child) = lock_ignoring_poison(&sidecar.child).clone() {
+                        kill_and_reap(&child, REAP_WAIT);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn pid(&self, step: RefineKind) -> Option<u32> {
+        lock_ignoring_poison(&self.inner.sidecar(step).slot)
+            .process
+            .as_ref()
+            .map(|p| p.pid)
+    }
+}
+
+/// Waits for a process slot until `deadline`, the session's cancel or the end of the lifecycle.
+fn lock_slot<'a>(
+    slot: &'a Mutex<Slot>,
+    deadline: Instant,
+    session: Option<&CancelToken>,
+    lifecycle: Option<&CancelToken>,
+) -> Result<MutexGuard<'a, Slot>, RefineError> {
+    loop {
+        match slot.try_lock() {
+            Ok(guard) => return Ok(guard),
+            // A panic while holding the slot leaves at worst a dead process, which the next call
+            // notices.
+            Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => {}
+        }
+        if session.is_some_and(CancelToken::is_cancelled) {
+            return Err(RefineError::Cancelled);
+        }
+        if lifecycle.is_some_and(CancelToken::is_cancelled) {
+            return Err(RefineError::Unavailable(STOPPED.to_owned()));
+        }
+        if Instant::now() >= deadline {
+            return Err(RefineError::Timeout);
+        }
+        thread::sleep(POLL);
+    }
+}
+
+impl Inner {
     fn sidecar(&self, step: RefineKind) -> &Sidecar {
         match step {
-            RefineKind::Clean => &self.inner.clean,
-            RefineKind::Translate => &self.inner.translate,
+            RefineKind::Clean => &self.clean,
+            RefineKind::Translate => &self.translate,
         }
     }
 
     fn now_ms(&self) -> Millis {
-        self.inner.origin.elapsed().as_millis() as Millis
-    }
-
-    /// Waits for the step's process slot until `deadline` (or the cancel).
-    fn lock(
-        &self,
-        step: RefineKind,
-        deadline: Instant,
-        cancel: Option<&CancelToken>,
-    ) -> Result<MutexGuard<'_, Slot>, RefineError> {
-        let slot = &self.sidecar(step).slot;
-        loop {
-            match slot.try_lock() {
-                Ok(guard) => return Ok(guard),
-                // A panic while holding the slot leaves at worst a dead process, which the next
-                // call notices.
-                Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
-                Err(TryLockError::WouldBlock) => {}
-            }
-            if cancel.is_some_and(CancelToken::is_cancelled) {
-                return Err(RefineError::Cancelled);
-            }
-            if Instant::now() >= deadline {
-                return Err(RefineError::Timeout);
-            }
-            thread::sleep(POLL);
-        }
+        self.origin.elapsed().as_millis() as Millis
     }
 
     /// Drops the slot's process. `crashed`: it ended by itself, so the next start is a restart.
     fn drop_process(&self, step: RefineKind, slot: &mut Slot, crashed: bool) {
+        let sidecar = self.sidecar(step);
+        *lock_ignoring_poison(&sidecar.child) = None;
         if let Some(mut process) = slot.process.take() {
             if crashed {
-                tracing::warn!(step = step.code(), "refine sidecar ended unexpectedly");
+                tracing::warn!(
+                    step = step.code(),
+                    pid = process.pid,
+                    "refine sidecar ended unexpectedly"
+                );
                 process.kill();
             } else {
                 process.stop();
@@ -386,31 +717,83 @@ impl Refiner {
         }
         slot.warmed = None;
         slot.crashed |= crashed;
-        self.sidecar(step).loaded.store(false, Ordering::Release);
+        sidecar.loaded.store(false, Ordering::Release);
+    }
+}
+
+// --- the calls of one lifecycle ---
+
+impl RefinerHandle {
+    fn sidecar(&self, step: RefineKind) -> &Sidecar {
+        self.inner.sidecar(step)
     }
 
-    /// Settles a failed call: a process that ended is dropped as a crash, a killed one as stopped.
+    /// Takes the step's slot for a call of this lifecycle.
+    fn slot(
+        &self,
+        step: RefineKind,
+        session: Option<&CancelToken>,
+    ) -> Result<MutexGuard<'_, Slot>, RefineError> {
+        let slot = lock_slot(
+            &self.sidecar(step).slot,
+            Instant::now() + SLOT_WAIT,
+            session,
+            Some(&self.lifecycle),
+        )?;
+        // Checked under the slot: a stop sweep ends the lifecycle before it takes any slot, so
+        // nothing of an ended lifecycle starts after the sweep has passed.
+        if self.lifecycle.is_cancelled() {
+            return Err(RefineError::Unavailable(STOPPED.to_owned()));
+        }
+        Ok(slot)
+    }
+
+    /// Settles a failed call: a process that ended by itself is dropped as a crash; a killed one,
+    /// one that reported a fatal error, or one that ended after its lifecycle, as stopped.
     fn after_call_error(&self, step: RefineKind, slot: &mut Slot, error: CallError) -> RefineError {
-        match error {
-            CallError::Exited => self.drop_process(step, slot, true),
-            CallError::Killed { .. } => self.drop_process(step, slot, false),
-            CallError::Cancelled | CallError::Deadline => {}
+        match &error {
+            CallError::Exited => {
+                let crashed = !self.lifecycle.is_cancelled();
+                self.inner.drop_process(step, slot, crashed);
+            }
+            CallError::Fatal(_) | CallError::Killed(_) => {
+                self.inner.drop_process(step, slot, false)
+            }
+            CallError::Interrupted(_) => {}
         }
         error.into_refine_error()
     }
 
-    /// Starts the step's sidecar and loads its model, unless it is running already.
+    /// Starts the step's sidecar and loads its model, unless it is running already, and keeps the
+    /// outcome for `status`.
     fn ensure_running(
         &self,
         step: RefineKind,
         slot: &mut Slot,
-        cancel: Option<&CancelToken>,
+        session: Option<&CancelToken>,
     ) -> Result<(), RefineError> {
-        if let Some(process) = slot.process.as_mut() {
+        let result = self.start_if_needed(step, slot, session);
+        let error = match &result {
+            Err(RefineError::Unavailable(code)) if code != STOPPED => Some(code.clone()),
+            Ok(()) | Err(RefineError::ModelMissing) => None,
+            // A cancelled or stopped call says nothing about the sidecar.
+            Err(_) => return result,
+        };
+        *lock_ignoring_poison(&self.sidecar(step).last_error) = error;
+        result
+    }
+
+    fn start_if_needed(
+        &self,
+        step: RefineKind,
+        slot: &mut Slot,
+        session: Option<&CancelToken>,
+    ) -> Result<(), RefineError> {
+        if let Some(process) = slot.process.as_ref() {
             if process.alive() {
                 return Ok(());
             }
-            self.drop_process(step, slot, true);
+            self.inner.drop_process(step, slot, true);
         }
         let model = (self.inner.model_paths)(step).ok_or(RefineError::ModelMissing)?;
         let binary = self
@@ -419,7 +802,7 @@ impl Refiner {
             .as_deref()
             .ok_or_else(|| RefineError::Unavailable("sidecar missing".to_owned()))?;
         if slot.crashed {
-            if !slot.restarts.try_restart(self.now_ms()) {
+            if !slot.restarts.try_restart(self.inner.now_ms()) {
                 return Err(RefineError::Unavailable(
                     "paused after repeated crashes".to_owned(),
                 ));
@@ -428,14 +811,21 @@ impl Refiner {
         }
         let started = Instant::now();
         let mut process = Process::spawn(binary)?;
+        *lock_ignoring_poison(&self.sidecar(step).child) = Some(Arc::clone(&process.child));
         // No greeting in the protocol: a cancel with no target answers as soon as it runs.
-        let handshake = process.call(
-            "cancel",
-            Map::from_iter([("target".to_owned(), json!("start"))]),
-            started + ms(refine::REFINER_START_TIMEOUT_MS),
-            cancel,
-        );
-        let load = handshake.and_then(|_| {
+        let handshake = process
+            .call(
+                "cancel",
+                Map::from_iter([("target".to_owned(), json!("start"))]),
+                started + ms(refine::REFINER_START_TIMEOUT_MS),
+                session,
+                &self.lifecycle,
+            )
+            .and_then(|response| match error_code(&response) {
+                Some(code) => Err(CallError::Fatal(code)),
+                None => Ok(()),
+            });
+        let load = handshake.and_then(|()| {
             let fields = Map::from_iter([
                 (
                     "model".to_owned(),
@@ -447,7 +837,8 @@ impl Refiner {
                 "load",
                 fields,
                 Instant::now() + ms(refine::REFINER_LOAD_TIMEOUT_MS),
-                cancel,
+                session,
+                &self.lifecycle,
             )
         });
         slot.process = Some(process);
@@ -455,11 +846,11 @@ impl Refiner {
             Ok(response) => response,
             Err(error) => {
                 // A start that does not get going counts as a crash only when the process
-                // itself ended; a timeout or cancel just stops it.
-                let crashed = matches!(error, CallError::Exited);
-                self.drop_process(step, slot, crashed);
+                // itself ended; a timeout, a cancel, a fatal report or a stop just stops it.
+                let crashed = error == CallError::Exited && !self.lifecycle.is_cancelled();
+                self.inner.drop_process(step, slot, crashed);
                 return Err(match error {
-                    CallError::Deadline | CallError::Killed { cancelled: false } => {
+                    CallError::Interrupted(Why::Deadline) | CallError::Killed(Why::Deadline) => {
                         RefineError::Unavailable("start or load timed out".to_owned())
                     }
                     other => other.into_refine_error(),
@@ -468,7 +859,7 @@ impl Refiner {
         };
         if let Some(code) = error_code(&response) {
             tracing::warn!(step = step.code(), error = %code, "refine model load failed");
-            self.drop_process(step, slot, false);
+            self.inner.drop_process(step, slot, false);
             return Err(RefineError::Unavailable(code));
         }
         let gpu = response
@@ -484,63 +875,22 @@ impl Refiner {
         self.sidecar(step).loaded.store(true, Ordering::Release);
         Ok(())
     }
-
-    /// Stops the processes that have not been used for `REFINER_IDLE_STOP_MS` (D3). A busy
-    /// process is left alone.
-    pub fn stop_idle(&self) {
-        for step in [RefineKind::Clean, RefineKind::Translate] {
-            let Ok(mut slot) = self.sidecar(step).slot.try_lock() else {
-                continue;
-            };
-            if slot.process.is_some()
-                && slot.last_used.elapsed() >= ms(refine::REFINER_IDLE_STOP_MS)
-            {
-                tracing::info!(step = step.code(), "stopping an idle refine sidecar");
-                self.drop_process(step, &mut slot, false);
-            }
-        }
-    }
-
-    /// Stops both processes (the feature was switched off). Waits for a call in progress to end
-    /// first; its own deadlines bound that wait.
-    pub fn stop_all(&self) {
-        self.stop_processes(SLOT_WAIT);
-    }
-
-    /// Stops both processes as the app quits. A call in progress was cancelled with its session;
-    /// a process still busy after a short wait exits by itself once Murmur's end closes its input.
-    pub fn shutdown(&self) {
-        self.stop_processes(SHUTDOWN_WAIT);
-    }
-
-    fn stop_processes(&self, wait: Duration) {
-        for step in [RefineKind::Clean, RefineKind::Translate] {
-            match self.lock(step, Instant::now() + wait, None) {
-                Ok(mut slot) => {
-                    if slot.process.is_some() {
-                        self.drop_process(step, &mut slot, false);
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(step = step.code(), %error, "could not stop a refine sidecar")
-                }
-            }
-        }
-    }
 }
 
-impl TextRefiner for Refiner {
+impl TextRefiner for RefinerHandle {
     fn warm(&mut self, step: RefineKind, prefix: &[ChatMessage]) -> Result<(), RefineError> {
-        let mut slot = self.lock(step, Instant::now() + SLOT_WAIT, None)?;
+        let mut slot = self.slot(step, None)?;
         slot.last_used = Instant::now();
         self.ensure_running(step, &mut slot, None)?;
         if slot.warmed.as_deref() == Some(prefix) {
             return Ok(());
         }
+        // The sidecar drops its old snapshot when a warm-up starts, whatever the outcome.
+        slot.warmed = None;
         let deadline = Instant::now() + ms(refine::REFINER_WARM_TIMEOUT_MS);
         let fields = Map::from_iter([("messages".to_owned(), messages_json(prefix))]);
         let result = match slot.process.as_mut() {
-            Some(process) => process.call("warm", fields, deadline, None),
+            Some(process) => process.call("warm", fields, deadline, None, &self.lifecycle),
             None => Err(CallError::Exited),
         };
         slot.last_used = Instant::now();
@@ -569,7 +919,7 @@ impl TextRefiner for Refiner {
         request: &GenerateRequest,
         cancel: &CancelToken,
     ) -> Result<Generated, RefineError> {
-        let mut slot = self.lock(step, Instant::now() + SLOT_WAIT, Some(cancel))?;
+        let mut slot = self.slot(step, Some(cancel))?;
         slot.last_used = Instant::now();
         self.ensure_running(step, &mut slot, Some(cancel))?;
         // The budget starts once the model is ready.
@@ -579,7 +929,9 @@ impl TextRefiner for Refiner {
             ("max_tokens".to_owned(), json!(request.max_tokens)),
         ]);
         let result = match slot.process.as_mut() {
-            Some(process) => process.call("generate", fields, deadline, Some(cancel)),
+            Some(process) => {
+                process.call("generate", fields, deadline, Some(cancel), &self.lifecycle)
+            }
             None => Err(CallError::Exited),
         };
         slot.last_used = Instant::now();
@@ -590,13 +942,25 @@ impl TextRefiner for Refiner {
                 "cancelled" if cancel.is_cancelled() => RefineError::Cancelled,
                 "cancelled" | "timeout" => RefineError::Timeout,
                 "model_not_loaded" => {
-                    self.drop_process(step, &mut slot, false);
+                    self.inner.drop_process(step, &mut slot, false);
                     RefineError::Unavailable(code)
                 }
                 _ => RefineError::Failed(code),
             });
         }
-        let stop_reason = response.get("stop_reason").and_then(Value::as_str);
+        // Only the two stop reasons of the protocol: anything else could be an incomplete answer
+        // passed off as complete.
+        let truncated = match response.get("stop_reason").and_then(Value::as_str) {
+            Some("eos") => false,
+            Some("max_tokens") => true,
+            _ => {
+                tracing::warn!(
+                    step = step.code(),
+                    "refine answer without a known stop reason"
+                );
+                return Err(RefineError::Failed("bad_stop_reason".to_owned()));
+            }
+        };
         tracing::info!(
             step = step.code(),
             prompt_ms = number(&response, "prompt_ms"),
@@ -604,32 +968,38 @@ impl TextRefiner for Refiner {
             prompt_tokens = number(&response, "prompt_tokens"),
             cached_tokens = number(&response, "cached_tokens"),
             generated_tokens = number(&response, "generated_tokens"),
-            stop_reason,
+            truncated,
             "refine generated"
         );
         let text = response
             .get("text")
             .and_then(Value::as_str)
-            .ok_or_else(|| RefineError::Failed("no text".to_owned()))?;
+            .ok_or_else(|| RefineError::Failed("no_text".to_owned()))?;
         Ok(Generated {
             text: text.to_owned(),
-            truncated: stop_reason == Some("max_tokens"),
+            truncated,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::AtomicUsize;
 
     use murmur_core::refine::Glossary;
 
     use super::*;
 
-    /// A stand-in sidecar: a shell script that speaks the protocol. `mode` decides how it answers
-    /// a generation: `ok`, `runaway` (stops at max_tokens), `slow` (answers only when
-    /// cancelled), `hang` (ignores the cancel too), `crash` (exits). Every start and every warm-up
-    /// is appended to `log`.
+    /// A stand-in sidecar: a shell script that speaks the protocol. `mode` decides how it answers:
+    /// `ok`, `runaway` (stops at max_tokens), `nostop` / `badstop` (no or an unknown stop reason),
+    /// `slow` (answers a generation only when cancelled), `hang` (ignores the cancel too),
+    /// `crash` (exits on a generation), `deaf` (stops reading its input after a warm-up),
+    /// `initfail` (reports `backend_init_failed` without an id at the load), `slowload` (the load
+    /// waits for `<log>.go`, reading nothing meanwhile). Every start, load and warm-up is appended
+    /// to `log`; while `<log>.fail` exists the load fails, while `<log>.warmfail` exists the
+    /// warm-up fails.
     fn fake_sidecar(name: &str, mode: &str) -> (PathBuf, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "murmur-refiner-{}-{name}-{}",
@@ -644,24 +1014,53 @@ mod tests {
 MODE={mode}
 LOG='{log}'
 echo start >> "$LOG"
+# Sets n to the number after a key, without starting a process per line.
+number() {{
+  n=
+  case "$1" in
+    *"\"$2\":"[0-9]*) n=${{1#*\"$2\":}}; n=${{n%%[!0-9]*}} ;;
+  esac
+}}
 while IFS= read -r line; do
-  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  number "$line" id; id=$n
   case "$line" in
     *'"op":"cancel"'*)
       printf '{{"id":%s,"ok":true,"error":null,"cancel_requested":false}}\n' "$id"
-      target=$(printf '%s\n' "$line" | sed -n 's/.*"target":\([0-9][0-9]*\).*/\1/p')
+      number "$line" target; target=$n
       if [ -n "$target" ] && [ "$MODE" = slow ]; then
         printf '{{"id":%s,"ok":false,"error":"cancelled","total_ms":1}}\n' "$target"
       fi ;;
     *'"op":"load"'*)
-      printf '{{"id":%s,"ok":true,"error":null,"load_ms":1,"ctx":2048,"gpu_offload_supported":true,"total_ms":1}}\n' "$id" ;;
+      echo load >> "$LOG"
+      if [ "$MODE" = initfail ]; then
+        printf '{{"id":null,"ok":false,"error":"backend_init_failed"}}\n'
+        continue
+      fi
+      if [ "$MODE" = slowload ]; then
+        while [ ! -f "$LOG.go" ]; do sleep 0.05; done
+      fi
+      if [ -f "$LOG.fail" ]; then
+        printf '{{"id":%s,"ok":false,"error":"model_load_failed","total_ms":1}}\n' "$id"
+      else
+        printf '{{"id":%s,"ok":true,"error":null,"load_ms":1,"ctx":2048,"gpu_offload_supported":true,"total_ms":1}}\n' "$id"
+      fi
+      ;;
     *'"op":"warm"'*)
       echo warm >> "$LOG"
-      printf '{{"id":%s,"ok":true,"error":null,"prompt_ms":1,"prompt_tokens":9,"cached_tokens":9,"generated_tokens":0,"total_ms":1}}\n' "$id" ;;
+      if [ -f "$LOG.warmfail" ]; then
+        printf '{{"id":%s,"ok":false,"error":"decode_failed","total_ms":1}}\n' "$id"
+      else
+        printf '{{"id":%s,"ok":true,"error":null,"prompt_ms":1,"prompt_tokens":9,"cached_tokens":9,"generated_tokens":0,"total_ms":1}}\n' "$id"
+      fi
+      if [ "$MODE" = deaf ]; then
+        exec sleep 30
+      fi ;;
     *'"op":"generate"'*)
       case "$MODE" in
         ok) printf '{{"id":%s,"ok":true,"error":null,"text":"The meeting is at four.","stop_reason":"eos","total_ms":1}}\n' "$id" ;;
         runaway) printf '{{"id":%s,"ok":true,"error":null,"text":"The the the","stop_reason":"max_tokens","total_ms":1}}\n' "$id" ;;
+        nostop) printf '{{"id":%s,"ok":true,"error":null,"text":"The meeting","total_ms":1}}\n' "$id" ;;
+        badstop) printf '{{"id":%s,"ok":true,"error":null,"text":"The meeting","stop_reason":"length","total_ms":1}}\n' "$id" ;;
         crash) exit 3 ;;
         *) ;;
       esac ;;
@@ -683,6 +1082,30 @@ done
             .count()
     }
 
+    fn flag(log: &Path, suffix: &str) -> PathBuf {
+        PathBuf::from(format!("{}.{suffix}", log.display()))
+    }
+
+    fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let until = Instant::now() + timeout;
+        while Instant::now() < until {
+            if done() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        done()
+    }
+
+    /// The process is gone and reaped (not even a zombie).
+    fn reaped(pid: u32) -> bool {
+        let out = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "stat="])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().is_empty()
+    }
+
     fn refiner(script: PathBuf) -> Refiner {
         // The fake never opens the model; any existing path will do.
         Refiner::new(Some(script), Box::new(|_| Some(PathBuf::from("/dev/null"))))
@@ -700,45 +1123,64 @@ done
         }
     }
 
+    fn generate(h: &mut RefinerHandle, budget_ms: Millis) -> Result<Generated, RefineError> {
+        h.generate(
+            RefineKind::Translate,
+            &request(budget_ms),
+            &CancelToken::new(),
+        )
+    }
+
     #[test]
     fn warms_once_per_prefix_and_generates() {
         let (script, log) = fake_sidecar("ok", "ok");
-        let mut r = refiner(script);
+        let r = refiner(script);
+        let mut h = r.handle();
         let prefix = refine::prefix(RefineKind::Translate, &Glossary::default());
-        assert!(!r.ready(RefineKind::Translate));
-        r.warm(RefineKind::Translate, &prefix).unwrap();
-        assert!(r.ready(RefineKind::Translate));
-        assert!(!r.ready(RefineKind::Clean));
-        r.warm(RefineKind::Translate, &prefix).unwrap();
+        assert!(!h.ready(RefineKind::Translate));
+        h.warm(RefineKind::Translate, &prefix).unwrap();
+        assert!(h.ready(RefineKind::Translate));
+        assert!(!h.ready(RefineKind::Clean));
+        h.warm(RefineKind::Translate, &prefix).unwrap();
         assert_eq!(count(&log, "warm"), 1, "the same prefix is warmed once");
-        let answer = r
-            .generate(RefineKind::Translate, &request(2_000), &CancelToken::new())
-            .unwrap();
+        let answer = generate(&mut h, 2_000).unwrap();
         assert_eq!(answer.text, "The meeting is at four.");
         assert!(!answer.truncated);
         assert_eq!(count(&log, "start"), 1);
         r.stop_all();
-        assert!(!r.ready(RefineKind::Translate));
+        assert!(!h.ready(RefineKind::Translate));
     }
 
     #[test]
     fn an_answer_cut_at_max_tokens_is_marked_truncated() {
         let (script, _) = fake_sidecar("runaway", "runaway");
-        let answer = refiner(script)
-            .generate(RefineKind::Translate, &request(2_000), &CancelToken::new())
-            .unwrap();
+        let answer = generate(&mut refiner(script).handle(), 2_000).unwrap();
         assert!(answer.truncated);
+    }
+
+    #[test]
+    fn a_missing_or_unknown_stop_reason_is_a_protocol_error() {
+        for mode in ["nostop", "badstop"] {
+            let (script, _) = fake_sidecar(mode, mode);
+            let r = refiner(script);
+            assert_eq!(
+                generate(&mut r.handle(), 2_000),
+                Err(RefineError::Failed("bad_stop_reason".to_owned())),
+                "{mode}"
+            );
+            r.stop_all();
+        }
     }
 
     #[test]
     fn the_budget_and_the_cancel_stop_a_generation_and_keep_the_process() {
         let (script, log) = fake_sidecar("slow", "slow");
-        let mut r = refiner(script);
+        let r = refiner(script);
+        let mut h = r.handle();
+        // Start the process first: only the budget phase is timed.
+        h.warm(RefineKind::Translate, &[]).unwrap();
         let started = Instant::now();
-        assert_eq!(
-            r.generate(RefineKind::Translate, &request(150), &CancelToken::new()),
-            Err(RefineError::Timeout)
-        );
+        assert_eq!(generate(&mut h, 150), Err(RefineError::Timeout));
         assert!(started.elapsed() < Duration::from_secs(2));
         let cancel = CancelToken::new();
         let later = cancel.clone();
@@ -747,12 +1189,12 @@ done
             later.cancel();
         });
         assert_eq!(
-            r.generate(RefineKind::Translate, &request(5_000), &cancel),
+            h.generate(RefineKind::Translate, &request(5_000), &cancel),
             Err(RefineError::Cancelled)
         );
         canceller.join().unwrap();
         // The sidecar answered both cancels: still the first process.
-        assert!(r.ready(RefineKind::Translate));
+        assert!(h.ready(RefineKind::Translate));
         assert_eq!(count(&log, "start"), 1);
         r.stop_all();
     }
@@ -760,37 +1202,75 @@ done
     #[test]
     fn a_sidecar_that_ignores_the_cancel_is_killed_and_started_again_freely() {
         let (script, log) = fake_sidecar("hang", "hang");
-        let mut r = refiner(script);
+        let r = refiner(script);
+        let mut h = r.handle();
         // One more kill than the restart budget allows after crashes.
         for _ in 0..=refine::REFINER_MAX_RESTARTS {
+            h.warm(RefineKind::Translate, &[]).ok();
+            let pid = r.pid(RefineKind::Translate).unwrap();
             let started = Instant::now();
-            assert_eq!(
-                r.generate(RefineKind::Translate, &request(100), &CancelToken::new()),
-                Err(RefineError::Timeout)
-            );
+            assert_eq!(generate(&mut h, 100), Err(RefineError::Timeout));
             // Budget plus the cancel reply time, with room for a slow machine.
-            assert!(started.elapsed() < Duration::from_secs(3));
-            assert!(!r.ready(RefineKind::Translate));
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(!h.ready(RefineKind::Translate));
+            assert!(
+                wait_until(Duration::from_secs(2), || reaped(pid)),
+                "pid {pid}"
+            );
         }
         // A kill is not a crash: no restart budget is used.
         assert_eq!(count(&log, "start"), refine::REFINER_MAX_RESTARTS + 1);
     }
 
     #[test]
+    fn a_sidecar_that_stops_reading_cannot_hold_a_call_past_its_deadline() {
+        let (script, _) = fake_sidecar("deaf", "deaf");
+        let r = refiner(script);
+        let mut h = r.handle();
+        h.warm(RefineKind::Translate, &[]).ok();
+        let pid = r.pid(RefineKind::Translate).unwrap();
+        // Far more than a pipe holds, to a process that reads nothing: the write blocks.
+        let mut big = request(200);
+        if let Some(last) = big.messages.last_mut() {
+            last.content = "あ".repeat(300_000);
+        }
+        let started = Instant::now();
+        assert_eq!(
+            h.generate(RefineKind::Translate, &big, &CancelToken::new()),
+            Err(RefineError::Timeout)
+        );
+        // The budget plus the cancel reply, sending included, then a kill.
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            wait_until(Duration::from_secs(2), || reaped(pid)),
+            "pid {pid}"
+        );
+        // The slot is free again: a stop does not wait for it.
+        let started = Instant::now();
+        r.stop_all();
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
     fn crashes_get_three_restarts_then_the_step_pauses() {
         let (script, log) = fake_sidecar("crash", "crash");
-        let mut r = refiner(script);
+        let r = refiner(script);
+        let mut h = r.handle();
         // The first start and three restarts each crash on the generation.
         for _ in 0..4 {
             assert!(matches!(
-                r.generate(RefineKind::Translate, &request(2_000), &CancelToken::new()),
+                generate(&mut h, 2_000),
                 Err(RefineError::Unavailable(_))
             ));
         }
         assert_eq!(count(&log, "start"), 4);
         // The fourth crash is refused a restart.
         assert_eq!(
-            r.generate(RefineKind::Translate, &request(2_000), &CancelToken::new()),
+            generate(&mut h, 2_000),
             Err(RefineError::Unavailable(
                 "paused after repeated crashes".to_owned()
             ))
@@ -798,7 +1278,7 @@ done
         assert_eq!(count(&log, "start"), 4);
         // The other step has its own budget.
         assert!(matches!(
-            r.generate(RefineKind::Clean, &request(2_000), &CancelToken::new()),
+            h.generate(RefineKind::Clean, &request(2_000), &CancelToken::new()),
             Err(RefineError::Unavailable(_))
         ));
         assert_eq!(count(&log, "start"), 5);
@@ -807,17 +1287,223 @@ done
     #[test]
     fn a_missing_model_or_sidecar_fails_without_starting() {
         let (script, log) = fake_sidecar("missing", "ok");
-        let mut r = Refiner::new(Some(script), Box::new(|_| None));
+        let r = Refiner::new(Some(script), Box::new(|_| None));
         assert_eq!(
-            r.generate(RefineKind::Translate, &request(2_000), &CancelToken::new()),
+            generate(&mut r.handle(), 2_000),
             Err(RefineError::ModelMissing)
         );
         assert_eq!(count(&log, "start"), 0);
-        let mut r = Refiner::new(None, Box::new(|_| Some(PathBuf::from("/dev/null"))));
+        assert_eq!(
+            r.status(),
+            RefinerStatus::default(),
+            "a missing model is not listed"
+        );
+        let r = Refiner::new(None, Box::new(|_| Some(PathBuf::from("/dev/null"))));
         assert!(matches!(
-            r.warm(RefineKind::Translate, &[]),
+            r.handle().warm(RefineKind::Translate, &[]),
             Err(RefineError::Unavailable(_))
         ));
+        assert_eq!(
+            r.status(),
+            RefinerStatus {
+                translate_error: Some("sidecar missing".to_owned()),
+                clean_error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_failed_load_is_shown_until_a_start_succeeds() {
+        let (script, log) = fake_sidecar("status", "ok");
+        std::fs::write(flag(&log, "fail"), "").unwrap();
+        let r = refiner(script);
+        let mut h = r.handle();
+        let prefix = refine::prefix(RefineKind::Clean, &Glossary::default());
+        assert_eq!(
+            h.warm(RefineKind::Clean, &prefix),
+            Err(RefineError::Unavailable("model_load_failed".to_owned()))
+        );
+        assert_eq!(
+            r.status(),
+            RefinerStatus {
+                translate_error: None,
+                clean_error: Some("model_load_failed".to_owned()),
+            }
+        );
+        // A failed load is not a crash: the next warm-up starts again and clears it.
+        std::fs::remove_file(flag(&log, "fail")).unwrap();
+        h.warm(RefineKind::Clean, &prefix).unwrap();
+        assert_eq!(r.status(), RefinerStatus::default());
+        assert_eq!(count(&log, "start"), 2);
+        r.stop_all();
+    }
+
+    #[test]
+    fn a_fatal_report_without_an_id_fails_at_once() {
+        let (script, _) = fake_sidecar("initfail", "initfail");
+        let r = refiner(script);
+        let started = Instant::now();
+        assert_eq!(
+            r.handle().warm(RefineKind::Translate, &[]),
+            Err(RefineError::Unavailable("backend_init_failed".to_owned()))
+        );
+        // At once: not after the 60 s load budget.
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            r.status().translate_error.as_deref(),
+            Some("backend_init_failed")
+        );
+        assert_eq!(r.pid(RefineKind::Translate), None);
+    }
+
+    #[test]
+    fn a_failed_warm_up_forgets_the_old_snapshot() {
+        let (script, log) = fake_sidecar("warmfail", "ok");
+        let r = refiner(script);
+        let mut h = r.handle();
+        let plain = refine::prefix(RefineKind::Clean, &Glossary::default());
+        let other = refine::prefix(
+            RefineKind::Clean,
+            &Glossary::new(&[murmur_core::settings::DictionaryEntry {
+                id: "e1".to_owned(),
+                written: "Murmur".to_owned(),
+                readings: vec!["マーマー".to_owned()],
+                scope: murmur_core::settings::DictionaryScope::Ja,
+            }]),
+        );
+        h.warm(RefineKind::Clean, &plain).unwrap();
+        std::fs::write(flag(&log, "warmfail"), "").unwrap();
+        assert!(h.warm(RefineKind::Clean, &other).is_err());
+        std::fs::remove_file(flag(&log, "warmfail")).unwrap();
+        // The failed warm-up may have dropped the first snapshot: it is warmed again.
+        h.warm(RefineKind::Clean, &plain).unwrap();
+        assert_eq!(count(&log, "warm"), 3);
+        r.stop_all();
+    }
+
+    #[test]
+    fn switching_off_during_a_warm_up_starts_nothing_more() {
+        let (script, log) = fake_sidecar("race", "slowload");
+        let r = refiner(script);
+        let mut warming = r.handle();
+        let old = r.handle();
+        let task = thread::spawn(move || {
+            crate::refine_session::warm(RefineKind::Translate, &Glossary::default(), &mut warming)
+        });
+        // Barrier: the translation model is loading (the cleanup one comes next).
+        assert!(wait_until(Duration::from_secs(3), || count(&log, "load") == 1));
+        let started = Instant::now();
+        r.stop_all();
+        // The cancel reply and a kill (0.7 s), not the slot wait of a load (75 s), with room for
+        // a busy machine.
+        assert!(started.elapsed() < STOP_WAIT, "{:?}", started.elapsed());
+        task.join().unwrap();
+        // Only the translation sidecar ever started, and nothing runs now.
+        assert_eq!(count(&log, "start"), 1);
+        assert_eq!(r.pid(RefineKind::Translate), None);
+        assert_eq!(r.pid(RefineKind::Clean), None);
+        assert!(!old.ready(RefineKind::Translate) && !old.ready(RefineKind::Clean));
+        // A stop is not a start failure.
+        assert_eq!(r.status(), RefinerStatus::default());
+        // A handle of the ended lifecycle starts nothing.
+        let mut old = old;
+        assert_eq!(
+            old.warm(RefineKind::Clean, &[]),
+            Err(RefineError::Unavailable(STOPPED.to_owned()))
+        );
+        assert_eq!(count(&log, "start"), 1);
+        // A later recording takes a handle of the next lifecycle.
+        std::fs::write(flag(&log, "go"), "").unwrap();
+        r.handle().warm(RefineKind::Clean, &[]).ok();
+        assert!(r.handle().ready(RefineKind::Clean));
+        assert_eq!(count(&log, "start"), 2);
+        r.stop_all();
+    }
+
+    #[test]
+    fn dropping_the_last_owner_stops_and_reaps_the_process() {
+        let (script, _) = fake_sidecar("drop", "ok");
+        let r = refiner(script);
+        let mut h = r.handle();
+        h.warm(RefineKind::Translate, &[]).ok();
+        let pid = r.pid(RefineKind::Translate).unwrap();
+        assert!(!reaped(pid));
+        let started = Instant::now();
+        drop(h);
+        drop(r);
+        // Dropping does not wait for the process.
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(
+            wait_until(Duration::from_secs(3), || reaped(pid)),
+            "pid {pid}"
+        );
+    }
+
+    /// A child whose kill fails and which exits only when told.
+    struct Stuck {
+        exited: Arc<AtomicBool>,
+        collected: Arc<AtomicUsize>,
+    }
+
+    impl Reapable for Stuck {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        }
+
+        fn try_wait(&mut self) -> std::io::Result<bool> {
+            let exited = self.exited.load(Ordering::SeqCst);
+            if exited {
+                self.collected.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(exited)
+        }
+    }
+
+    #[test]
+    fn a_kill_that_fails_does_not_hold_the_caller_and_is_reaped_later() {
+        let exited = Arc::new(AtomicBool::new(false));
+        let collected = Arc::new(AtomicUsize::new(0));
+        let child: SharedChild = Arc::new(Mutex::new(Box::new(Stuck {
+            exited: Arc::clone(&exited),
+            collected: Arc::clone(&collected),
+        })));
+        let started = Instant::now();
+        assert!(!kill_and_reap(&child, Duration::from_millis(100)));
+        assert!(started.elapsed() < Duration::from_millis(400));
+        // The reaper keeps trying off the caller's path and collects the exit when it comes.
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(collected.load(Ordering::SeqCst), 0);
+        exited.store(true, Ordering::SeqCst);
+        assert!(wait_until(Duration::from_secs(2), || collected
+            .load(Ordering::SeqCst)
+            > 0));
+    }
+
+    #[test]
+    fn output_lines_are_bounded() {
+        let mut input = Cursor::new(b"{\"id\":1}\nxxxxxxxxxxxx\ntail".to_vec());
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_line_bounded(&mut input, &mut buf, 10).unwrap(),
+            LineRead::Line
+        );
+        assert_eq!(buf, b"{\"id\":1}");
+        assert_eq!(
+            read_line_bounded(&mut input, &mut buf, 10).unwrap(),
+            LineRead::TooLong
+        );
+        let mut input = Cursor::new(b"tail".to_vec());
+        assert_eq!(
+            read_line_bounded(&mut input, &mut buf, 10).unwrap(),
+            LineRead::Line
+        );
+        assert_eq!(buf, b"tail");
+        assert_eq!(
+            read_line_bounded(&mut input, &mut buf, 10).unwrap(),
+            LineRead::Eof
+        );
+        assert!(is_plain_code("backend_init_failed"));
+        assert!(!is_plain_code("Bad code: 会議"));
     }
 
     /// The real sidecar and models: the staged binary (`scripts/build-sidecar.sh`, or
@@ -845,13 +1531,14 @@ done
                 PathBuf::from(std::env::var("HOME").unwrap()).join(".murmur-dev-models")
             })
             .join("llm");
-        let mut r = Refiner::new(
+        let r = Refiner::new(
             Some(binary),
             Box::new(move |step| Some(models.join(catalog::refine_model(step).file))),
         );
+        let mut h = r.handle();
         let glossary = Glossary::default();
-        refine_session::warm(RefineKind::Translate, &glossary, &mut r);
-        assert!(r.ready(RefineKind::Translate) && r.ready(RefineKind::Clean));
+        refine_session::warm(RefineKind::Translate, &glossary, &mut h);
+        assert!(h.ready(RefineKind::Translate) && h.ready(RefineKind::Clean));
         let mut loading = 0;
         for (text, cleaned_first) in [
             ("明日の会議は午後4時からです。", false),
@@ -862,7 +1549,7 @@ done
                 RefineKind::Translate,
                 text,
                 glossary.clone(),
-                &mut r,
+                &mut h,
                 &CancelToken::new(),
                 &mut || loading += 1,
             );
@@ -881,7 +1568,17 @@ done
             );
         }
         assert_eq!(loading, 0, "both models were warm");
+        let pids = [
+            r.pid(RefineKind::Translate).unwrap(),
+            r.pid(RefineKind::Clean).unwrap(),
+        ];
         r.stop_all();
-        assert!(!r.ready(RefineKind::Translate));
+        assert!(!h.ready(RefineKind::Translate));
+        for pid in pids {
+            assert!(
+                wait_until(Duration::from_secs(2), || reaped(pid)),
+                "pid {pid}"
+            );
+        }
     }
 }

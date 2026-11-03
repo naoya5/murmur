@@ -93,6 +93,11 @@ pub struct ModelEntry {
     pub capabilities: Capabilities,
     /// What a `Role::Refinement` model does. Empty for every other role.
     pub tasks: &'static [RefineKind],
+    /// About how much memory the model takes while it runs (the peak resident size of its sidecar
+    /// in the stage 0 / M2 measurements, the mapped file included). Shown for the refine models;
+    /// `None` where it was not measured.
+    #[specta(type = Option<f64>)]
+    pub memory_bytes: Option<u64>,
 }
 
 impl ModelEntry {
@@ -144,6 +149,7 @@ pub static CATALOG: &[ModelEntry] = &[
         attribution: "Haas-ja-v1.0 by Third Intelligence, Apache-2.0",
         capabilities: FASTCONFORMER_HAAS,
         tasks: &[],
+        memory_bytes: None,
     },
     ModelEntry {
         id: "haas-ja-v1.0-q5_k",
@@ -161,6 +167,7 @@ pub static CATALOG: &[ModelEntry] = &[
         attribution: "Haas-ja-v1.0 by Third Intelligence, Apache-2.0",
         capabilities: FASTCONFORMER_HAAS,
         tasks: &[],
+        memory_bytes: None,
     },
     ModelEntry {
         id: DEFAULT_EN_MODEL,
@@ -178,6 +185,7 @@ pub static CATALOG: &[ModelEntry] = &[
         attribution: "NVIDIA parakeet-tdt-0.6b-v3, licensed under CC-BY-4.0. Converted to GGUF by sakasegawa.",
         capabilities: FASTCONFORMER_PARAKEET,
         tasks: &[],
+        memory_bytes: None,
     },
     ModelEntry {
         id: "qwen3-asr-0.6b-q8_0",
@@ -200,6 +208,7 @@ pub static CATALOG: &[ModelEntry] = &[
             language_id: true,
         },
         tasks: &[],
+        memory_bytes: None,
     },
     ModelEntry {
         id: VAD_MODEL,
@@ -217,6 +226,7 @@ pub static CATALOG: &[ModelEntry] = &[
         attribution: "Silero VAD by Silero Team, MIT",
         capabilities: NO_SPEECH_CAPABILITIES,
         tasks: &[],
+        memory_bytes: None,
     },
     ModelEntry {
         id: DEFAULT_TRANSLATE_MODEL,
@@ -234,6 +244,8 @@ pub static CATALOG: &[ModelEntry] = &[
         attribution: "LFM2-350M-ENJP-MT by Liquid AI, LFM Open License v1.0",
         capabilities: NO_SPEECH_CAPABILITIES,
         tasks: &[RefineKind::Translate],
+        // crates/murmur-llm/PERFORMANCE.md: 352 to 355 MiB.
+        memory_bytes: Some(355 * 1024 * 1024),
     },
     ModelEntry {
         id: DEFAULT_CLEAN_MODEL,
@@ -251,6 +263,8 @@ pub static CATALOG: &[ModelEntry] = &[
         attribution: "Qwen3.5-0.8B by the Qwen team, Apache-2.0. GGUF by Unsloth.",
         capabilities: NO_SPEECH_CAPABILITIES,
         tasks: &[RefineKind::Clean],
+        // crates/murmur-llm/PERFORMANCE.md: 701 to 741 MiB.
+        memory_bytes: Some(741 * 1024 * 1024),
     },
 ];
 
@@ -392,6 +406,13 @@ mod tests {
     fn only_refinement_models_have_tasks_and_they_are_llms() {
         for m in CATALOG {
             assert_eq!(m.role == Role::Refinement, !m.tasks.is_empty(), "{}", m.id);
+            // The Models screen shows a memory estimate for each refine model.
+            assert_eq!(
+                m.role == Role::Refinement,
+                m.memory_bytes.is_some_and(|b| b > m.bytes),
+                "{}",
+                m.id
+            );
             assert_eq!(
                 m.role == Role::Refinement,
                 m.family == Family::Llm,

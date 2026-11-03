@@ -1940,6 +1940,29 @@ button {
   color: var(--accent-hi);
 }
 
+.hist__links {
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: var(--space-3);
+}
+
+/* The text before the model step (a translation's Japanese), opened under the result. */
+.hist__before {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: calc(var(--u) * 6);
+  margin-top: calc(var(--u) * 8);
+  padding: calc(var(--u) * 10) calc(var(--u) * 12);
+  border-radius: var(--radius-sm);
+  background: var(--fill);
+  box-shadow: inset 0 0 0 1px var(--hairline);
+}
+
+.hist__before .hist__text {
+  color: var(--ink-2);
+}
+
 .hist__actions {
   display: flex;
   gap: calc(var(--u) * 2);
@@ -2557,6 +2580,17 @@ button {
     inset 0 0 0 1px rgba(255, 240, 225, 0.1);
   flex-shrink: 0;
   line-height: 1;
+}
+
+/* A translation recording: the spoken and the pasted language, in place of the round mark. */
+.pill__lang--pair {
+  width: auto;
+  padding: 0 7px;
+  border-radius: 10px;
+  font-size: 10px;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+  font-variant-numeric: normal;
 }
 
 .pill__ring {

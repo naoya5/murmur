@@ -658,7 +658,7 @@ impl Controller {
             started: None,
             refine_ms: None,
         });
-        let mut refiner = self.services.refiner().clone();
+        let mut refiner = self.services.refiner().handle();
         tauri::async_runtime::spawn_blocking(move || {
             crate::refine_session::warm(kind, &glossary, &mut refiner);
         });
@@ -687,7 +687,7 @@ impl Controller {
         let backstop = Duration::from_millis(
             refine::timeout_ms(kind, &text.0).saturating_add(REFINE_BACKSTOP_EXTRA_MS),
         );
-        let mut refiner = self.services.refiner().clone();
+        let mut refiner = self.services.refiner().handle();
         let tx = self.tx.clone();
         tauri::async_runtime::spawn(async move {
             let job_cancel = cancel.clone();

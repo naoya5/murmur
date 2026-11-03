@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use murmur_core::Language;
+use murmur_core::refine::RefineStatus;
 use murmur_core::session::{Event, PillView};
 use tauri::{AppHandle, Manager, RunEvent};
 use tauri_specta::Event as _;
@@ -35,7 +36,7 @@ use crate::adapters::{engine, settings_file, store::Store};
 use crate::app::{App, Paths};
 use crate::controller::{ControllerHandle, Msg};
 use crate::inference::Inference;
-use crate::tray::{TrayAction, TrayModel};
+use crate::tray::{RecentItem, TrayAction, TrayModel};
 
 /// How often the idle check runs for the "unload model after N minutes" setting.
 const IDLE_CHECK: Duration = Duration::from_secs(60);
@@ -182,7 +183,19 @@ pub fn tray_model(services: &App) -> TrayModel {
         .list("", 5, 0)
         .map(|rows| {
             rows.into_iter()
-                .filter_map(|row| Some((row.id, row.text?)))
+                .filter_map(|row| {
+                    // Only a successful model step changed the text; a failed one delivered the
+                    // text from before it.
+                    let before = match (row.refine_kind, row.refine_status, row.pre_refine_text) {
+                        (Some(kind), Some(RefineStatus::Ok), Some(text)) => Some((kind, text)),
+                        _ => None,
+                    };
+                    Some(RecentItem {
+                        id: row.id,
+                        text: row.text?,
+                        before,
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -248,6 +261,16 @@ fn on_tray(app: &AppHandle, services: &Arc<App>, action: TrayAction) {
             tauri::async_runtime::spawn_blocking(move || {
                 if let Ok(Some(row)) = services.store().get(&id)
                     && let Some(text) = row.text
+                {
+                    copy_text_now(&text);
+                }
+            });
+        }
+        TrayAction::CopyRecentBefore(id) => {
+            let services = services.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Ok(Some(row)) = services.store().get(&id)
+                    && let Some(text) = row.pre_refine_text
                 {
                     copy_text_now(&text);
                 }

@@ -1,12 +1,14 @@
 //! Menu bar icon and its menu.
 //!
 //! `create` builds the tray once; `update` rebuilds the menu from a `TrayModel` (recording state, language,
-//! recent items). Menu clicks become `TrayAction`s for the controller. Strings are kept here, English and
-//! Japanese, short. Previews are transcript text: they are shown, never logged (G7).
+//! recent items; a translated item also offers its Japanese, D4). Menu clicks become `TrayAction`s for the
+//! controller. Strings are kept here, English and Japanese, short. Previews are transcript text: they are
+//! shown, never logged (G7).
 
 use std::sync::Arc;
 
 use murmur_core::Language;
+use murmur_core::refine::RefineKind;
 use tauri::AppHandle;
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
@@ -21,9 +23,17 @@ const PREVIEW_CHARS: usize = 40;
 pub struct TrayModel {
     pub recording: bool,
     pub language: Language,
-    /// (id, preview). The preview is cut to 40 characters here.
-    pub recent: Vec<(String, String)>,
+    pub recent: Vec<RecentItem>,
     pub ui_ja: bool,
+}
+
+/// One recent history row. Previews are cut to 40 characters here.
+#[derive(Clone)]
+pub struct RecentItem {
+    pub id: String,
+    pub text: String,
+    /// The text before a successful model step (a translation's Japanese), with its kind.
+    pub before: Option<(RefineKind, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +43,8 @@ pub enum TrayAction {
     SetLanguage(Language),
     CopyLast,
     CopyRecent(String),
+    /// Copy the text of a recent item before its model step.
+    CopyRecentBefore(String),
     CheckUpdates,
     Quit,
 }
@@ -55,6 +67,7 @@ const ID_LANG_JA: &str = "lang-ja";
 const ID_LANG_EN: &str = "lang-en";
 const ID_COPY_LAST: &str = "copy-last";
 const ID_RECENT_PREFIX: &str = "recent:";
+const ID_RECENT_BEFORE_PREFIX: &str = "recent-before:";
 const ID_UPDATES: &str = "updates";
 const ID_QUIT: &str = "quit";
 
@@ -69,7 +82,12 @@ fn action_from_id(id: &str) -> Option<TrayAction> {
         ID_QUIT => Some(TrayAction::Quit),
         other => other
             .strip_prefix(ID_RECENT_PREFIX)
-            .map(|id| TrayAction::CopyRecent(id.to_owned())),
+            .map(|id| TrayAction::CopyRecent(id.to_owned()))
+            .or_else(|| {
+                other
+                    .strip_prefix(ID_RECENT_BEFORE_PREFIX)
+                    .map(|id| TrayAction::CopyRecentBefore(id.to_owned()))
+            }),
     }
 }
 
@@ -80,6 +98,10 @@ struct Labels {
     language: &'static str,
     copy_last: &'static str,
     recent: &'static str,
+    /// Prefix of the item that copies a translation's Japanese.
+    before_translation: &'static str,
+    /// Prefix of the item that copies the text before a cleanup.
+    before_cleanup: &'static str,
     no_history: &'static str,
     updates: &'static str,
     quit: &'static str,
@@ -94,6 +116,8 @@ fn labels(ui_ja: bool) -> Labels {
             language: "言語",
             copy_last: "直前の文字起こしをコピー",
             recent: "最近の文字起こし",
+            before_translation: "翻訳前",
+            before_cleanup: "整形前",
             no_history: "履歴はありません",
             updates: "アップデートを確認",
             quit: "Murmur を終了",
@@ -106,6 +130,8 @@ fn labels(ui_ja: bool) -> Labels {
             language: "Language",
             copy_last: "Copy last transcript",
             recent: "Recent",
+            before_translation: "Before translation",
+            before_cleanup: "Before cleanup",
             no_history: "No history yet",
             updates: "Check for updates",
             quit: "Quit Murmur",
@@ -164,19 +190,30 @@ fn build_menu(app: &AppHandle, model: &TrayModel) -> tauri::Result<Menu<tauri::W
     let has_history = !model.recent.is_empty();
     let copy_last = MenuItem::with_id(app, ID_COPY_LAST, t.copy_last, has_history, None::<&str>)?;
     let recent_items = if has_history {
-        model
-            .recent
-            .iter()
-            .map(|(id, text)| {
-                MenuItem::with_id(
+        let mut items = Vec::new();
+        for item in &model.recent {
+            items.push(MenuItem::with_id(
+                app,
+                format!("{ID_RECENT_PREFIX}{}", item.id),
+                preview(&item.text),
+                true,
+                None::<&str>,
+            )?);
+            if let Some((kind, before)) = &item.before {
+                let label = match kind {
+                    RefineKind::Translate => t.before_translation,
+                    RefineKind::Clean => t.before_cleanup,
+                };
+                items.push(MenuItem::with_id(
                     app,
-                    format!("{ID_RECENT_PREFIX}{id}"),
-                    preview(text),
+                    format!("{ID_RECENT_BEFORE_PREFIX}{}", item.id),
+                    format!("{label}: {}", preview(before)),
                     true,
                     None::<&str>,
-                )
-            })
-            .collect::<tauri::Result<Vec<_>>>()?
+                )?);
+            }
+        }
+        items
     } else {
         vec![MenuItem::with_id(
             app,
@@ -271,6 +308,10 @@ mod tests {
         assert_eq!(
             action_from_id("recent:abc-123"),
             Some(TrayAction::CopyRecent("abc-123".into()))
+        );
+        assert_eq!(
+            action_from_id("recent-before:abc-123"),
+            Some(TrayAction::CopyRecentBefore("abc-123".into()))
         );
         assert_eq!(action_from_id("updates"), Some(TrayAction::CheckUpdates));
         assert_eq!(action_from_id("quit"), Some(TrayAction::Quit));
