@@ -44,3 +44,10 @@ busy rejection, cancellation, stdin EOF, silent stderr and absence of sockets (`
 Prompts, output and stderr stay in memory. `--output` persists only numeric check/timing metadata;
 put local results under `target/`, not in tracked files. Production task validation and idle-stop
 policy belong to the app/core, not this transport executable.
+
+## Performance investigation
+
+See [PERFORMANCE.md](PERFORMANCE.md) for the 100-sample baseline, rejected tuning candidates,
+CLI comparison and declined native-runtime experiment. No runtime tuning was adopted. `benchmark.py`
+repeats the fixed-prefix 10-item x 10-run method against an explicit read-only request-set JSON
+and persists numeric measurements only.
