@@ -1,9 +1,10 @@
 //! Adapter: hotkeys, on top of `tauri-plugin-global-shortcut`.
 //!
-//! Registers the main hotkey, an optional alternate hotkey, the annotations hotkey (only while
-//! that feature is on) and plain Esc. Press and release are reported separately so push-to-talk
-//! can work. The three configurable keys must differ; each setter refuses a clash with the other
-//! two. The plugin itself must be added to the Tauri builder in `lib.rs`.
+//! Registers the main hotkey, an optional alternate hotkey, the annotations hotkey and the
+//! translation hotkey (each only while its feature is on) and plain Esc. Press and release are
+//! reported separately so push-to-talk can work. The four configurable keys must differ; each
+//! setter refuses a clash with the other three. The plugin itself must be added to the Tauri
+//! builder in `lib.rs`.
 
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -19,6 +20,9 @@ pub enum HotkeyEvent {
     AlternateUp,
     /// The annotations hotkey went down (press to start, press again to stop; no release event).
     Annotations,
+    /// The translation hotkey (records Japanese for translation, like the main hotkey).
+    TranslateDown,
+    TranslateUp,
     Esc,
 }
 
@@ -39,6 +43,7 @@ struct State {
     main: Option<Shortcut>,
     alternate: Option<Shortcut>,
     annotations: Option<Shortcut>,
+    translate: Option<Shortcut>,
     esc: bool,
     /// While suspended, nothing is registered with the system; `resume` restores it all.
     suspended: bool,
@@ -115,7 +120,7 @@ impl Hotkeys {
     pub fn set_main(&self, accelerator: &str) -> Result<(), HotkeyError> {
         let new = parse_accelerator(accelerator)?;
         let mut state = self.lock();
-        if state.alternate == Some(new) || state.annotations == Some(new) {
+        if [state.alternate, state.annotations, state.translate].contains(&Some(new)) {
             return Err(HotkeyError::Conflict);
         }
         if state.main == Some(new) {
@@ -135,7 +140,7 @@ impl Hotkeys {
     pub fn set_alternate(&self, accelerator: Option<&str>) -> Result<(), HotkeyError> {
         let new = accelerator.map(parse_accelerator).transpose()?;
         let mut state = self.lock();
-        if new.is_some() && (new == state.main || new == state.annotations) {
+        if new.is_some() && [state.main, state.annotations, state.translate].contains(&new) {
             return Err(HotkeyError::Conflict);
         }
         if new == state.alternate {
@@ -162,7 +167,7 @@ impl Hotkeys {
     pub fn set_annotations(&self, accelerator: Option<&str>) -> Result<(), HotkeyError> {
         let new = accelerator.map(parse_accelerator).transpose()?;
         let mut state = self.lock();
-        if new.is_some() && (new == state.main || new == state.alternate) {
+        if new.is_some() && [state.main, state.alternate, state.translate].contains(&new) {
             return Err(HotkeyError::Conflict);
         }
         if new == state.annotations {
@@ -177,6 +182,33 @@ impl Hotkeys {
             }
         }
         state.annotations = new;
+        Ok(())
+    }
+
+    /// Set or clear the translation hotkey (cleared while the feature is off). On failure the
+    /// old one stays registered.
+    pub fn set_translate(&self, accelerator: Option<&str>) -> Result<(), HotkeyError> {
+        let new = accelerator.map(parse_accelerator).transpose()?;
+        let mut state = self.lock();
+        if new.is_some() && [state.main, state.alternate, state.annotations].contains(&new) {
+            return Err(HotkeyError::Conflict);
+        }
+        if new == state.translate {
+            return Ok(());
+        }
+        if !state.suspended {
+            if let Some(new) = new {
+                self.register(
+                    new,
+                    HotkeyEvent::TranslateDown,
+                    Some(HotkeyEvent::TranslateUp),
+                )?;
+            }
+            if let Some(old) = state.translate {
+                self.unregister(old);
+            }
+        }
+        state.translate = new;
         Ok(())
     }
 
@@ -239,6 +271,13 @@ impl Hotkeys {
         if let Some(annotations) = state.annotations {
             note(self.register(annotations, HotkeyEvent::Annotations, None));
         }
+        if let Some(translate) = state.translate {
+            note(self.register(
+                translate,
+                HotkeyEvent::TranslateDown,
+                Some(HotkeyEvent::TranslateUp),
+            ));
+        }
         if state.esc {
             note(self.register(esc_shortcut(), HotkeyEvent::Esc, None));
         }
@@ -253,6 +292,9 @@ mod tests {
     #[test]
     fn accepts_modifier_combos_and_function_keys() {
         assert!(parse_accelerator("Alt+Space").is_ok());
+        // The defaults of the feature hotkeys, registered only at start when the feature is on.
+        assert!(parse_accelerator(murmur_core::settings::DEFAULT_ANNOTATIONS_HOTKEY).is_ok());
+        assert!(parse_accelerator(murmur_core::settings::DEFAULT_TRANSLATE_HOTKEY).is_ok());
         assert!(parse_accelerator("CommandOrControl+Shift+D").is_ok());
         assert!(parse_accelerator("F5").is_ok());
         assert!(parse_accelerator("Ctrl+Option+KeyM").is_ok());

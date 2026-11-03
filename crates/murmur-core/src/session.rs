@@ -87,7 +87,10 @@
 //! | CancelPending(Ref)         | Refined / refine timer         | stays; the outcome is held (the timer also CancelRefine) |
 //! | CancelPending(Ref)         | Esc / PillClicked              | the held outcome is handled, or back to Refining |
 //! | CancelPending(Ref)         | 3 s timer                      | Idle; CancelRefine, DropAudio                    |
-//! | any state of kind k but Delivering | RefineDisabled(k)      | Idle, no notice; capture stopped, engine / refiner cancelled, DropAudio |
+//! | Recording / CancelPending(Rec) of kind k | RefineDisabled(k) | Idle, no notice; capture stopped, DropAudio (as AnnotationsDisabled) |
+//! | Transcribing / CancelPending(Tx) of kind k | RefineDisabled(k) | stays; the text then goes out as a failed refine (refine Failed) |
+//! | Refining(k)                | RefineDisabled(k)              | Delivering as for Refined(Failed); CancelRefine  |
+//! | CancelPending(Ref) of kind k | RefineDisabled(k)            | stays; the held outcome becomes Failed (CancelRefine while none is held) |
 //! | Transcribing / Refining / Delivering | HotkeyDown            | ignored                                          |
 //!
 //! Leaving the refine phase always delivers or emits `CancelRefine`; the randomized test checks it.
@@ -390,8 +393,10 @@ pub enum Event {
     RefinerLoading {
         session: SessionId,
     },
-    /// The user switched a refine feature off: a session of that kind in progress ends at once
-    /// and keeps nothing. A delivery in flight finishes; other sessions ignore it.
+    /// The user switched a refine feature off. A recording of that kind ends at once and keeps
+    /// nothing; once the recording has ended, the words are kept and go out as a failed refine
+    /// (a translation copies the Japanese). A delivery in flight finishes; other sessions ignore
+    /// it.
     RefineDisabled {
         kind: RefineKind,
     },
@@ -588,6 +593,9 @@ pub struct Transcribing {
     pub session: SessionId,
     pub kind: SessionKind,
     pub refine: Option<RefineKind>,
+    /// The refine kind's feature was switched off after the recording ended: the text goes out
+    /// as a failed refine (a translation copies the Japanese), never through a model.
+    pub refine_off: bool,
     pub recorded_ms: Millis,
     pub timeout_timer: TimerId,
     /// Annotation only: what `PlanKeyframes` found, once `Event::Planned` arrived.
@@ -727,7 +735,7 @@ impl Machine {
     pub fn active_refine(&self) -> Option<RefineKind> {
         match &self.state {
             State::Recording(rec) => rec.refine,
-            State::Transcribing(tx) => tx.refine,
+            State::Transcribing(tx) => tx.refine.filter(|_| !tx.refine_off),
             State::Refining(refining) => Some(refining.kind),
             State::CancelPending { paused, .. } => paused_refine(paused),
             State::Idle { .. } | State::Composing(_) | State::Delivering { .. } => None,
@@ -867,6 +875,7 @@ impl Machine {
             session,
             kind,
             refine,
+            refine_off: false,
             recorded_ms,
             timeout_timer,
             plan: None,
@@ -950,6 +959,9 @@ impl Machine {
             SessionKind::Dictation => match outcome {
                 TranscribeOutcome::Text(text) => match tx.refine {
                     None => self.deliver_text(session, text, None, None, fx),
+                    Some(kind) if tx.refine_off => {
+                        self.deliver_unrefined(session, kind, text, RefineStatus::Failed, fx)
+                    }
                     Some(RefineKind::Clean) if refine::clean_gate(&text.0) != CleanGate::Run => {
                         self.deliver_text(session, text, None, Some(RefineStatus::Skipped), fx)
                     }
@@ -1062,11 +1074,24 @@ impl Machine {
             RefineOutcome::Failed => RefineStatus::Failed,
             RefineOutcome::TimedOut => RefineStatus::Timeout,
         };
-        let copy_only = match refining.kind {
+        self.deliver_unrefined(session, refining.kind, refining.text, status, fx)
+    }
+
+    /// Delivers the rule-formatted text of a refine that did not happen or failed: a cleanup
+    /// pastes it; a translation only copies the Japanese and says so (C5).
+    fn deliver_unrefined(
+        &mut self,
+        session: SessionId,
+        kind: RefineKind,
+        text: TranscriptText,
+        status: RefineStatus,
+        fx: &mut Vec<Effect>,
+    ) -> State {
+        let copy_only = match kind {
             RefineKind::Clean => None,
             RefineKind::Translate => Some(CopyReason::RefineFailed),
         };
-        self.deliver_text(session, refining.text, copy_only, Some(status), fx)
+        self.deliver_text(session, text, copy_only, Some(status), fx)
     }
 
     fn compose(&mut self, session: SessionId, words: ComposeWords, fx: &mut Vec<Effect>) -> State {
@@ -1297,8 +1322,12 @@ impl Machine {
                 Event::AnnotationsDisabled if tx.kind == SessionKind::Annotation => {
                     Self::abandon_paused(tx.session, Paused::Transcribing { tx, held: None }, fx)
                 }
+                // The recording has ended: the words are kept and go out unrefined.
                 Event::RefineDisabled { kind } if tx.refine == Some(kind) => {
-                    Self::abandon_paused(tx.session, Paused::Transcribing { tx, held: None }, fx)
+                    State::Transcribing(Transcribing {
+                        refine_off: true,
+                        ..tx
+                    })
                 }
                 _ => State::Transcribing(tx),
             },
@@ -1328,14 +1357,12 @@ impl Machine {
                         fx,
                     )
                 }
-                Event::RefineDisabled { kind } if kind == refining.kind => Self::abandon_paused(
-                    refining.session,
-                    Paused::Refining {
-                        refining,
-                        held: None,
-                    },
-                    fx,
-                ),
+                Event::RefineDisabled { kind } if kind == refining.kind => {
+                    fx.push(Effect::CancelRefine {
+                        session: refining.session,
+                    });
+                    self.finish_refining(refining, RefineOutcome::Failed, fx)
+                }
                 _ => State::Refining(refining),
             },
 
@@ -1413,8 +1440,36 @@ impl Machine {
             {
                 Self::abandon_paused(session, paused, fx)
             }
+            // The refine feature was switched off under a paused session. A recording is
+            // dropped; once the recording has ended the words are kept, and the undo delivers
+            // them unrefined (a translation copies the Japanese). The countdown still discards.
             (paused, Event::RefineDisabled { kind }) if paused_refine(&paused) == Some(kind) => {
-                Self::abandon_paused(session, paused, fx)
+                let paused = match paused {
+                    Paused::Recording(_) => return Self::abandon_paused(session, paused, fx),
+                    Paused::Transcribing { tx, held } => Paused::Transcribing {
+                        tx: Transcribing {
+                            refine_off: true,
+                            ..tx
+                        },
+                        held,
+                    },
+                    Paused::Refining { refining, held } => {
+                        if held.is_none() {
+                            fx.push(Effect::CancelRefine { session });
+                        }
+                        Paused::Refining {
+                            refining,
+                            held: Some(RefineOutcome::Failed),
+                        }
+                    }
+                    Paused::Composing { .. } => paused,
+                };
+                State::CancelPending {
+                    session,
+                    timer,
+                    deadline,
+                    paused,
+                }
             }
 
             // Undo while recording: resume, or transcribe if the microphone went away.
@@ -1669,11 +1724,17 @@ fn paused_kind(paused: &Paused) -> SessionKind {
     }
 }
 
+/// The refine kind that a `RefineDisabled` still changes for a paused session.
 fn paused_refine(paused: &Paused) -> Option<RefineKind> {
     match paused {
         Paused::Recording(rec) => rec.refine,
-        Paused::Transcribing { tx, .. } => tx.refine,
+        Paused::Transcribing { tx, .. } => tx.refine.filter(|_| !tx.refine_off),
         Paused::Composing { .. } => None,
+        // Already a failure: nothing left to change.
+        Paused::Refining {
+            held: Some(RefineOutcome::Failed | RefineOutcome::TimedOut),
+            ..
+        } => None,
         Paused::Refining { refining, .. } => Some(refining.kind),
     }
 }
@@ -2012,6 +2073,7 @@ mod tests {
                 session: S1,
                 kind: SessionKind::Dictation,
                 refine: None,
+                refine_off: false,
                 recorded_ms: 10_000,
                 timeout_timer: timeout,
                 plan: None,
@@ -2682,6 +2744,7 @@ mod tests {
                 session: S1,
                 kind: SessionKind::Dictation,
                 refine: None,
+                refine_off: false,
                 recorded_ms: 5_000,
                 timeout_timer: timeout,
                 plan: None,
@@ -3231,6 +3294,7 @@ mod tests {
                     session: S1,
                     kind: SessionKind::Annotation,
                     refine: None,
+                    refine_off: false,
                     recorded_ms: 10_000,
                     timeout_timer: timeout,
                     plan: None,
@@ -4585,9 +4649,10 @@ mod tests {
     }
 
     #[test]
-    fn switching_a_refine_feature_off_ends_its_sessions() {
+    fn switching_a_refine_feature_off_drops_a_recording_but_keeps_the_words() {
         let off = |kind| Event::RefineDisabled { kind };
-        // Recording.
+        let failed = deliver(MARKED, Some(CopyReason::RefineFailed));
+        // Recording: dropped, like the annotations switch.
         let mut h = recording_refine(RefineKind::Translate);
         assert_eq!(h.step(off(RefineKind::Clean)), vec![]);
         assert_eq!(
@@ -4599,33 +4664,79 @@ mod tests {
             ]
         );
         assert_eq!(h.state(), &State::Idle { notice: None });
-        // Transcribing.
+        // Paused while recording: dropped too.
+        let mut h = recording_refine(RefineKind::Translate);
+        h.step(Event::Esc);
+        let fx = h.step(off(RefineKind::Translate));
+        assert!(fx.contains(&Effect::DropAudio { session: S1 }), "{fx:?}");
+        assert_eq!(h.state(), &State::Idle { notice: None });
+
+        // Transcribing: the transcription goes on, and its text is copied without a model.
         let mut h = recording_refine(RefineKind::Translate);
         h.step(TOGGLE);
+        assert_eq!(h.step(off(RefineKind::Translate)), vec![]);
+        assert_eq!(h.step(off(RefineKind::Translate)), vec![], "idempotent");
+        let fx = h.step(transcribed(S1, TranscribeOutcome::Text(text(MARKED))));
+        assert!(fx.contains(&failed), "{fx:?}");
+        assert!(
+            !fx.iter().any(|e| matches!(e, Effect::Refine { .. })),
+            "{fx:?}"
+        );
+        assert!(matches!(
+            h.state(),
+            State::Delivering {
+                delivery: Delivery::Text {
+                    refine: Some(RefineStatus::Failed)
+                },
+                ..
+            }
+        ));
+        // Paused while transcribing: the undo delivers the held text the same way; the
+        // countdown still discards it.
+        let mut h = recording_refine(RefineKind::Translate);
+        h.step(TOGGLE);
+        h.step(Event::Esc);
+        assert_eq!(h.step(off(RefineKind::Translate)), vec![]);
+        h.step(transcribed(S1, TranscribeOutcome::Text(text(MARKED))));
+        let fx = h.step(Event::Esc);
+        assert!(fx.contains(&failed), "{fx:?}");
+
+        // Refining: the refine is cancelled and the Japanese is copied.
+        let mut h = refining(RefineKind::Translate, MARKED);
+        let fx = h.step(off(RefineKind::Translate));
+        assert_eq!(fx[0], Effect::CancelRefine { session: S1 });
+        assert!(fx.contains(&failed), "{fx:?}");
+        // A late result changes nothing.
+        assert_eq!(
+            h.step(refined(S1, RefineOutcome::Text(text("late")))),
+            vec![]
+        );
+
+        // Paused while refining: cancelled once, the held outcome is a failure; neither a late
+        // result nor the refine timer replaces it or cancels again; the undo copies.
+        let mut h = refining(RefineKind::Translate, MARKED);
+        let timer = refine_timer(&h);
+        h.step(Event::Esc);
         assert_eq!(
             h.step(off(RefineKind::Translate)),
-            vec![
-                Effect::CancelTranscription { session: S1 },
-                Effect::SetEscCapture(false),
-                Effect::DropAudio { session: S1 },
-            ]
+            vec![Effect::CancelRefine { session: S1 }]
         );
-        // Refining, and paused while refining.
-        for paused in [false, true] {
-            let mut h = refining(RefineKind::Translate, MARKED);
-            if paused {
-                h.step(Event::Esc);
-            }
-            assert_eq!(
-                h.step(off(RefineKind::Translate)),
-                vec![
-                    Effect::CancelRefine { session: S1 },
-                    Effect::SetEscCapture(false),
-                    Effect::DropAudio { session: S1 },
-                ]
-            );
-            assert_eq!(h.state(), &State::Idle { notice: None });
-        }
+        assert_eq!(h.step(off(RefineKind::Translate)), vec![]);
+        assert_eq!(
+            h.step(refined(S1, RefineOutcome::Text(text("late")))),
+            vec![]
+        );
+        assert_eq!(h.step(Event::TimerFired(timer)), vec![]);
+        let fx = h.step(Event::PillClicked);
+        assert!(fx.contains(&failed), "{fx:?}");
+        // A result held before the switch becomes a failure too, without a cancel.
+        let mut h = refining(RefineKind::Translate, MARKED);
+        h.step(Event::Esc);
+        h.step(refined(S1, RefineOutcome::Text(text("held"))));
+        assert_eq!(h.step(off(RefineKind::Translate)), vec![]);
+        let fx = h.step(Event::Esc);
+        assert!(fx.contains(&failed), "{fx:?}");
+
         // A delivery in flight finishes; plain dictation ignores it.
         let mut h = refining(RefineKind::Translate, MARKED);
         h.step(refined(S1, RefineOutcome::Text(text("refined"))));
@@ -4799,10 +4910,15 @@ mod tests {
                             self.refined_deliveries += 1;
                         }
                         let warmed = self.warmed.get(&session.0).copied();
-                        if warmed == Some(RefineKind::Translate) {
-                            assert!(
-                                self.refine_sent.contains(&session.0),
-                                "a translation delivered without the refiner"
+                        // A translation never pastes unrefined Japanese: without the refiner
+                        // (switched off after the recording) it is copied as a failure.
+                        if warmed == Some(RefineKind::Translate)
+                            && !self.refine_sent.contains(&session.0)
+                        {
+                            assert_eq!(
+                                *copy_only,
+                                Some(CopyReason::RefineFailed),
+                                "a translation pasted without the refiner"
                             );
                         }
                         if *copy_only == Some(CopyReason::RefineFailed) {

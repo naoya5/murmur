@@ -12,6 +12,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::adapters::hotkeys::Hotkeys;
 use crate::adapters::models::ModelStore;
+use crate::adapters::refiner::{self, Refiner};
 use crate::adapters::store::Store;
 use crate::controller::{ControllerHandle, PillState};
 use crate::inference::Inference;
@@ -69,6 +70,8 @@ pub struct App {
     store: Arc<Store>,
     models: ModelStore,
     inference: Inference,
+    /// The local models of the refine step (experimental). Nothing runs until a recording asks.
+    refiner: Refiner,
     hotkeys: OnceLock<Hotkeys>,
     controller: OnceLock<ControllerHandle>,
     /// The last delivered text, for "copy last result" (S6). Memory only.
@@ -80,9 +83,19 @@ pub struct App {
 impl App {
     pub fn new(paths: Paths, settings: Settings, store: Store, inference: Inference) -> App {
         let models = ModelStore::new(paths.models.clone());
+        let model_store = models.clone();
+        let refiner = Refiner::new(
+            refiner::bundled_sidecar(),
+            Box::new(move |step| {
+                model_store
+                    .spec(catalog::refine_model(step).id)
+                    .map(|spec| spec.path)
+            }),
+        );
         let pill_state = PillState {
             view: PillView::Hidden,
             language: settings.language,
+            refine: None,
             annotation: None,
         };
         App {
@@ -92,6 +105,7 @@ impl App {
             store: Arc::new(store),
             models,
             inference,
+            refiner,
             hotkeys: OnceLock::new(),
             controller: OnceLock::new(),
             last_text: Mutex::new(None),
@@ -129,6 +143,10 @@ impl App {
 
     pub fn inference(&self) -> &Inference {
         &self.inference
+    }
+
+    pub fn refiner(&self) -> &Refiner {
+        &self.refiner
     }
 
     pub fn set_hotkeys(&self, hotkeys: Hotkeys) {

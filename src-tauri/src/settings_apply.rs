@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use murmur_core::refine::RefineKind;
 use murmur_core::session::Event;
 use murmur_core::settings::{SettingKey, Settings, SettingsError, same_accelerator};
 use serde::Serialize;
@@ -97,6 +98,17 @@ pub fn update(
                 ) {
                     tracing::error!(%error, "could not restore the annotations hotkey");
                 }
+                if keys.iter().any(|k| {
+                    matches!(
+                        k,
+                        SettingKey::TranslateEnabled | SettingKey::TranslateHotkey
+                    )
+                }) && let Err(error) = hotkeys.set_translate(
+                    old.translate_enabled
+                        .then_some(old.translate_hotkey.as_str()),
+                ) {
+                    tracing::error!(%error, "could not restore the translation hotkey");
+                }
             }
             if keys.contains(&SettingKey::LaunchAtLogin) {
                 sync_autostart(app, old.launch_at_login);
@@ -151,28 +163,52 @@ fn save_and_publish(
     Ok(())
 }
 
-/// A clash between the annotations hotkey (while that feature is on) and a dictation hotkey,
-/// worded for the field the user changed. `validate` reports the same clash under
-/// `AnnotationsHotkey`, which fits only when that field changed.
+/// A clash between a feature hotkey (annotations, translation; each while its feature is on) and
+/// another hotkey, worded for the field the user changed. `validate` reports the same clash under
+/// the feature's own key, which fits only when that field changed.
 fn hotkey_clash(old: &Settings, next: &Settings) -> Option<ApplyError> {
-    if !next.annotations_enabled {
-        return None;
-    }
     let changed = old.diff(next);
-    let clashes = |other: &str| same_accelerator(&next.annotations_hotkey, other);
-    if changed.contains(&SettingKey::Hotkey) && clashes(&next.hotkey) {
-        return Some(ApplyError::Hotkey(
-            "this key is the annotations hotkey".to_owned(),
-        ));
+    let changed_any = |keys: &[SettingKey]| keys.iter().any(|k| changed.contains(k));
+    let features = [
+        (
+            next.annotations_enabled,
+            next.annotations_hotkey.as_str(),
+            "this key is the annotations hotkey",
+        ),
+        (
+            next.translate_enabled,
+            next.translate_hotkey.as_str(),
+            "this key is the translation hotkey",
+        ),
+    ];
+    for (on, feature_key, message) in features {
+        if !on {
+            continue;
+        }
+        let clashes = |other: &str| same_accelerator(feature_key, other);
+        let hotkey = changed_any(&[SettingKey::Hotkey]) && clashes(&next.hotkey);
+        let alternate = changed_any(&[SettingKey::AlternateLanguageHotkey])
+            && next
+                .alternate_language_hotkey
+                .as_deref()
+                .is_some_and(clashes);
+        if hotkey || alternate {
+            return Some(ApplyError::Hotkey(message.to_owned()));
+        }
     }
-    if changed.contains(&SettingKey::AlternateLanguageHotkey)
-        && next
-            .alternate_language_hotkey
-            .as_deref()
-            .is_some_and(clashes)
+    // The annotations hotkey moved onto the translation hotkey (`validate` words it the other
+    // way round, for a change of the translation hotkey).
+    if next.annotations_enabled
+        && next.translate_enabled
+        && changed_any(&[
+            SettingKey::AnnotationsEnabled,
+            SettingKey::AnnotationsHotkey,
+        ])
+        && !changed_any(&[SettingKey::TranslateEnabled, SettingKey::TranslateHotkey])
+        && same_accelerator(&next.annotations_hotkey, &next.translate_hotkey)
     {
         return Some(ApplyError::Hotkey(
-            "this key is the annotations hotkey".to_owned(),
+            "this key is the translation hotkey".to_owned(),
         ));
     }
     None
@@ -213,6 +249,12 @@ pub fn apply_at_start(app: &AppHandle, services: &Arc<App>) {
             && let Err(error) = hotkeys.set_annotations(Some(&settings.annotations_hotkey))
         {
             tracing::warn!(%error, "could not register the annotations hotkey at start");
+        }
+        // No sidecar starts here: the first translation recording starts it (D3).
+        if settings.translate_enabled
+            && let Err(error) = hotkeys.set_translate(Some(&settings.translate_hotkey))
+        {
+            tracing::warn!(%error, "could not register the translation hotkey at start");
         }
     }
     // Off: no window, no hotkey, no permission check, no folder (spec rule for experiments).
@@ -343,6 +385,50 @@ fn apply(
         }
         // The cleanup runs after the settings commit in `update`.
         SettingKey::AnnotationsRetentionDays => Ok(()),
+        // Translation (experimental). On: the hotkey only; the sidecars start with the first
+        // translation recording (D3), and the UI guides to the Models screen while a model is
+        // missing. Off: the hotkey goes, a recording in progress is dropped and one past its
+        // recording is copied unrefined (`Event::RefineDisabled`), and both sidecars stop (the
+        // cleanup model serves only the translation in stage 1).
+        SettingKey::TranslateEnabled => {
+            if next.translate_enabled {
+                let Some(hotkeys) = services.hotkeys() else {
+                    return Ok(());
+                };
+                hotkeys
+                    .set_translate(Some(&next.translate_hotkey))
+                    .map_err(|error| {
+                        next.translate_enabled = false;
+                        ApplyError::Hotkey(error.to_string())
+                    })
+            } else {
+                if let Some(hotkeys) = services.hotkeys()
+                    && let Err(error) = hotkeys.set_translate(None)
+                {
+                    tracing::warn!(%error, "could not unregister the translation hotkey");
+                }
+                if let Some(controller) = services.controller() {
+                    controller.event(Event::RefineDisabled {
+                        kind: RefineKind::Translate,
+                    });
+                }
+                let refiner = services.refiner().clone();
+                tauri::async_runtime::spawn_blocking(move || refiner.stop_all());
+                Ok(())
+            }
+        }
+        SettingKey::TranslateHotkey => {
+            // Registered only while the feature is on; otherwise the value is stored for later.
+            let Some(hotkeys) = services.hotkeys().filter(|_| next.translate_enabled) else {
+                return Ok(());
+            };
+            hotkeys
+                .set_translate(Some(&next.translate_hotkey))
+                .map_err(|error| {
+                    next.translate_hotkey = old.translate_hotkey.clone();
+                    ApplyError::Hotkey(error.to_string())
+                })
+        }
     }
 }
 
@@ -458,6 +544,47 @@ mod tests {
         let off = Settings::default();
         let next = Settings {
             hotkey: "Alt+Shift+S".into(),
+            ..off.clone()
+        };
+        assert!(hotkey_clash(&off, &next).is_none());
+    }
+
+    #[test]
+    fn translation_hotkey_clash_is_reported_for_the_field_the_user_changed() {
+        let on = Settings {
+            translate_enabled: true,
+            ..Settings::default()
+        };
+        let translation = |e: Option<ApplyError>| matches!(e, Some(ApplyError::Hotkey(m)) if m == "this key is the translation hotkey");
+        // The dictation or alternate hotkey takes the translation key.
+        let next = Settings {
+            hotkey: "Shift+Alt+E".into(),
+            ..on.clone()
+        };
+        assert!(translation(hotkey_clash(&on, &next)));
+        let next = Settings {
+            alternate_language_hotkey: Some("alt+shift+keye".into()),
+            ..on.clone()
+        };
+        assert!(translation(hotkey_clash(&on, &next)));
+        // Annotations switched on with its key on the translation key.
+        let next = Settings {
+            annotations_enabled: true,
+            annotations_hotkey: "Alt+Shift+KeyE".into(),
+            ..on.clone()
+        };
+        assert!(translation(hotkey_clash(&on, &next)));
+        // The translation hotkey itself moved onto the dictation key: `validate` reports that.
+        let next = Settings {
+            translate_hotkey: "Alt+Space".into(),
+            ..on.clone()
+        };
+        assert!(hotkey_clash(&on, &next).is_none());
+        assert!(next.validate().is_err());
+        // Translation off: no clash.
+        let off = Settings::default();
+        let next = Settings {
+            hotkey: "Alt+Shift+KeyE".into(),
             ..off.clone()
         };
         assert!(hotkey_clash(&off, &next).is_none());

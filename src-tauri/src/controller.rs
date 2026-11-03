@@ -16,11 +16,13 @@ use std::time::{Duration, Instant};
 
 use murmur_core::Language;
 use murmur_core::annotations as ann;
-use murmur_core::ports::{CancelToken, RawTranscript};
+use murmur_core::catalog;
+use murmur_core::ports::{CancelToken, RawTranscript, RefineError};
+use murmur_core::refine::{self, Glossary, RefineKind, RefineStatus, RunReport};
 use murmur_core::session::{
     self, AnnotationsRefusal, CaptureError, ComposeOutcome, ComposeWords, CopyReason,
     DeliveryOutcome, Effect, Event, FailureKind, Machine, Notice, Paused, PillView, PlanCounts,
-    SessionId, SessionKind, State, TranscribeOutcome, TranscriptText,
+    RefineOutcome, SessionId, SessionKind, State, TranscribeOutcome, TranscriptText,
 };
 use murmur_core::text::{self, FormatOptions};
 use serde::Serialize;
@@ -42,7 +44,7 @@ use crate::annotation_session::{self as ann_session, AnnotationCtx, PlanInput, P
 use crate::app::App;
 use crate::bundles::{self, RecordingClock};
 use crate::debug;
-use crate::history::{self, Record};
+use crate::history::{self, Record, RefineRecord};
 use crate::inference::{
     InferenceError, InferenceOutput, RangesRequest, RegionsRequest, StreamId, StreamRequest,
     TranscribeRequest,
@@ -65,12 +67,22 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 const CAPTURE_READY_TIMEOUT: Duration = Duration::from_secs(10);
 /// The microphone permission prompt waits for the user; give them time, but not forever.
 const PERMISSION_PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
+/// A hard bound for one refine task, above the machine's refine timer: the adapter may wait for a
+/// warm-up to finish (start, load and warm) and then start and load a cold model itself.
+const REFINE_BACKSTOP_EXTRA_MS: u64 = refine::REFINER_START_TIMEOUT_MS * 2
+    + refine::REFINER_LOAD_TIMEOUT_MS * 2
+    + refine::REFINER_WARM_TIMEOUT_MS
+    + 5_000;
 
 /// What the pill window receives after every step.
 #[derive(Debug, Clone, Serialize, Type, tauri_specta::Event)]
 pub struct PillState {
     pub view: PillView,
     pub language: Language,
+    /// Present while the session has a model step (the pill shows "JA -> EN" for a translation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[specta(optional)]
+    pub refine: Option<RefineKind>,
     /// Present while the session is a screen annotation (absent: dictation or idle).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[specta(optional)]
@@ -113,6 +125,8 @@ pub enum Msg {
     Core(Event),
     /// The main hotkey with a language override (alternate hotkey).
     HotkeyDownWithLanguage(Language),
+    /// The translation hotkey went down (experimental). Its release is a plain `HotkeyUp`.
+    TranslateHotkey,
     /// The annotations hotkey. The permissions are checked here, right before use (G8).
     AnnotationsHotkey,
     CaptureOpened {
@@ -126,6 +140,11 @@ pub enum Msg {
     Inferred {
         session: SessionId,
         result: Result<InferenceOutput, InferenceError>,
+    },
+    /// The model step ended (or was cancelled).
+    Refined {
+        session: SessionId,
+        report: RunReport,
     },
     /// A stroke from the drawing layer (epoch milliseconds).
     InkStroke {
@@ -230,8 +249,25 @@ struct SessionCtx {
     latency_ms: Option<u64>,
     /// Annotation sessions only.
     annotation: Option<AnnotationCtx>,
+    /// Dictations with a model step only.
+    refine: Option<RefineCtx>,
     /// Resolves once the screen capture has stopped (an empty result when there was none).
     screen_done: Option<(watch::Sender<ScreenDone>, watch::Receiver<ScreenDone>)>,
+}
+
+/// The model step of a dictation (experimental).
+struct RefineCtx {
+    kind: RefineKind,
+    /// Built from the dictionary once per recording, so the warm-up and the call share a prefix.
+    glossary: Glossary,
+    cancel: CancelToken,
+    /// The rule-formatted text that went to the model (a translation's Japanese).
+    pre_refine_text: Option<String>,
+    /// The steps planned for the text (`refine::steps`), for the history's model ids.
+    steps: Vec<RefineKind>,
+    started: Option<Instant>,
+    /// From the refine request to the delivery.
+    refine_ms: Option<u64>,
 }
 
 pub struct Controller {
@@ -315,6 +351,20 @@ impl Controller {
                     refine: None,
                 })
             }
+            Msg::TranslateHotkey => {
+                let settings = self.services.settings();
+                // The key may fire once after the feature was switched off.
+                if !settings.translate_enabled {
+                    return None;
+                }
+                // The language is fixed for the recording: translation records Japanese.
+                self.language_override = Some(refine::TRANSLATE_FROM);
+                Some(Event::HotkeyDown {
+                    mode: settings.record_mode,
+                    refine: Some(RefineKind::Translate),
+                })
+            }
+            Msg::Refined { session, report } => self.on_refined(session, report),
             Msg::AnnotationsHotkey => self.on_annotations_hotkey(),
             Msg::CaptureOpened { session, result } => self.on_capture_opened(session, result),
             Msg::AudioReady { session, result } => {
@@ -488,6 +538,37 @@ impl Controller {
         Some(Event::Transcribed { session, outcome })
     }
 
+    /// Turns the model step's report into the machine's outcome. A cancel needs no event: the
+    /// machine cancelled it.
+    fn on_refined(&mut self, session: SessionId, report: RunReport) -> Option<Event> {
+        let rejected = match &report.result {
+            Err(RefineError::Rejected(rules)) => Some(rules.clone()),
+            _ => None,
+        };
+        let (pre_clean, pre_clean_error) = match &report.pre_clean {
+            refine::PreClean::NotNeeded => ("not_needed", None),
+            refine::PreClean::Used => ("used", None),
+            refine::PreClean::Failed(error) => ("failed", Some(error.to_string())),
+        };
+        tracing::info!(
+            session = session.0,
+            steps = ?report.steps,
+            ok = report.result.is_ok(),
+            error = report.result.as_ref().err().map(|e| e.to_string()),
+            ?rejected,
+            pre_clean,
+            pre_clean_error,
+            "refine finished"
+        );
+        let outcome = match report.result {
+            Ok(text) => RefineOutcome::Text(text),
+            Err(RefineError::Cancelled) => return None,
+            Err(RefineError::Timeout) => RefineOutcome::TimedOut,
+            Err(_) => RefineOutcome::Failed,
+        };
+        Some(Event::Refined { session, outcome })
+    }
+
     fn execute(&mut self, effect: Effect) {
         self.cue(&effect);
         match effect {
@@ -512,10 +593,11 @@ impl Controller {
                 text,
                 copy_only,
             } => self.deliver(session, text, copy_only),
-            // The refine status goes to the history with the refine columns (stage 1, M2).
             Effect::SaveSuccess {
-                session, outcome, ..
-            } => self.save_success(session, outcome),
+                session,
+                outcome,
+                refine,
+            } => self.save_success(session, outcome, refine),
             Effect::SaveFailure { session, failure } => self.save_failure(session, failure),
             Effect::DropAudio { session } => self.drop_audio(session),
             Effect::SetEscCapture(on) => {
@@ -546,19 +628,100 @@ impl Controller {
             Effect::DeliverText { session } => self.deliver_annotation(session, false),
             Effect::SaveAnnotation { session, outcome } => self.save_annotation(session, outcome),
             Effect::DropAll { session } => self.drop_all(session),
-            // --- refine (stage 1, M1): no refiner is wired yet, so a refine fails at once and
-            // the machine takes its fallback. Nothing produces a refine kind before M2.
-            Effect::WarmRefiner { .. } | Effect::CancelRefine { .. } => {}
-            Effect::Refine { session, .. } => self.send_self(Msg::Core(Event::Refined {
+            // --- the model step (experimental) ---
+            Effect::WarmRefiner { session, kind } => self.warm_refiner(session, kind),
+            Effect::Refine {
                 session,
-                outcome: session::RefineOutcome::Failed,
-            })),
+                kind,
+                text,
+            } => self.refine(session, kind, text),
+            Effect::CancelRefine { session } => {
+                if let Some(refine) = self.sessions.get(&session).and_then(|c| c.refine.as_ref()) {
+                    refine.cancel.cancel();
+                }
+            }
         }
     }
 
-    fn send_self(&self, msg: Msg) {
-        // The loop only stops at shutdown; a failed send then is expected and harmless.
-        let _ = self.tx.send(msg);
+    /// Starts and warms the models a session of `kind` may need, while the user speaks.
+    fn warm_refiner(&mut self, session: SessionId, kind: RefineKind) {
+        let Some(ctx) = self.sessions.get_mut(&session) else {
+            return;
+        };
+        let glossary = Glossary::new(&self.services.settings().dictionary);
+        ctx.refine = Some(RefineCtx {
+            kind,
+            glossary: glossary.clone(),
+            cancel: CancelToken::new(),
+            pre_refine_text: None,
+            steps: Vec::new(),
+            started: None,
+            refine_ms: None,
+        });
+        let mut refiner = self.services.refiner().clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            crate::refine_session::warm(kind, &glossary, &mut refiner);
+        });
+    }
+
+    /// Sends the rule-formatted text through the model step on a blocking thread.
+    fn refine(&mut self, session: SessionId, kind: RefineKind, text: TranscriptText) {
+        let dictionary = self.services.settings().dictionary;
+        let Some(ctx) = self.sessions.get_mut(&session) else {
+            return;
+        };
+        let refine = ctx.refine.get_or_insert_with(|| RefineCtx {
+            kind,
+            glossary: Glossary::new(&dictionary),
+            cancel: CancelToken::new(),
+            pre_refine_text: None,
+            steps: Vec::new(),
+            started: None,
+            refine_ms: None,
+        });
+        refine.pre_refine_text = Some(text.0.clone());
+        refine.steps = refine::steps(kind, &text.0).to_vec();
+        refine.started = Some(Instant::now());
+        let glossary = refine.glossary.clone();
+        let cancel = refine.cancel.clone();
+        let backstop = Duration::from_millis(
+            refine::timeout_ms(kind, &text.0).saturating_add(REFINE_BACKSTOP_EXTRA_MS),
+        );
+        let mut refiner = self.services.refiner().clone();
+        let tx = self.tx.clone();
+        tauri::async_runtime::spawn(async move {
+            let job_cancel = cancel.clone();
+            let loading_tx = tx.clone();
+            let job = tauri::async_runtime::spawn_blocking(move || {
+                crate::refine_session::drive(
+                    kind,
+                    &text.0,
+                    glossary,
+                    &mut refiner,
+                    &job_cancel,
+                    &mut || {
+                        let _ = loading_tx.send(Msg::Core(Event::RefinerLoading { session }));
+                    },
+                )
+            });
+            let report = match tokio::time::timeout(backstop, job).await {
+                Ok(Ok(report)) => report,
+                Ok(Err(error)) => {
+                    tracing::error!(session = session.0, %error, "the refine task failed");
+                    RunReport {
+                        result: Err(RefineError::Failed("task".to_owned())),
+                        pre_clean: refine::PreClean::NotNeeded,
+                        steps: Vec::new(),
+                    }
+                }
+                Err(_) => {
+                    // The machine has given up already; free the blocking thread.
+                    cancel.cancel();
+                    return;
+                }
+            };
+            let _ = tx.send(Msg::Refined { session, report });
+        });
     }
 
     /// Start and stop sounds, read from settings at the moment they play.
@@ -641,6 +804,7 @@ impl Controller {
                 model_id: None,
                 latency_ms: None,
                 annotation: None,
+                refine: None,
                 screen_done: None,
             },
         );
@@ -821,6 +985,14 @@ impl Controller {
             restore_clipboard: settings.restore_clipboard,
         };
         let t_stop = self.sessions.get(&session).and_then(|c| c.t_stop);
+        if let Some(ctx) = self.sessions.get_mut(&session) {
+            // The history keeps what went out: the English of a translation, the Japanese when
+            // the translation failed.
+            ctx.text = Some(text.0.clone());
+            if let Some(refine) = ctx.refine.as_mut() {
+                refine.refine_ms = refine.started.map(|t| t.elapsed().as_millis() as u64);
+            }
+        }
         let tx = self.tx.clone();
         tauri::async_runtime::spawn(async move {
             let job = tauri::async_runtime::spawn_blocking(move || match copy_only {
@@ -857,18 +1029,40 @@ impl Controller {
             latency_ms: ctx.latency_ms,
             asr_ms: ctx.asr_ms,
             failure,
+            refine: None,
         }
     }
 
-    fn save_success(&mut self, session: SessionId, outcome: DeliveryOutcome) {
+    fn save_success(
+        &mut self,
+        session: SessionId,
+        outcome: DeliveryOutcome,
+        refine_status: Option<RefineStatus>,
+    ) {
         let Some(ctx) = self.sessions.remove(&session) else {
             return;
         };
-        tracing::info!(session = session.0, ?outcome, "session saved");
+        tracing::info!(
+            session = session.0,
+            ?outcome,
+            ?refine_status,
+            "session saved"
+        );
         if let Some(text) = &ctx.text {
             self.services.remember_last(text.clone());
         }
-        let record = Self::record(&ctx, None);
+        let mut record = Self::record(&ctx, None);
+        if let (Some(status), Some(refine)) = (refine_status, ctx.refine.as_ref()) {
+            record.refine = Some(RefineRecord {
+                kind: refine.kind,
+                status,
+                // Without a model call the delivered text is the rule text.
+                pre_refine_text: refine.pre_refine_text.clone().or_else(|| ctx.text.clone()),
+                model_id: (!refine.steps.is_empty())
+                    .then(|| catalog::refine_model_ids(&refine.steps)),
+                refine_ms: refine.refine_ms,
+            });
+        }
         history::save_success(
             self.app.clone(),
             self.services.store().clone(),
@@ -1743,6 +1937,7 @@ impl Controller {
         let state = PillState {
             view,
             language: self.last_language,
+            refine: self.machine.active_refine(),
             annotation,
         };
         self.services.set_pill_state(state.clone());
@@ -1759,6 +1954,9 @@ impl Controller {
     fn shutdown(&mut self) {
         for (_, ctx) in self.sessions.drain() {
             ctx.cancel.cancel();
+            if let Some(refine) = &ctx.refine {
+                refine.cancel.cancel();
+            }
             if let Some(annotation) = ctx.annotation {
                 if let Some(pointer) = annotation.pointer {
                     pointer.stop();

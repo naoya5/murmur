@@ -9,9 +9,10 @@
 //!      itself until the cap. Every rule that decides what reaches the clipboard is pure and lives
 //!      here, so it is tested against the stage 0 calibration: every expected output passes and
 //!      every hand-written fake answer fails (`testdata/refine_calibration.json`).
-//! Where: `session.rs` calls `clean_gate` and `timeout_ms` (pure, no I/O). The app runs `run` on a
-//!        blocking thread with `src-tauri/src/adapters/refiner.rs` as the `ports::TextRefiner`
-//!        (the murmur-llm sidecar, one process per model). Models: `catalog::refine_model`.
+//! Where: `session.rs` calls `clean_gate` and `timeout_ms` (pure, no I/O). `Run` says which model
+//!        call comes next; the app's `src-tauri/src/refine_session.rs` makes the calls on a
+//!        blocking thread through `src-tauri/src/adapters/refiner.rs` (the `ports::TextRefiner`:
+//!        the murmur-llm sidecar, one process per model). Models: `catalog::refine_model`.
 //!        Tests at the end of this file.
 //!
 //! Stage 1 ships translation only (spoken Japanese, pasted English). The cleanup step exists
@@ -22,7 +23,7 @@ use specta::Type;
 
 use crate::Language;
 use crate::Millis;
-use crate::ports::{CancelToken, GenerateRequest, RefineError, TextRefiner};
+use crate::ports::{GenerateRequest, Generated, RefineError};
 use crate::session::TranscriptText;
 use crate::settings::DictionaryEntry;
 use crate::text;
@@ -44,6 +45,13 @@ impl RefineKind {
             RefineKind::Clean => "clean",
             RefineKind::Translate => "translate",
         }
+    }
+
+    /// Reads a stored `code`.
+    pub fn from_code(code: &str) -> Option<RefineKind> {
+        [RefineKind::Clean, RefineKind::Translate]
+            .into_iter()
+            .find(|k| k.code() == code)
     }
 }
 
@@ -73,6 +81,18 @@ impl RefineStatus {
             RefineStatus::Failed => "failed",
             RefineStatus::Timeout => "timeout",
         }
+    }
+
+    /// Reads a stored `code`.
+    pub fn from_code(code: &str) -> Option<RefineStatus> {
+        [
+            RefineStatus::Ok,
+            RefineStatus::Skipped,
+            RefineStatus::Failed,
+            RefineStatus::Timeout,
+        ]
+        .into_iter()
+        .find(|k| k.code() == code)
     }
 }
 
@@ -225,9 +245,11 @@ pub fn context_tokens(step: RefineKind) -> u32 {
 }
 
 /// Output cap (spec 6.6: input tokens x 1.5 + 32). The app has no tokenizer, so the character
-/// count stands in for the token count. Japanese runs 1.5 to 1.9 characters per token on these
-/// models, so the cap is looser than the spec's but still stops a runaway (an output that
-/// reaches the cap is rejected).
+/// count stands in for the token count. A token of these models covers one or more Japanese
+/// characters (1.5 to 1.9 on average), so this is an upper bound of the token-based cap: it never
+/// cuts off an answer that the token-based cap would let finish, and it still stops a runaway (an
+/// answer that reaches the cap is rejected). The test `output_cap_is_an_upper_bound_of_stage_0`
+/// checks it against the token-based caps measured in stage 0.
 pub fn max_new_tokens(text: &str) -> u32 {
     let chars = u32::try_from(char_count(text)).unwrap_or(u32::MAX / 2);
     (chars.saturating_mul(3) / 2 + 32).min(MAX_NEW_TOKENS_LIMIT)
@@ -237,25 +259,25 @@ pub fn max_new_tokens(text: &str) -> u32 {
 /// anyway and fails as `context_overflow`.
 pub const MAX_NEW_TOKENS_LIMIT: u32 = 8_192;
 
-/// Crash restarts of one sidecar (spec 6.12). An idle stop is not a crash.
+/// Restarts of one sidecar after a crash (spec 6.12). The first start and a start after an idle
+/// stop or a deliberate stop are not restarts. Within any window, `REFINER_MAX_RESTARTS`
+/// restarts are allowed; the crash after them is refused until the oldest restart leaves the
+/// window.
 #[derive(Debug, Clone, Default)]
 pub struct RestartBudget {
-    crashes: Vec<Millis>,
+    restarts: Vec<Millis>,
 }
 
 impl RestartBudget {
-    pub fn record_crash(&mut self, now: Millis) {
-        self.crashes.push(now);
-    }
-
-    /// Whether the sidecar may be started again after its crashes so far.
-    pub fn may_restart(&self, now: Millis) -> bool {
-        let recent = self
-            .crashes
-            .iter()
-            .filter(|t| now.saturating_sub(**t) < REFINER_RESTART_WINDOW_MS)
-            .count();
-        recent < REFINER_MAX_RESTARTS
+    /// Asks to start the sidecar again after a crash at `now`. Counts the restart when allowed.
+    pub fn try_restart(&mut self, now: Millis) -> bool {
+        self.restarts
+            .retain(|t| now.saturating_sub(*t) < REFINER_RESTART_WINDOW_MS);
+        if self.restarts.len() >= REFINER_MAX_RESTARTS {
+            return false;
+        }
+        self.restarts.push(now);
+        true
     }
 }
 
@@ -766,72 +788,124 @@ pub enum PreClean {
     Failed(RefineError),
 }
 
-/// The result of `run`. `Debug` shows no text (G7).
+/// How a refine session ended. `Debug` shows no text (G7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunReport {
     pub result: Result<TranscriptText, RefineError>,
     pub pre_clean: PreClean,
+    /// The model of each call that was made, in order (`catalog::refine_model_ids`).
+    pub steps: Vec<RefineKind>,
 }
 
-/// Runs the model calls of a refine session on `text` (the rule-formatted text) and returns the
-/// text to deliver. Each step's budget is computed from `text`, so the steps fit the machine's
-/// timer (`timeout_ms`). A cleanup before a translation that fails for any reason but a cancel
-/// leaves the rule text to translate.
-pub fn run(
+/// One model call that a refine session needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Call {
+    pub step: RefineKind,
+    pub request: GenerateRequest,
+}
+
+/// What comes after an answer: another call, or the end of the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Next {
+    Call(Call),
+    Done(RunReport),
+}
+
+/// The steps of one refine session as plain data. It says which model call comes next and turns
+/// each answer into the next call or the report; it never calls a model itself (G1). The app
+/// (`src-tauri/src/refine_session.rs`) makes the calls and feeds the answers back.
+///
+/// Every step's budget comes from the rule text, so the steps fit the machine's timer
+/// (`timeout_ms`). A cleanup before a translation that fails for any reason but a cancel leaves
+/// the rule text to translate; a cancel ends the session.
+#[derive(Debug, Clone)]
+pub struct Run {
     kind: RefineKind,
-    text: &str,
-    glossary: &Glossary,
-    refiner: &mut dyn TextRefiner,
-    cancel: &CancelToken,
-) -> RunReport {
-    let chars = char_count(text);
-    let mut step = |step: RefineKind, input: &str| -> Result<String, RefineError> {
-        if cancel.is_cancelled() {
-            return Err(RefineError::Cancelled);
-        }
-        let request = GenerateRequest {
-            messages: messages(step, glossary, input),
-            max_tokens: max_new_tokens(input),
-            budget_ms: step_budget_ms(step, chars),
-        };
-        let generated = refiner.generate(step, &request, cancel)?;
-        finish(step, &generated.text, generated.truncated, input, glossary)
-            .map_err(RefineError::Rejected)
-    };
-    match kind {
-        RefineKind::Clean => RunReport {
-            result: step(RefineKind::Clean, text).map(TranscriptText),
+    /// The rule-formatted text.
+    text: TranscriptText,
+    chars: usize,
+    glossary: Glossary,
+    /// The step whose answer is awaited and the text it was given; `None` once done.
+    pending: Option<(RefineKind, TranscriptText)>,
+    pre_clean: PreClean,
+    steps: Vec<RefineKind>,
+}
+
+impl Run {
+    /// Starts a session on the rule-formatted `text` and returns its first call.
+    pub fn start(kind: RefineKind, text: &str, glossary: Glossary) -> (Run, Call) {
+        let mut run = Run {
+            kind,
+            text: TranscriptText(text.to_owned()),
+            chars: char_count(text),
+            glossary,
+            pending: None,
             pre_clean: PreClean::NotNeeded,
-        },
-        RefineKind::Translate => {
-            let (input, pre_clean) = if cleans_before_translation(text) {
-                match step(RefineKind::Clean, text) {
-                    Ok(cleaned) => (cleaned, PreClean::Used),
-                    Err(RefineError::Cancelled) => {
-                        return RunReport {
-                            result: Err(RefineError::Cancelled),
-                            pre_clean: PreClean::Failed(RefineError::Cancelled),
-                        };
-                    }
-                    Err(error) => (text.to_owned(), PreClean::Failed(error)),
-                }
-            } else {
-                (text.to_owned(), PreClean::NotNeeded)
-            };
-            RunReport {
-                result: step(RefineKind::Translate, &input).map(TranscriptText),
-                pre_clean,
+            steps: Vec::new(),
+        };
+        let first = steps(kind, text).first().copied().unwrap_or(kind);
+        let call = run.call(first, text.to_owned());
+        (run, call)
+    }
+
+    fn call(&mut self, step: RefineKind, input: String) -> Call {
+        let request = GenerateRequest {
+            messages: messages(step, &self.glossary, &input),
+            max_tokens: max_new_tokens(&input),
+            budget_ms: step_budget_ms(step, self.chars),
+        };
+        self.steps.push(step);
+        self.pending = Some((step, TranscriptText(input)));
+        Call { step, request }
+    }
+
+    fn done(&mut self, result: Result<String, RefineError>) -> Next {
+        self.pending = None;
+        Next::Done(RunReport {
+            result: result.map(TranscriptText),
+            pre_clean: self.pre_clean.clone(),
+            steps: self.steps.clone(),
+        })
+    }
+
+    /// Takes the answer to the last call. An answer after the end is a caller error and ends
+    /// the session as failed.
+    pub fn advance(&mut self, answer: Result<Generated, RefineError>) -> Next {
+        let Some((step, input)) = self.pending.take() else {
+            return self.done(Err(RefineError::Failed("the session has ended".to_owned())));
+        };
+        let result = answer.and_then(|generated| {
+            finish(
+                step,
+                &generated.text,
+                generated.truncated,
+                &input.0,
+                &self.glossary,
+            )
+            .map_err(RefineError::Rejected)
+        });
+        match (self.kind, step, result) {
+            (RefineKind::Translate, RefineKind::Clean, Err(RefineError::Cancelled)) => {
+                self.pre_clean = PreClean::Failed(RefineError::Cancelled);
+                self.done(Err(RefineError::Cancelled))
             }
+            (RefineKind::Translate, RefineKind::Clean, Ok(cleaned)) => {
+                self.pre_clean = PreClean::Used;
+                Next::Call(self.call(RefineKind::Translate, cleaned))
+            }
+            (RefineKind::Translate, RefineKind::Clean, Err(error)) => {
+                self.pre_clean = PreClean::Failed(error);
+                let text = self.text.0.clone();
+                Next::Call(self.call(RefineKind::Translate, text))
+            }
+            (_, _, result) => self.done(result),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
-
     use super::*;
-    use crate::ports::Generated;
     use crate::settings::DictionaryScope;
 
     fn entry(written: &str, readings: &[&str], scope: DictionaryScope) -> DictionaryEntry {
@@ -1062,6 +1136,49 @@ mod tests {
     }
 
     #[test]
+    fn output_cap_is_an_upper_bound_of_stage_0() {
+        // The token-based caps (input tokens x 1.5 + 32) of the 10 long eval items in the stage 0
+        // final benchmark: (id, Qwen3.5-0.8B cleanup, LFM2-350M-ENJP-MT translation).
+        let stage0 = [
+            (4, 71, 86),
+            (8, 75, 87),
+            (9, 75, 90),
+            (12, 83, 93),
+            (23, 71, 81),
+            (26, 86, 93),
+            (28, 75, 90),
+            (31, 71, 78),
+            (39, 78, 90),
+            (40, 81, 83),
+        ];
+        let cal = calibration();
+        for (id, clean_cap, translate_cap) in stage0 {
+            let cap = max_new_tokens(input_of(&cal, id));
+            assert!(
+                cap >= clean_cap && cap >= translate_cap,
+                "item {id}: {cap} < {clean_cap} / {translate_cap}"
+            );
+        }
+    }
+
+    #[test]
+    fn stored_codes_round_trip() {
+        for kind in [RefineKind::Clean, RefineKind::Translate] {
+            assert_eq!(RefineKind::from_code(kind.code()), Some(kind));
+        }
+        for status in [
+            RefineStatus::Ok,
+            RefineStatus::Skipped,
+            RefineStatus::Failed,
+            RefineStatus::Timeout,
+        ] {
+            assert_eq!(RefineStatus::from_code(status.code()), Some(status));
+        }
+        assert_eq!(RefineKind::from_code("other"), None);
+        assert_eq!(RefineStatus::from_code(""), None);
+    }
+
+    #[test]
     fn output_cap_from_characters() {
         assert_eq!(max_new_tokens(""), 32);
         assert_eq!(max_new_tokens("あいう"), 36);
@@ -1070,16 +1187,18 @@ mod tests {
     }
 
     #[test]
-    fn restart_budget_allows_three_per_window() {
+    fn restart_budget_allows_three_restarts_per_window() {
+        // First start (not a restart), then crash -> restart three times; the fourth crash is
+        // refused.
         let mut b = RestartBudget::default();
-        assert!(b.may_restart(0));
-        for t in [0, 1_000, 2_000] {
-            b.record_crash(t);
-        }
-        assert!(!b.may_restart(3_000));
-        assert!(!b.may_restart(REFINER_RESTART_WINDOW_MS - 1));
-        // The first crash left the window.
-        assert!(b.may_restart(REFINER_RESTART_WINDOW_MS));
+        assert!(b.try_restart(1_000), "restart 1");
+        assert!(b.try_restart(2_000), "restart 2");
+        assert!(b.try_restart(3_000), "restart 3");
+        assert!(!b.try_restart(4_000), "the fourth crash is refused");
+        // A refusal is not counted: the next restart is allowed once restart 1 leaves the window.
+        assert!(!b.try_restart(REFINER_RESTART_WINDOW_MS + 999));
+        assert!(b.try_restart(REFINER_RESTART_WINDOW_MS + 1_000));
+        assert!(!b.try_restart(REFINER_RESTART_WINDOW_MS + 1_001));
     }
 
     // --- prompts ---
@@ -1301,100 +1420,88 @@ mod tests {
 
     // --- run ---
 
-    /// A refiner that returns scripted answers and records the calls.
-    struct Scripted {
-        answers: VecDeque<Result<Generated, RefineError>>,
-        calls: Vec<(RefineKind, GenerateRequest)>,
+    fn ok(text: &str) -> Result<Generated, RefineError> {
+        Ok(Generated {
+            text: text.to_owned(),
+            truncated: false,
+        })
     }
 
-    impl Scripted {
-        fn new(answers: Vec<Result<(&str, bool), RefineError>>) -> Self {
-            Self {
-                answers: answers
-                    .into_iter()
-                    .map(|a| {
-                        a.map(|(text, truncated)| Generated {
-                            text: text.to_owned(),
-                            truncated,
-                        })
-                    })
-                    .collect(),
-                calls: Vec::new(),
+    /// Feeds scripted answers to a session the way the app's driver does, and records the calls.
+    fn drive(
+        kind: RefineKind,
+        text: &str,
+        answers: Vec<Result<Generated, RefineError>>,
+    ) -> (RunReport, Vec<Call>) {
+        let mut answers = std::collections::VecDeque::from(answers);
+        let (mut run, mut call) = Run::start(kind, text, Glossary::default());
+        let mut calls = Vec::new();
+        loop {
+            calls.push(call);
+            let answer = answers
+                .pop_front()
+                .unwrap_or(Err(RefineError::Failed("no scripted answer".to_owned())));
+            match run.advance(answer) {
+                Next::Call(next) => call = next,
+                Next::Done(report) => return (report, calls),
             }
         }
     }
 
-    impl TextRefiner for Scripted {
-        fn warm(&mut self, _step: RefineKind, _prefix: &[ChatMessage]) -> Result<(), RefineError> {
-            Ok(())
-        }
-
-        fn generate(
-            &mut self,
-            step: RefineKind,
-            request: &GenerateRequest,
-            _cancel: &CancelToken,
-        ) -> Result<Generated, RefineError> {
-            self.calls.push((step, request.clone()));
-            self.answers
-                .pop_front()
-                .unwrap_or(Err(RefineError::Failed("no scripted answer".to_owned())))
-        }
-    }
-
-    fn ok(text: &str) -> Result<(&str, bool), RefineError> {
-        Ok((text, false))
-    }
-
     #[test]
     fn translation_without_a_marker_translates_the_rule_text() {
-        let mut r = Scripted::new(vec![ok("The meeting is at four.")]);
-        let report = run(
+        let (report, calls) = drive(
             RefineKind::Translate,
             "会議は4時からです。",
-            &Glossary::default(),
-            &mut r,
-            &CancelToken::new(),
+            vec![ok("The meeting is at four.")],
         );
         assert_eq!(
             report.result,
             Ok(TranscriptText("The meeting is at four.".to_owned()))
         );
         assert_eq!(report.pre_clean, PreClean::NotNeeded);
-        assert_eq!(r.calls.len(), 1);
-        let (step, request) = &r.calls[0];
-        assert_eq!(*step, RefineKind::Translate);
-        assert_eq!(request.max_tokens, max_new_tokens("会議は4時からです。"));
-        assert_eq!(request.budget_ms, step_budget_ms(RefineKind::Translate, 10));
+        assert_eq!(report.steps, vec![RefineKind::Translate]);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].step, RefineKind::Translate);
+        assert_eq!(
+            calls[0].request.max_tokens,
+            max_new_tokens("会議は4時からです。")
+        );
+        assert_eq!(
+            calls[0].request.budget_ms,
+            step_budget_ms(RefineKind::Translate, 10)
+        );
     }
 
     #[test]
     fn translation_with_a_marker_translates_the_cleaned_text() {
         let src = "会議は3時から、いや4時からでお願いします。";
-        let mut r = Scripted::new(vec![
-            ok("会議は4時からでお願いします。"),
-            ok("Please make the meeting at four."),
-        ]);
-        let report = run(
+        let (report, calls) = drive(
             RefineKind::Translate,
             src,
-            &Glossary::default(),
-            &mut r,
-            &CancelToken::new(),
+            vec![
+                ok("会議は4時からでお願いします。"),
+                ok("Please make the meeting at four."),
+            ],
         );
         assert_eq!(report.pre_clean, PreClean::Used);
         assert!(report.result.is_ok());
-        assert_eq!(r.calls[0].0, RefineKind::Clean);
-        assert_eq!(r.calls[1].0, RefineKind::Translate);
+        assert_eq!(report.steps, vec![RefineKind::Clean, RefineKind::Translate]);
+        assert_eq!(calls[0].step, RefineKind::Clean);
+        assert_eq!(calls[1].step, RefineKind::Translate);
         assert_eq!(
-            r.calls[1].1.messages.last().map(|m| m.content.as_str()),
+            calls[1].request.messages.last().map(|m| m.content.as_str()),
             Some("会議は4時からでお願いします。")
         );
         // Both steps get budgets from the rule text, as the machine's timer does.
         let chars = char_count(src);
         assert_eq!(
-            r.calls[1].1.budget_ms,
+            calls[1].request.budget_ms,
             step_budget_ms(RefineKind::Translate, chars)
+        );
+        assert_eq!(
+            calls[1].request.max_tokens,
+            max_new_tokens("会議は4時からでお願いします。")
         );
     }
 
@@ -1406,22 +1513,25 @@ mod tests {
             Err(RefineError::Unavailable("model_load_failed".to_owned())),
             // An answer instead of a cleanup: rejected.
             ok("会議の時間は4時です。予定を入れておきますね。"),
+            // A runaway cleanup: rejected.
+            Ok(Generated {
+                text: "会議は4時からでお願いします。".to_owned(),
+                truncated: true,
+            }),
         ] {
-            let mut r = Scripted::new(vec![first, ok("Please make the meeting at four.")]);
-            let report = run(
+            let (report, calls) = drive(
                 RefineKind::Translate,
                 src,
-                &Glossary::default(),
-                &mut r,
-                &CancelToken::new(),
+                vec![first, ok("Please make the meeting at four.")],
             );
             assert!(
                 matches!(report.pre_clean, PreClean::Failed(_)),
                 "{report:?}"
             );
             assert!(report.result.is_ok());
+            assert_eq!(report.steps, vec![RefineKind::Clean, RefineKind::Translate]);
             assert_eq!(
-                r.calls[1].1.messages.last().map(|m| m.content.as_str()),
+                calls[1].request.messages.last().map(|m| m.content.as_str()),
                 Some(src)
             );
         }
@@ -1429,77 +1539,48 @@ mod tests {
 
     #[test]
     fn a_cancelled_cleanup_stops_the_translation() {
-        let src = "まあ、会議は4時からです。";
-        let mut r = Scripted::new(vec![Err(RefineError::Cancelled)]);
-        let report = run(
+        let (report, calls) = drive(
             RefineKind::Translate,
-            src,
-            &Glossary::default(),
-            &mut r,
-            &CancelToken::new(),
+            "まあ、会議は4時からです。",
+            vec![Err(RefineError::Cancelled)],
         );
         assert_eq!(report.result, Err(RefineError::Cancelled));
-        assert_eq!(r.calls.len(), 1);
-        // A cancel before the first call makes no call at all.
-        let cancel = CancelToken::new();
-        cancel.cancel();
-        let mut r = Scripted::new(vec![]);
-        let report = run(
-            RefineKind::Translate,
-            src,
-            &Glossary::default(),
-            &mut r,
-            &cancel,
-        );
-        assert_eq!(report.result, Err(RefineError::Cancelled));
-        assert!(r.calls.is_empty());
+        assert_eq!(report.pre_clean, PreClean::Failed(RefineError::Cancelled));
+        assert_eq!(calls.len(), 1);
     }
 
     #[test]
     fn a_bad_translation_is_an_error() {
         let src = "明日の東京の天気はどうなりますか？";
-        for answer in [
-            Ok(("It will be sunny in Tokyo tomorrow.", false)),
-            Ok((
+        for (text, truncated) in [
+            ("It will be sunny in Tokyo tomorrow.", false),
+            (
                 "What will the weather be in Tokyo tomorrow? What will the",
                 true,
-            )),
-            Ok(("明日の東京の天気はどうなりますか？", false)),
+            ),
+            ("明日の東京の天気はどうなりますか？", false),
         ] {
-            let mut r = Scripted::new(vec![answer]);
-            let report = run(
-                RefineKind::Translate,
-                src,
-                &Glossary::default(),
-                &mut r,
-                &CancelToken::new(),
-            );
+            let answer = Ok(Generated {
+                text: text.to_owned(),
+                truncated,
+            });
+            let (report, _) = drive(RefineKind::Translate, src, vec![answer]);
             assert!(
                 matches!(report.result, Err(RefineError::Rejected(_))),
                 "{report:?}"
             );
         }
-        let mut r = Scripted::new(vec![Err(RefineError::Timeout)]);
-        let report = run(
-            RefineKind::Translate,
-            src,
-            &Glossary::default(),
-            &mut r,
-            &CancelToken::new(),
-        );
+        let (report, _) = drive(RefineKind::Translate, src, vec![Err(RefineError::Timeout)]);
         assert_eq!(report.result, Err(RefineError::Timeout));
     }
 
     #[test]
     fn a_cleanup_run_returns_the_validated_text() {
         let src = "あの、明日の打ち合わせなんですけど、なんか少し遅れそうです。";
-        let mut r = Scripted::new(vec![ok("明日の打ち合わせなんですけど、少し遅れそうです。")]);
-        let report = run(
+        let (report, calls) = drive(
             RefineKind::Clean,
             src,
-            &Glossary::default(),
-            &mut r,
-            &CancelToken::new(),
+            vec![ok("明日の打ち合わせなんですけど、少し遅れそうです。")],
         );
         assert_eq!(
             report.result,
@@ -1507,9 +1588,29 @@ mod tests {
                 "明日の打ち合わせなんですけど、少し遅れそうです。".to_owned()
             ))
         );
+        assert_eq!(report.steps, vec![RefineKind::Clean]);
         assert_eq!(
-            r.calls[0].1.budget_ms,
+            calls[0].request.budget_ms,
             step_budget_ms(RefineKind::Clean, char_count(src))
         );
+    }
+
+    #[test]
+    fn an_answer_after_the_end_fails_and_the_debug_output_hides_the_text() {
+        let src = "会議は4時からです。";
+        let (mut run, _) = Run::start(RefineKind::Translate, src, Glossary::default());
+        assert!(matches!(
+            run.advance(ok("The meeting is at four.")),
+            Next::Done(RunReport { result: Ok(_), .. })
+        ));
+        assert!(matches!(
+            run.advance(ok("again")),
+            Next::Done(RunReport {
+                result: Err(RefineError::Failed(_)),
+                ..
+            })
+        ));
+        let shown = format!("{run:?}");
+        assert!(!shown.contains("会議"), "{shown}");
     }
 }

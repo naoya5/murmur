@@ -29,8 +29,9 @@ Read in this order. Each step names where to go next.
 |---|---|---|---|
 | Core | `crates/murmur-core` | std, serde, specta, unicode-segmentation | Tauri, files, network, OS APIs, SDKs |
 | Speech FFI | `crates/speech-sys` | speech.cpp (git submodule, pinned tag) | anything else |
+| LLM sidecar | `crates/murmur-llm` (its own executable, bundled as `externalBin`) | llama.cpp | the app's code; it only speaks JSON Lines |
 | Adapters | `src-tauri/src/adapters`, `src-tauri/src/platform` | core, one SDK each | other adapters' internals |
-| Assembly | `src-tauri/src/{lib,controller,inference,ipc,windows,tray,settings_apply,annotation_session,bundles}.rs` | core, adapters | business rules |
+| Assembly | `src-tauri/src/{lib,controller,inference,ipc,windows,tray,settings_apply,annotation_session,bundles,refine_session}.rs` | core, adapters | business rules |
 | UI | `src/` | the backend through `src/ipc/` only | `invoke` directly, business rules |
 
 ## Threads
@@ -42,7 +43,8 @@ Read in this order. Each step names where to go next.
 | Audio owner (OS thread per recording) | the cpal stream (not `Send`) | the cpal callback only writes to a lock-free ring buffer |
 | Audio converter (OS thread per recording) | resampler, spool writer, level meter | 30 fps level events; appends 16 kHz PCM |
 | Inference (one OS thread) | engine, loaded model, VAD | jobs arrive on a channel; one request at a time |
-| Blocking pool | SQLite, file cleanup, paste | runs after delivery |
+| Blocking pool | SQLite, file cleanup, paste; refine warm-ups and calls | runs after delivery; a refine call runs before it (experimental) |
+| Sidecar reader (OS thread per sidecar process) | the process's stdout | turns each output line into a channel message; ends with the process |
 
 ## Dictation flow and latency budget
 
@@ -72,6 +74,44 @@ the spans in which speech was heard, the target app's bundle id). The folder is 
 start-up.
 Retention is a number of days (1 to 90, default 7) plus a 1 GiB cap on the whole folder; the cleanup runs on
 blocking threads after a paste and when the setting changes.
+
+Translation (experimental) adds five columns to `transcripts`: `refine_kind`, `refine_status`,
+`pre_refine_text` (the Japanese before the model step), `refine_model_id` (every model that ran, joined with
+`+`) and `refine_ms`. `text` stays what went out. The day totals count `pre_refine_text`, what was spoken. The
+two models are ordinary catalog entries in `models/`.
+
+## Translation (experimental)
+
+Off by default (`translate_enabled`). While it is off nothing of it runs: no hotkey, no process, no model. A
+second hotkey (default Option+Shift+E, same record modes as the main one) records Japanese, and English is
+pasted. After the text rules, a text with a filler or self-correction marker (up to 200 characters) is first
+cleaned by Qwen3.5-0.8B, then LFM2-350M-ENJP-MT translates it. A failed cleanup is silent: the rule text is
+translated instead. A failed translation pastes nothing: the Japanese goes to the clipboard and the pill says so.
+The history keeps the Japanese.
+
+New parts:
+
+| Where | Role |
+|---|---|
+| `crates/murmur-core/src/refine.rs` | Pure rules: marker gating, prompts and example turns, output cap, post-processing, validation (stage 0 calibration in its tests), time budgets, sidecar timings, the restart budget, and `Run`, which says which model call comes next. |
+| `crates/murmur-core/src/{session,catalog,settings,ports}.rs` | The `Refining` state and its rows, the two LLM catalog rows, the two `Translate*` settings, the `TextRefiner` port. |
+| `src-tauri/src/refine_session.rs` | Makes the calls that `Run` asks for (on a blocking thread) and warms the models at recording start. |
+| `adapters/refiner.rs` | The `TextRefiner`: one sidecar process per model, JSON Lines (protocol SOT: `crates/murmur-llm/src/main.rs`), every wait bounded, cancel then kill, three restarts per ten minutes after crashes, stopped after five idle minutes. |
+
+Flow at a glance:
+
+```
+translation hotkey -> StartCapture (language fixed to ja) + WarmRefiner: start, load and warm both models
+  ... speech ...
+hotkey -> StopCapture -> Transcribe -> text rules
+  -> Refining (timer: the steps' budgets + slack; a cold model load extends it once)
+     marker? -> cleanup (rejected or failed: the rule text) -> translation -> validation
+  -> Deliver: English pasted; on failure the Japanese copied, not pasted
+  -> Delivered -> SaveSuccess: row with the refine columns                    (after the paste, G9)
+```
+
+Esc during refining behaves like dictation (3 s undo). Switching the feature off drops a recording in progress;
+once the recording has ended, the Japanese is copied as a failed translation.
 
 ## Annotations (experimental)
 
@@ -121,7 +161,7 @@ pasted anywhere: the text goes to the clipboard and the pill says why.
 
 | Task | Touch |
 |---|---|
-| Add a model | `core/catalog.rs` only |
+| Add a model | `core/catalog.rs` only (a refine model also needs a `tasks` entry) |
 | Add an engine | a new adapter implementing `core/ports.rs` + catalog entries + one factory arm in `inference.rs` |
 | Add a setting | `core/settings.rs` -> the compiler asks for a `SettingKey` and an `apply` arm -> `views/Settings.tsx` |
 | Add a text rule | `core/text.rs` + its tests |

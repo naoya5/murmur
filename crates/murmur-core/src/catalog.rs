@@ -272,6 +272,16 @@ pub fn refine_model(step: RefineKind) -> &'static ModelEntry {
     find(id).unwrap_or(&CATALOG[0])
 }
 
+/// The history's `refine_model_id`: the model of each call in order, joined with "+" (a
+/// translation that was cleaned first names both models). Ids only, never text.
+pub fn refine_model_ids(steps: &[RefineKind]) -> String {
+    steps
+        .iter()
+        .map(|step| refine_model(*step).id)
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
 /// The refine models (the Models screen's "cleanup and translation" section).
 pub fn refinement_models() -> impl Iterator<Item = &'static ModelEntry> {
     CATALOG.iter().filter(|m| m.role == Role::Refinement)
@@ -403,6 +413,15 @@ mod tests {
             DEFAULT_TRANSLATE_MODEL
         );
         assert_eq!(refine_model(RefineKind::Clean).id, DEFAULT_CLEAN_MODEL);
+        assert_eq!(
+            refine_model_ids(&[RefineKind::Clean, RefineKind::Translate]),
+            format!("{DEFAULT_CLEAN_MODEL}+{DEFAULT_TRANSLATE_MODEL}")
+        );
+        assert_eq!(
+            refine_model_ids(&[RefineKind::Translate]),
+            DEFAULT_TRANSLATE_MODEL
+        );
+        assert_eq!(refine_model_ids(&[]), "");
         let ids: Vec<&str> = refinement_models().map(|m| m.id).collect();
         assert_eq!(ids, vec![DEFAULT_TRANSLATE_MODEL, DEFAULT_CLEAN_MODEL]);
         // D2: both together stay under 1 GB of files.

@@ -520,6 +520,10 @@ screen_recording?: boolean | null }
  */
 export type PillState = { view: PillView; language: Language; 
 /**
+ * Present while the session has a model step (the pill shows "JA -> EN" for a translation).
+ */
+refine?: RefineKind | null; 
+/**
  * Present while the session is a screen annotation (absent: dictation or idle).
  */
 annotation?: AnnotationPill | null }
@@ -556,6 +560,26 @@ export type RefineKind =
  * Japanese to English (`TRANSLATE_FROM` to `TRANSLATE_TO`).
  */
 "translate"
+/**
+ * How the refine step of a session ended. Stored in the history (`refine_status`).
+ */
+export type RefineStatus = 
+/**
+ * The model's output was delivered.
+ */
+"ok" | 
+/**
+ * The model was not asked (a short or a long cleanup).
+ */
+"skipped" | 
+/**
+ * The model failed, was unavailable, or its output broke a validation rule.
+ */
+"failed" | 
+/**
+ * The time budget ran out.
+ */
+"timeout"
 export type RetryError = { kind: "not_found" } | { kind: "audio_missing" } | { kind: "model_missing" } | { kind: "no_speech" } | { kind: "failed"; message: string }
 export type Role = "recognition" | "voice_detection" | 
 /**
@@ -598,7 +622,17 @@ annotations_hotkey: string;
 /**
  * How many days an annotation bundle is kept on disk.
  */
-annotations_retention_days: number }
+annotations_retention_days: number; 
+/**
+ * Experimental: translation (speak Japanese, English is pasted) by local models
+ * (`refine.rs`). Off by default; while off, no hotkey, no process, no model runs.
+ */
+translate_enabled: boolean; 
+/**
+ * Hotkey that records Japanese for translation (accelerator string), same record modes as
+ * the main hotkey. Registered only while translation is on.
+ */
+translate_hotkey: string }
 /**
  * Settings were saved; every window re-reads what it shows.
  */
@@ -620,7 +654,23 @@ export type Tier =
  * Internal helper model (VAD). Not chosen by the user.
  */
 "internal"
-export type TranscriptRow = { id: string; created_at_ms: number; status: TranscriptStatus; text: string | null; raw_text: string | null; language: Language | null; duration_ms: number; latin_words: number; cjk_chars: number; model_id: string | null; latency_ms: number | null; asr_ms: number | null; audio_path: string | null; error: string | null }
+export type TranscriptRow = { id: string; created_at_ms: number; status: TranscriptStatus; text: string | null; raw_text: string | null; language: Language | null; duration_ms: number; latin_words: number; cjk_chars: number; model_id: string | null; latency_ms: number | null; asr_ms: number | null; audio_path: string | null; error: string | null; 
+/**
+ * The model step of the session (experimental), when it had one.
+ */
+refine_kind: RefineKind | null; refine_status: RefineStatus | null; 
+/**
+ * The rule-formatted text before the model step (a translation's Japanese).
+ */
+pre_refine_text: string | null; 
+/**
+ * Every model that ran, joined with "+" (`catalog::refine_model_ids`).
+ */
+refine_model_id: string | null; 
+/**
+ * Time from the refine request to the delivery: the model step's share of `latency_ms`.
+ */
+refine_ms: number | null }
 export type TranscriptStatus = "ok" | "failed" | "recovered"
 export type UiLanguage = "system" | "en" | "ja"
 /**

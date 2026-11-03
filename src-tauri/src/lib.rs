@@ -2,8 +2,9 @@
 //!
 //! Start-up order: paths -> logging -> settings -> history store (+ spool recovery) -> inference
 //! thread -> services -> windows -> controller -> hotkeys -> settings side effects -> tray.
-//! Exit: the controller stops capture (the spool is kept for recovery) and the inference thread
-//! frees the model before the process ends (Metal aborts if a model is still loaded).
+//! Exit: the controller stops capture (the spool is kept for recovery), the refine sidecars stop,
+//! and the inference thread frees the model before the process ends (Metal aborts if a model is
+//! still loaded).
 
 mod adapters;
 mod annotation_session;
@@ -15,6 +16,7 @@ mod history;
 mod inference;
 mod ipc;
 mod platform;
+mod refine_session;
 mod settings_apply;
 mod tray;
 mod updater;
@@ -157,7 +159,10 @@ fn hotkey_callback(
             mode: services.settings().record_mode,
             refine: None,
         }),
-        HotkeyEvent::MainUp | HotkeyEvent::AlternateUp => controller.event(Event::HotkeyUp),
+        HotkeyEvent::MainUp | HotkeyEvent::AlternateUp | HotkeyEvent::TranslateUp => {
+            controller.event(Event::HotkeyUp)
+        }
+        HotkeyEvent::TranslateDown => controller.send(Msg::TranslateHotkey),
         HotkeyEvent::AlternateDown => {
             let other = match services.settings().language {
                 Language::Ja => Language::En,
@@ -275,12 +280,15 @@ fn copy_text_now(text: &str) {
     }
 }
 
-/// Frees the model after the configured idle time. Off by default (speed first).
+/// Frees the model after the configured idle time. Off by default (speed first). The refine
+/// sidecars stop after their own fixed idle time (D3).
 fn spawn_idle_unload(services: Arc<App>) {
     tauri::async_runtime::spawn(async move {
         let mut idle_minutes = 0u32;
         loop {
             tokio::time::sleep(IDLE_CHECK).await;
+            let refiner = services.refiner().clone();
+            tauri::async_runtime::spawn_blocking(move || refiner.stop_idle());
             let busy = !matches!(
                 services.pill_state().view,
                 PillView::Hidden | PillView::Notice { .. }
@@ -306,6 +314,8 @@ fn shutdown(handle: &AppHandle) {
         if let Some(controller) = services.controller() {
             controller.send(Msg::Shutdown);
         }
+        // A sidecar also exits by itself when Murmur's end closes its input.
+        services.refiner().shutdown();
         services.inference().shutdown(Duration::from_secs(10));
     }
 }

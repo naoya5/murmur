@@ -10,7 +10,7 @@
 //!        stream starts, so every chunk of one recording uses the same vocabulary (a PLAN 2.9
 //!        deviation: a dictionary edit applies from the next recording).
 //!        `src-tauri/src/adapters/refiner.rs` implements `TextRefiner` with the murmur-llm
-//!        sidecar; `refine::run` drives it.
+//!        sidecar; `src-tauri/src/refine_session.rs` makes the calls that `refine::Run` asks for.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -206,6 +206,9 @@ pub trait TextRefiner: Send {
     /// prompt and example turns) so that a later `generate` with the same prefix starts from it.
     /// Called when a recording that may need the step starts.
     fn warm(&mut self, step: RefineKind, prefix: &[ChatMessage]) -> Result<(), RefineError>;
+    /// Whether the model for `step` is loaded and running now. `false` means the next call
+    /// starts or loads it first (the session's timer then gets the load budget once). Never waits.
+    fn ready(&self, step: RefineKind) -> bool;
     /// Generates the answer at temperature 0. Must return `Err(Cancelled)` soon after `cancel` is
     /// set and `Err(Timeout)` once `request.budget_ms` has passed after the model was ready; the
     /// adapter enforces both (G5).

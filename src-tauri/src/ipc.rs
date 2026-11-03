@@ -336,6 +336,12 @@ pub fn delete_model(app: AppHandle, services: Services<'_>, id: String) -> Resul
     if services.inference().loaded_model() == Some(id.as_str()) {
         services.inference().unload();
     }
+    // A refine model stays mapped by its sidecar after the file is gone: stop the sidecars, so
+    // the next translation reports the missing model instead of using a deleted file.
+    if catalog::find(&id).is_some_and(|m| m.role == catalog::Role::Refinement) {
+        let refiner = services.refiner().clone();
+        tauri::async_runtime::spawn_blocking(move || refiner.stop_all());
+    }
     let result = services
         .models()
         .delete(&id)

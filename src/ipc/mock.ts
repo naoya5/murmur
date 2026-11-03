@@ -84,7 +84,18 @@ let settings: Settings = {
   annotations_enabled: params.has("annotations"),
   annotations_hotkey: "Option+Shift+KeyS",
   annotations_retention_days: 7,
+  translate_enabled: params.has("translate"),
+  translate_hotkey: "Alt+Shift+KeyE",
 };
+
+/** A history row without a model step. */
+const NO_REFINE = {
+  refine_kind: null,
+  refine_status: null,
+  pre_refine_text: null,
+  refine_model_id: null,
+  refine_ms: null,
+} as const;
 
 const JA_TEXTS = [
   "明日の打ち合わせは午後三時からに変更になりました。資料は前日までに共有します。",
@@ -125,6 +136,7 @@ function makeHistory(): TranscriptRow[] {
       asr_ms: failed ? null : 300 + Math.round(rand() * 400),
       audio_path: failed ? "/tmp/spool/x.pcm" : null,
       error: failed ? (i === 2 ? "timeout" : "model_missing") : null,
+      ...NO_REFINE,
     });
   }
   return rows;
@@ -566,6 +578,7 @@ function simulateDictation(): void {
         asr_ms: 410,
         audio_path: null,
         error: null,
+        ...NO_REFINE,
       },
       ...history,
     ];
