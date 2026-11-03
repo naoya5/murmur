@@ -216,6 +216,7 @@ const catalog: ModelEntry[] = [
       punctuation: true,
       language_id: false,
     },
+    tasks: [],
   },
   {
     id: "haas-ja-v1.0-q5_k",
@@ -237,6 +238,7 @@ const catalog: ModelEntry[] = [
       punctuation: true,
       language_id: false,
     },
+    tasks: [],
   },
   {
     id: "parakeet-tdt-0.6b-v3-q8_0",
@@ -259,6 +261,7 @@ const catalog: ModelEntry[] = [
       punctuation: true,
       language_id: false,
     },
+    tasks: [],
   },
   {
     id: "qwen3-asr-0.6b-q8_0",
@@ -280,6 +283,7 @@ const catalog: ModelEntry[] = [
       punctuation: true,
       language_id: true,
     },
+    tasks: [],
   },
   {
     id: "silero-vad-v6.2",
@@ -301,6 +305,7 @@ const catalog: ModelEntry[] = [
       punctuation: false,
       language_id: false,
     },
+    tasks: [],
   },
 ];
 

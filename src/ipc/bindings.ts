@@ -298,7 +298,11 @@ export type CopyReason = "auto_paste_off" | "no_accessibility" | "secure_input" 
  * The app the annotation was started in is not in front (it quit, or macOS refused to
  * bring it back), so nothing was pasted anywhere else.
  */
-"target_not_in_front"
+"target_not_in_front" | 
+/**
+ * The translation failed: the Japanese is on the clipboard and nothing was pasted (C5).
+ */
+"refine_failed"
 /**
  * Everything the Home screen shows.
  */
@@ -405,7 +409,11 @@ export type Family =
 /**
  * Silero voice activity detection.
  */
-"silero_vad"
+"silero_vad" | 
+/**
+ * A chat LLM in GGUF, run by the murmur-llm sidecar (llama.cpp), never in the app process.
+ */
+"llm"
 /**
  * The history changed (insert, update, delete). The UI reloads what it shows.
  */
@@ -434,7 +442,11 @@ export type ModelEntry = { id: string; display_name: string; family: Family; rol
 /**
  * Credit text that must be shown (CC-BY models). Empty when none is required.
  */
-attribution: string; capabilities: Capabilities }
+attribution: string; capabilities: Capabilities; 
+/**
+ * What a `Role::Refinement` model does. Empty for every other role.
+ */
+tasks: RefineKind[] }
 /**
  * A catalog entry with its state on this Mac.
  */
@@ -514,7 +526,11 @@ annotation?: AnnotationPill | null }
 /**
  * What the pill shows. Derived from the state; the controller emits it after every step.
  */
-export type PillView = { kind: "hidden" } | { kind: "recording"; elapsed_ms: number; mode: RecordMode } | { kind: "cancel_pending"; remaining_ms: number; from_recording: boolean } | { kind: "transcribing" } | { kind: "delivering" } | { kind: "notice"; notice: Notice }
+export type PillView = { kind: "hidden" } | { kind: "recording"; elapsed_ms: number; mode: RecordMode } | { kind: "cancel_pending"; remaining_ms: number; from_recording: boolean } | { kind: "transcribing" } | 
+/**
+ * A model is cleaning or translating the text.
+ */
+{ kind: "refining"; task: RefineKind } | { kind: "delivering" } | { kind: "notice"; notice: Notice }
 /**
  * Which pane of System Settings > Privacy & Security to open.
  */
@@ -528,8 +544,24 @@ export type RecordMode =
  * Record while the hotkey is held.
  */
 "push_to_talk"
+/**
+ * What a model does with the text. Also the history's `refine_kind` and the catalog's tasks.
+ */
+export type RefineKind = 
+/**
+ * Light cleanup of Japanese: fillers, self-corrections, punctuation, marked lists.
+ */
+"clean" | 
+/**
+ * Japanese to English (`TRANSLATE_FROM` to `TRANSLATE_TO`).
+ */
+"translate"
 export type RetryError = { kind: "not_found" } | { kind: "audio_missing" } | { kind: "model_missing" } | { kind: "no_speech" } | { kind: "failed"; message: string }
-export type Role = "recognition" | "voice_detection"
+export type Role = "recognition" | "voice_detection" | 
+/**
+ * The refine step after the text rules (`tasks` says which).
+ */
+"refinement"
 /**
  * All user settings. Stored in `settings.json`.
  */

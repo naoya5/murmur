@@ -34,7 +34,8 @@
 //! Every other (state, event) pair is ignored. In push-to-talk, `HotkeyDown` while recording is
 //! key repeat and is ignored; after a resume with the key already up, press and release stops. A result or timer that carries an id other than
 //! the current one is stale and ignored. Esc is captured exactly while the state is Recording,
-//! CancelPending, Transcribing or Composing, so Esc reaches other apps the rest of the time.
+//! CancelPending, Transcribing, Composing or Refining, so Esc reaches other apps the rest of the
+//! time.
 //!
 //! Annotation sessions (experimental; `SessionKind::Annotation`) record the screen next to the
 //! microphone and end with a composed bundle instead of plain text. Their rows:
@@ -67,11 +68,35 @@
 //! | any annotation state but Delivering | AnnotationsDisabled    | Idle, no notice; the screen and the overlay are released, the engine cancelled, DropAll |
 //!
 //! Every dictation row above is unchanged by the annotation rows.
+//!
+//! Refine (experimental, `refine.rs`): a dictation may carry a refine kind, chosen at the
+//! hotkey press and fixed for the recording like the language (`HotkeyDown { refine }`; the
+//! translation hotkey sends `Some(Translate)` and records Japanese). Its rows:
+//!
+//! | State                      | Event                          | Next / effects                                   |
+//! |----------------------------|--------------------------------|--------------------------------------------------|
+//! | Idle                       | HotkeyDown(refine: Some(k))    | Recording(refine k); StartCapture, SetEscCapture(true), max timer, WarmRefiner(k) |
+//! | Recording / CancelPending(Rec) | HotkeyDown / HotkeyUp (any refine) | as without refine; the kind does not change  |
+//! | Transcribing(Clean)        | Transcribed(Text) short or long (`refine::clean_gate`) | Delivering; Deliver(rule text), refine Skipped |
+//! | Transcribing(Some(k))      | Transcribed(Text)              | Refining; Refine(k, rule text), refine timer (`refine::timeout_ms`) |
+//! | Refining                   | Refined(Text)                  | Delivering; SetEscCapture(false), Deliver(refined), refine Ok |
+//! | Refining(Clean)            | Refined(Failed / TimedOut) / refine timer | Delivering; Deliver(rule text), refine Failed / Timeout; the timer also CancelRefine |
+//! | Refining(Translate)        | Refined(Failed / TimedOut) / refine timer | Delivering; Deliver(Japanese, copy only: RefineFailed), refine Failed / Timeout |
+//! | Refining / CancelPending(Ref) | RefinerLoading              | the refine timer re-armed once with the 60 s load budget |
+//! | Refining                   | Esc                            | CancelPending(from Refining); the refine keeps running |
+//! | CancelPending(Ref)         | Refined / refine timer         | stays; the outcome is held (the timer also CancelRefine) |
+//! | CancelPending(Ref)         | Esc / PillClicked              | the held outcome is handled, or back to Refining |
+//! | CancelPending(Ref)         | 3 s timer                      | Idle; CancelRefine, DropAudio                    |
+//! | any state of kind k but Delivering | RefineDisabled(k)      | Idle, no notice; capture stopped, engine / refiner cancelled, DropAudio |
+//! | Transcribing / Refining / Delivering | HotkeyDown            | ignored                                          |
+//!
+//! Leaving the refine phase always delivers or emits `CancelRefine`; the randomized test checks it.
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
 use crate::Millis;
+use crate::refine::{self, CleanGate, RefineKind, RefineStatus};
 use crate::settings::RecordMode;
 
 pub const CANCEL_WINDOW_MS: Millis = 3_000;
@@ -163,6 +188,8 @@ pub enum CopyReason {
     /// The app the annotation was started in is not in front (it quit, or macOS refused to
     /// bring it back), so nothing was pasted anywhere else.
     TargetNotInFront,
+    /// The translation failed: the Japanese is on the clipboard and nothing was pasted (C5).
+    RefineFailed,
 }
 
 /// What the output adapter did with the text.
@@ -204,6 +231,16 @@ pub enum ComposeWords {
     None,
     /// The transcription failed; the summary says so in place of the words.
     Failed,
+}
+
+/// What the refiner produced for a session (`refine::run`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefineOutcome {
+    Text(TranscriptText),
+    /// The model failed, was unavailable, or its answer broke a validation rule.
+    Failed,
+    /// A step's own budget ran out before the machine's timer.
+    TimedOut,
 }
 
 /// What the compose step produced.
@@ -287,9 +324,12 @@ impl Notice {
 /// Inputs to the state machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// The main hotkey went down. `mode` is read from settings at the moment of the press.
+    /// The main hotkey (or the alternate language or translation hotkey) went down. `mode` is
+    /// read from settings at the moment of the press; `refine` is what the key asks for (the
+    /// translation hotkey: `Some(Translate)`). Both are fixed for the recording it starts.
     HotkeyDown {
         mode: RecordMode,
+        refine: Option<RefineKind>,
     },
     /// The main hotkey went up (only push-to-talk uses it).
     HotkeyUp,
@@ -340,6 +380,21 @@ pub enum Event {
     /// The user switched the feature off: an annotation session in progress ends at once and
     /// keeps nothing. A delivery in flight finishes. Dictation sessions ignore it.
     AnnotationsDisabled,
+    /// `Effect::Refine` is done (or gave up).
+    Refined {
+        session: SessionId,
+        outcome: RefineOutcome,
+    },
+    /// The refiner has to start a sidecar or load a model first: the refine timer is re-armed
+    /// once with the model load budget added, so a cold start is not reported as a failure.
+    RefinerLoading {
+        session: SessionId,
+    },
+    /// The user switched a refine feature off: a session of that kind in progress ends at once
+    /// and keeps nothing. A delivery in flight finishes; other sessions ignore it.
+    RefineDisabled {
+        kind: RefineKind,
+    },
 }
 
 /// Instructions for the controller. Executed in order.
@@ -368,15 +423,20 @@ pub enum Effect {
     CancelTranscription {
         session: SessionId,
     },
-    /// Put the text on the clipboard and paste it, then report `Event::Delivered`.
+    /// Put the text on the clipboard and paste it, then report `Event::Delivered`. With
+    /// `copy_only` the text only goes to the clipboard and the outcome is `Copied` with that
+    /// reason.
     Deliver {
         session: SessionId,
         text: TranscriptText,
+        copy_only: Option<CopyReason>,
     },
-    /// After delivery: write history and daily stats, delete the spool file.
+    /// After delivery: write history and daily stats, delete the spool file. `refine` is how the
+    /// refine step ended (`None`: the session had none).
     SaveSuccess {
         session: SessionId,
         outcome: DeliveryOutcome,
+        refine: Option<RefineStatus>,
     },
     /// Write a failed history row and keep the audio for a retry.
     SaveFailure {
@@ -447,6 +507,25 @@ pub enum Effect {
     DropAll {
         session: SessionId,
     },
+    // --- refine (experimental) ---
+    /// Start the models this kind may need (`refine::warm_steps`) if they are not running, and
+    /// cache their fixed prompts while the user speaks.
+    WarmRefiner {
+        session: SessionId,
+        kind: RefineKind,
+    },
+    /// Run `refine::run` on the rule-formatted text, then report `Event::Refined`, and
+    /// `Event::RefinerLoading` first when a model must be started or loaded.
+    Refine {
+        session: SessionId,
+        kind: RefineKind,
+        text: TranscriptText,
+    },
+    /// The session no longer wants a refine result: stop the work in flight (if any). A late
+    /// result is stale.
+    CancelRefine {
+        session: SessionId,
+    },
 }
 
 /// What the pill shows. Derived from the state; the controller emits it after every step.
@@ -463,6 +542,10 @@ pub enum PillView {
         from_recording: bool,
     },
     Transcribing,
+    /// A model is cleaning or translating the text.
+    Refining {
+        task: RefineKind,
+    },
     Delivering,
     Notice {
         notice: Notice,
@@ -474,6 +557,8 @@ pub struct Recording {
     pub session: SessionId,
     pub kind: SessionKind,
     pub mode: RecordMode,
+    /// Chosen at the hotkey press; always `None` for an annotation.
+    pub refine: Option<RefineKind>,
     /// Recorded time before the last resume.
     pub active_before_ms: Millis,
     pub resumed_at: Millis,
@@ -502,10 +587,24 @@ pub fn max_recording_ms(kind: SessionKind) -> Millis {
 pub struct Transcribing {
     pub session: SessionId,
     pub kind: SessionKind,
+    pub refine: Option<RefineKind>,
     pub recorded_ms: Millis,
     pub timeout_timer: TimerId,
     /// Annotation only: what `PlanKeyframes` found, once `Event::Planned` arrived.
     pub plan: Option<PlanCounts>,
+}
+
+/// A dictation whose rule-formatted text is with the refiner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refining {
+    pub session: SessionId,
+    pub kind: RefineKind,
+    /// The rule-formatted text: the fallback when the refine fails.
+    pub text: TranscriptText,
+    /// `refine::timeout_ms` for the text; a model load adds `MODEL_LOAD_TIMEOUT_MS` once.
+    pub budget_ms: Millis,
+    pub timeout_timer: TimerId,
+    pub load_extended: bool,
 }
 
 /// An annotation session whose pictures and summary are being drawn.
@@ -518,13 +617,12 @@ pub struct Composing {
 /// What `Delivering` hands over, and which save follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delivery {
-    Text,
+    /// A dictation. `refine` is how its refine step ended, when it had one.
+    Text { refine: Option<RefineStatus> },
     /// An annotation without ink: the words alone, shown like a dictation, saved as a bundle.
     Words,
     /// `images` is 0 when the compose failed and only the words go out.
-    Bundle {
-        images: u32,
-    },
+    Bundle { images: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -538,6 +636,10 @@ pub enum Paused {
     Composing {
         composing: Composing,
         held: Option<ComposeOutcome>,
+    },
+    Refining {
+        refining: Refining,
+        held: Option<RefineOutcome>,
     },
 }
 
@@ -555,6 +657,7 @@ pub enum State {
     },
     Transcribing(Transcribing),
     Composing(Composing),
+    Refining(Refining),
     Delivering {
         session: SessionId,
         timer: TimerId,
@@ -599,6 +702,7 @@ impl Machine {
             }
             State::Transcribing(tx) => Some(tx.session),
             State::Composing(composing) => Some(composing.session),
+            State::Refining(refining) => Some(refining.session),
         }
     }
 
@@ -609,11 +713,24 @@ impl Machine {
             State::Recording(rec) => Some(rec.kind),
             State::Transcribing(tx) => Some(tx.kind),
             State::Composing(_) => Some(SessionKind::Annotation),
+            State::Refining(_) => Some(SessionKind::Dictation),
             State::Delivering { delivery, .. } => Some(match delivery {
-                Delivery::Text => SessionKind::Dictation,
+                Delivery::Text { .. } => SessionKind::Dictation,
                 Delivery::Words | Delivery::Bundle { .. } => SessionKind::Annotation,
             }),
             State::CancelPending { paused, .. } => Some(paused_kind(paused)),
+        }
+    }
+
+    /// The refine kind of the active session until it is delivered (the pill shows "JA -> EN"
+    /// while a translation records).
+    pub fn active_refine(&self) -> Option<RefineKind> {
+        match &self.state {
+            State::Recording(rec) => rec.refine,
+            State::Transcribing(tx) => tx.refine,
+            State::Refining(refining) => Some(refining.kind),
+            State::CancelPending { paused, .. } => paused_refine(paused),
+            State::Idle { .. } | State::Composing(_) | State::Delivering { .. } => None,
         }
     }
 
@@ -637,6 +754,7 @@ impl Machine {
                 | State::CancelPending { .. }
                 | State::Transcribing(_)
                 | State::Composing(_)
+                | State::Refining(_)
         )
     }
 
@@ -658,6 +776,9 @@ impl Machine {
             },
             // The compose step shows the same busy animation as the transcription.
             State::Transcribing(_) | State::Composing(_) => PillView::Transcribing,
+            State::Refining(refining) => PillView::Refining {
+                task: refining.kind,
+            },
             State::Delivering { .. } => PillView::Delivering,
         }
     }
@@ -692,6 +813,7 @@ impl Machine {
         &mut self,
         kind: SessionKind,
         mode: RecordMode,
+        refine: Option<RefineKind>,
         now: Millis,
         fx: &mut Vec<Effect>,
     ) -> State {
@@ -704,10 +826,14 @@ impl Machine {
         }
         fx.push(Effect::SetEscCapture(true));
         let max_timer = self.timer(max_recording_ms(kind), fx);
+        if let Some(kind) = refine {
+            fx.push(Effect::WarmRefiner { session, kind });
+        }
         State::Recording(Recording {
             session,
             kind,
             mode,
+            refine,
             active_before_ms: 0,
             resumed_at: now,
             max_timer,
@@ -720,6 +846,7 @@ impl Machine {
         &mut self,
         session: SessionId,
         kind: SessionKind,
+        refine: Option<RefineKind>,
         recorded_ms: Millis,
         fx: &mut Vec<Effect>,
     ) -> State {
@@ -739,6 +866,7 @@ impl Machine {
         State::Transcribing(Transcribing {
             session,
             kind,
+            refine,
             recorded_ms,
             timeout_timer,
             plan: None,
@@ -785,6 +913,8 @@ impl Machine {
                 fx.push(Effect::CancelTranscription { session })
             }
             Paused::Transcribing { held: Some(_), .. } | Paused::Composing { .. } => {}
+            // Also when the outcome is held: the refiner forgets the session either way.
+            Paused::Refining { .. } => fx.push(Effect::CancelRefine { session }),
         }
         fx.push(Effect::SetEscCapture(false));
         Self::drop_session(session, kind, fx);
@@ -811,24 +941,20 @@ impl Machine {
     /// Handles a transcription outcome while transcribing (or when a held one is released).
     fn finish_transcription(
         &mut self,
-        session: SessionId,
-        kind: SessionKind,
-        plan: Option<PlanCounts>,
+        tx: &Transcribing,
         outcome: TranscribeOutcome,
         fx: &mut Vec<Effect>,
     ) -> State {
-        match kind {
+        let (session, plan) = (tx.session, tx.plan);
+        match tx.kind {
             SessionKind::Dictation => match outcome {
-                TranscribeOutcome::Text(text) => {
-                    fx.push(Effect::SetEscCapture(false));
-                    fx.push(Effect::Deliver { session, text });
-                    let timer = self.timer(DELIVERY_TIMEOUT_MS, fx);
-                    State::Delivering {
-                        session,
-                        timer,
-                        delivery: Delivery::Text,
+                TranscribeOutcome::Text(text) => match tx.refine {
+                    None => self.deliver_text(session, text, None, None, fx),
+                    Some(RefineKind::Clean) if refine::clean_gate(&text.0) != CleanGate::Run => {
+                        self.deliver_text(session, text, None, Some(RefineStatus::Skipped), fx)
                     }
-                }
+                    Some(kind) => self.start_refining(session, kind, text, fx),
+                },
                 TranscribeOutcome::NoSpeech => {
                     fx.push(Effect::SetEscCapture(false));
                     fx.push(Effect::DropAudio { session });
@@ -856,6 +982,91 @@ impl Machine {
                 TranscribeOutcome::Failed(_) => self.compose(session, ComposeWords::Failed, fx),
             },
         }
+    }
+
+    /// Hands a dictation's text to the output adapter.
+    fn deliver_text(
+        &mut self,
+        session: SessionId,
+        text: TranscriptText,
+        copy_only: Option<CopyReason>,
+        refine: Option<RefineStatus>,
+        fx: &mut Vec<Effect>,
+    ) -> State {
+        fx.push(Effect::SetEscCapture(false));
+        fx.push(Effect::Deliver {
+            session,
+            text,
+            copy_only,
+        });
+        let timer = self.timer(DELIVERY_TIMEOUT_MS, fx);
+        State::Delivering {
+            session,
+            timer,
+            delivery: Delivery::Text { refine },
+        }
+    }
+
+    /// Sends the rule-formatted text to the refiner. Esc stays captured.
+    fn start_refining(
+        &mut self,
+        session: SessionId,
+        kind: RefineKind,
+        text: TranscriptText,
+        fx: &mut Vec<Effect>,
+    ) -> State {
+        let budget_ms = refine::timeout_ms(kind, &text.0);
+        fx.push(Effect::Refine {
+            session,
+            kind,
+            text: text.clone(),
+        });
+        let timeout_timer = self.timer(budget_ms, fx);
+        State::Refining(Refining {
+            session,
+            kind,
+            text,
+            budget_ms,
+            timeout_timer,
+            load_extended: false,
+        })
+    }
+
+    /// Re-arms the refine timer once with the model load budget added.
+    fn extend_for_refiner_load(&mut self, refining: Refining, fx: &mut Vec<Effect>) -> Refining {
+        if refining.load_extended {
+            return refining;
+        }
+        let timeout_timer = self.timer(refine::REFINER_LOAD_TIMEOUT_MS + refining.budget_ms, fx);
+        Refining {
+            timeout_timer,
+            load_extended: true,
+            ..refining
+        }
+    }
+
+    /// Handles a refine outcome while refining (or when a held one is released). A failed
+    /// cleanup delivers the rule text; a failed translation copies the Japanese without pasting
+    /// it (C5).
+    fn finish_refining(
+        &mut self,
+        refining: Refining,
+        outcome: RefineOutcome,
+        fx: &mut Vec<Effect>,
+    ) -> State {
+        let session = refining.session;
+        let status = match outcome {
+            RefineOutcome::Text(text) => {
+                return self.deliver_text(session, text, None, Some(RefineStatus::Ok), fx);
+            }
+            RefineOutcome::Failed => RefineStatus::Failed,
+            RefineOutcome::TimedOut => RefineStatus::Timeout,
+        };
+        let copy_only = match refining.kind {
+            RefineKind::Clean => None,
+            RefineKind::Translate => Some(CopyReason::RefineFailed),
+        };
+        self.deliver_text(session, refining.text, copy_only, Some(status), fx)
     }
 
     fn compose(&mut self, session: SessionId, words: ComposeWords, fx: &mut Vec<Effect>) -> State {
@@ -905,8 +1116,12 @@ impl Machine {
         fx: &mut Vec<Effect>,
     ) -> State {
         match delivery {
-            Delivery::Text => {
-                fx.push(Effect::SaveSuccess { session, outcome });
+            Delivery::Text { refine } => {
+                fx.push(Effect::SaveSuccess {
+                    session,
+                    outcome,
+                    refine,
+                });
                 self.idle_with(Some(Notice::Delivered { outcome }), fx)
             }
             Delivery::Words => {
@@ -929,11 +1144,11 @@ impl Machine {
     ) -> State {
         match state {
             State::Idle { notice } => match event {
-                Event::HotkeyDown { mode } => {
-                    self.start_recording(SessionKind::Dictation, mode, now, fx)
+                Event::HotkeyDown { mode, refine } => {
+                    self.start_recording(SessionKind::Dictation, mode, refine, now, fx)
                 }
                 Event::AnnotationsHotkey => {
-                    self.start_recording(SessionKind::Annotation, RecordMode::Toggle, now, fx)
+                    self.start_recording(SessionKind::Annotation, RecordMode::Toggle, None, now, fx)
                 }
                 Event::AnnotationsRefused { reason } => {
                     self.idle_with(Some(Notice::AnnotationsRefused { reason }), fx)
@@ -948,25 +1163,55 @@ impl Machine {
                 Event::HotkeyDown { .. }
                     if rec.kind == SessionKind::Dictation && rec.mode == RecordMode::Toggle =>
                 {
-                    self.stop_and_transcribe(rec.session, rec.kind, rec.recorded_ms(now), fx)
+                    self.stop_and_transcribe(
+                        rec.session,
+                        rec.kind,
+                        rec.refine,
+                        rec.recorded_ms(now),
+                        fx,
+                    )
                 }
                 Event::HotkeyUp
                     if rec.kind == SessionKind::Dictation && rec.mode == RecordMode::PushToTalk =>
                 {
-                    self.stop_and_transcribe(rec.session, rec.kind, rec.recorded_ms(now), fx)
+                    self.stop_and_transcribe(
+                        rec.session,
+                        rec.kind,
+                        rec.refine,
+                        rec.recorded_ms(now),
+                        fx,
+                    )
                 }
-                Event::AnnotationsHotkey if rec.kind == SessionKind::Annotation => {
-                    self.stop_and_transcribe(rec.session, rec.kind, rec.recorded_ms(now), fx)
-                }
-                Event::PillClicked => {
-                    self.stop_and_transcribe(rec.session, rec.kind, rec.recorded_ms(now), fx)
-                }
-                Event::TimerFired(id) if id == rec.max_timer => {
-                    self.stop_and_transcribe(rec.session, rec.kind, rec.recorded_ms(now), fx)
-                }
-                Event::MicDisconnected { session } if session == rec.session => {
-                    self.stop_and_transcribe(rec.session, rec.kind, rec.recorded_ms(now), fx)
-                }
+                Event::AnnotationsHotkey if rec.kind == SessionKind::Annotation => self
+                    .stop_and_transcribe(
+                        rec.session,
+                        rec.kind,
+                        rec.refine,
+                        rec.recorded_ms(now),
+                        fx,
+                    ),
+                Event::PillClicked => self.stop_and_transcribe(
+                    rec.session,
+                    rec.kind,
+                    rec.refine,
+                    rec.recorded_ms(now),
+                    fx,
+                ),
+                Event::TimerFired(id) if id == rec.max_timer => self.stop_and_transcribe(
+                    rec.session,
+                    rec.kind,
+                    rec.refine,
+                    rec.recorded_ms(now),
+                    fx,
+                ),
+                Event::MicDisconnected { session } if session == rec.session => self
+                    .stop_and_transcribe(
+                        rec.session,
+                        rec.kind,
+                        rec.refine,
+                        rec.recorded_ms(now),
+                        fx,
+                    ),
                 Event::ScreenFailed { session }
                     if session == rec.session && rec.kind == SessionKind::Annotation =>
                 {
@@ -1001,6 +1246,9 @@ impl Machine {
                 Event::AnnotationsDisabled if rec.kind == SessionKind::Annotation => {
                     Self::abandon_paused(rec.session, Paused::Recording(rec), fx)
                 }
+                Event::RefineDisabled { kind } if rec.refine == Some(kind) => {
+                    Self::abandon_paused(rec.session, Paused::Recording(rec), fx)
+                }
                 _ => State::Recording(rec),
             },
 
@@ -1019,16 +1267,14 @@ impl Machine {
                     self.idle_with(Some(Notice::CaptureFailed { error }), fx)
                 }
                 Event::Transcribed { session, outcome } if session == tx.session => {
-                    self.finish_transcription(session, tx.kind, tx.plan, outcome, fx)
+                    self.finish_transcription(&tx, outcome, fx)
                 }
                 Event::TimerFired(id) if id == tx.timeout_timer => {
                     fx.push(Effect::CancelTranscription {
                         session: tx.session,
                     });
                     self.finish_transcription(
-                        tx.session,
-                        tx.kind,
-                        tx.plan,
+                        &tx,
                         TranscribeOutcome::Failed(FailureKind::Timeout),
                         fx,
                     )
@@ -1051,7 +1297,46 @@ impl Machine {
                 Event::AnnotationsDisabled if tx.kind == SessionKind::Annotation => {
                     Self::abandon_paused(tx.session, Paused::Transcribing { tx, held: None }, fx)
                 }
+                Event::RefineDisabled { kind } if tx.refine == Some(kind) => {
+                    Self::abandon_paused(tx.session, Paused::Transcribing { tx, held: None }, fx)
+                }
                 _ => State::Transcribing(tx),
+            },
+
+            State::Refining(refining) => match event {
+                Event::Refined { session, outcome } if session == refining.session => {
+                    self.finish_refining(refining, outcome, fx)
+                }
+                Event::TimerFired(id) if id == refining.timeout_timer => {
+                    fx.push(Effect::CancelRefine {
+                        session: refining.session,
+                    });
+                    self.finish_refining(refining, RefineOutcome::TimedOut, fx)
+                }
+                Event::RefinerLoading { session } if session == refining.session => {
+                    State::Refining(self.extend_for_refiner_load(refining, fx))
+                }
+                Event::Esc => {
+                    let session = refining.session;
+                    self.pause(
+                        session,
+                        Paused::Refining {
+                            refining,
+                            held: None,
+                        },
+                        now,
+                        fx,
+                    )
+                }
+                Event::RefineDisabled { kind } if kind == refining.kind => Self::abandon_paused(
+                    refining.session,
+                    Paused::Refining {
+                        refining,
+                        held: None,
+                    },
+                    fx,
+                ),
+                _ => State::Refining(refining),
             },
 
             State::Composing(composing) => match event {
@@ -1128,11 +1413,20 @@ impl Machine {
             {
                 Self::abandon_paused(session, paused, fx)
             }
+            (paused, Event::RefineDisabled { kind }) if paused_refine(&paused) == Some(kind) => {
+                Self::abandon_paused(session, paused, fx)
+            }
 
             // Undo while recording: resume, or transcribe if the microphone went away.
             (Paused::Recording(rec), Event::Esc | Event::PillClicked) => {
                 if rec.mic_lost {
-                    return self.stop_and_transcribe(session, rec.kind, rec.active_before_ms, fx);
+                    return self.stop_and_transcribe(
+                        session,
+                        rec.kind,
+                        rec.refine,
+                        rec.active_before_ms,
+                        fx,
+                    );
                 }
                 fx.push(Effect::ResumeCapture { session });
                 if rec.kind == SessionKind::Annotation {
@@ -1149,12 +1443,12 @@ impl Machine {
             (Paused::Recording(rec), Event::HotkeyDown { .. })
                 if rec.kind == SessionKind::Dictation =>
             {
-                self.stop_and_transcribe(session, rec.kind, rec.active_before_ms, fx)
+                self.stop_and_transcribe(session, rec.kind, rec.refine, rec.active_before_ms, fx)
             }
             (Paused::Recording(rec), Event::AnnotationsHotkey)
                 if rec.kind == SessionKind::Annotation =>
             {
-                self.stop_and_transcribe(session, rec.kind, rec.active_before_ms, fx)
+                self.stop_and_transcribe(session, rec.kind, rec.refine, rec.active_before_ms, fx)
             }
             (Paused::Recording(rec), Event::MicDisconnected { session: s }) if same(s) => {
                 State::CancelPending {
@@ -1254,7 +1548,7 @@ impl Machine {
                 }
             }
             (Paused::Transcribing { tx, held }, Event::Esc | Event::PillClicked) => match held {
-                Some(outcome) => self.finish_transcription(session, tx.kind, tx.plan, outcome, fx),
+                Some(outcome) => self.finish_transcription(&tx, outcome, fx),
                 None => State::Transcribing(tx),
             },
 
@@ -1299,6 +1593,63 @@ impl Machine {
                 }
             }
 
+            // While refining: the same, with the refine outcome held.
+            (
+                Paused::Refining {
+                    refining,
+                    held: None,
+                },
+                Event::Refined {
+                    session: s,
+                    outcome,
+                },
+            ) if same(s) => State::CancelPending {
+                session,
+                timer,
+                deadline,
+                paused: Paused::Refining {
+                    refining,
+                    held: Some(outcome),
+                },
+            },
+            (
+                Paused::Refining {
+                    refining,
+                    held: None,
+                },
+                Event::TimerFired(id),
+            ) if id == refining.timeout_timer => {
+                fx.push(Effect::CancelRefine { session });
+                State::CancelPending {
+                    session,
+                    timer,
+                    deadline,
+                    paused: Paused::Refining {
+                        refining,
+                        held: Some(RefineOutcome::TimedOut),
+                    },
+                }
+            }
+            (
+                Paused::Refining {
+                    refining,
+                    held: None,
+                },
+                Event::RefinerLoading { session: s },
+            ) if same(s) => State::CancelPending {
+                session,
+                timer,
+                deadline,
+                paused: Paused::Refining {
+                    refining: self.extend_for_refiner_load(refining, fx),
+                    held: None,
+                },
+            },
+            (Paused::Refining { refining, held }, Event::Esc | Event::PillClicked) => match held {
+                Some(outcome) => self.finish_refining(refining, outcome, fx),
+                None => State::Refining(refining),
+            },
+
             (paused, _) => State::CancelPending {
                 session,
                 timer,
@@ -1314,6 +1665,16 @@ fn paused_kind(paused: &Paused) -> SessionKind {
         Paused::Recording(rec) => rec.kind,
         Paused::Transcribing { tx, .. } => tx.kind,
         Paused::Composing { .. } => SessionKind::Annotation,
+        Paused::Refining { .. } => SessionKind::Dictation,
+    }
+}
+
+fn paused_refine(paused: &Paused) -> Option<RefineKind> {
+    match paused {
+        Paused::Recording(rec) => rec.refine,
+        Paused::Transcribing { tx, .. } => tx.refine,
+        Paused::Composing { .. } => None,
+        Paused::Refining { refining, .. } => Some(refining.kind),
     }
 }
 
@@ -1329,9 +1690,11 @@ mod tests {
     const STALE_TIMER: TimerId = TimerId(9_999);
     const TOGGLE: Event = Event::HotkeyDown {
         mode: RecordMode::Toggle,
+        refine: None,
     };
     const PTT: Event = Event::HotkeyDown {
         mode: RecordMode::PushToTalk,
+        refine: None,
     };
 
     fn text(s: &str) -> TranscriptText {
@@ -1436,7 +1799,7 @@ mod tests {
 
     fn recording(mode: RecordMode) -> Harness {
         let mut h = Harness::new();
-        let fx = h.step(Event::HotkeyDown { mode });
+        let fx = h.step(Event::HotkeyDown { mode, refine: None });
         assert!(matches!(h.state(), State::Recording(_)), "{fx:?}");
         h
     }
@@ -1648,6 +2011,7 @@ mod tests {
             &State::Transcribing(Transcribing {
                 session: S1,
                 kind: SessionKind::Dictation,
+                refine: None,
                 recorded_ms: 10_000,
                 timeout_timer: timeout,
                 plan: None,
@@ -1983,6 +2347,7 @@ mod tests {
                 Effect::Deliver {
                     session: S1,
                     text: text("hello"),
+                    copy_only: None,
                 },
                 arm(delivery, DELIVERY_TIMEOUT_MS),
             ]
@@ -1992,7 +2357,7 @@ mod tests {
             &State::Delivering {
                 session: S1,
                 timer: delivery,
-                delivery: Delivery::Text,
+                delivery: Delivery::Text { refine: None },
             }
         );
         assert_eq!(h.view(), PillView::Delivering);
@@ -2184,6 +2549,7 @@ mod tests {
                 Effect::Deliver {
                     session: S1,
                     text: text("kept"),
+                    copy_only: None,
                 },
                 arm(delivery, DELIVERY_TIMEOUT_MS),
             ]
@@ -2315,6 +2681,7 @@ mod tests {
             &State::Transcribing(Transcribing {
                 session: S1,
                 kind: SessionKind::Dictation,
+                refine: None,
                 recorded_ms: 5_000,
                 timeout_timer: timeout,
                 plan: None,
@@ -2376,7 +2743,8 @@ mod tests {
                 vec![
                     Effect::SaveSuccess {
                         session: S1,
-                        outcome
+                        outcome,
+                        refine: None,
                     },
                     arm(notice, notice_ms),
                 ],
@@ -2401,7 +2769,8 @@ mod tests {
             fx[0],
             Effect::SaveSuccess {
                 session: S1,
-                outcome: DeliveryOutcome::Unconfirmed
+                outcome: DeliveryOutcome::Unconfirmed,
+                refine: None,
             }
         );
         timer_for(&fx, NOTICE_ERROR_MS);
@@ -2861,6 +3230,7 @@ mod tests {
                 &State::Transcribing(Transcribing {
                     session: S1,
                     kind: SessionKind::Annotation,
+                    refine: None,
                     recorded_ms: 10_000,
                     timeout_timer: timeout,
                     plan: None,
@@ -3767,6 +4137,534 @@ mod tests {
         assert!(fx.contains(&Effect::StartCapture { session: S2 }));
     }
 
+    // --- refine (experimental) ---
+
+    const MARKED: &str = "あの、明日の打ち合わせは三時からです。";
+
+    fn hotkey(mode: RecordMode, refine: Option<RefineKind>) -> Event {
+        Event::HotkeyDown { mode, refine }
+    }
+
+    fn refined(session: SessionId, outcome: RefineOutcome) -> Event {
+        Event::Refined { session, outcome }
+    }
+
+    /// Recording with a refine kind (toggle).
+    fn recording_refine(kind: RefineKind) -> Harness {
+        let mut h = Harness::new();
+        h.step(hotkey(RecordMode::Toggle, Some(kind)));
+        h
+    }
+
+    /// Transcribed `said` in a session of `kind`; returns the effects of the transcription.
+    fn transcribed_refine(kind: RefineKind, said: &str) -> (Harness, Vec<Effect>) {
+        let mut h = recording_refine(kind);
+        h.advance(4_000);
+        h.step(TOGGLE);
+        h.advance(150);
+        let fx = h.step(transcribed(S1, TranscribeOutcome::Text(text(said))));
+        (h, fx)
+    }
+
+    fn refining(kind: RefineKind, said: &str) -> Harness {
+        let (h, _) = transcribed_refine(kind, said);
+        assert!(matches!(h.state(), State::Refining(_)), "{:?}", h.state());
+        h
+    }
+
+    fn refine_timer(h: &Harness) -> TimerId {
+        match h.state() {
+            State::Refining(r) => r.timeout_timer,
+            State::CancelPending {
+                paused: Paused::Refining { refining, .. },
+                ..
+            } => refining.timeout_timer,
+            other => panic!("not refining: {other:?}"),
+        }
+    }
+
+    fn deliver(said: &str, copy_only: Option<CopyReason>) -> Effect {
+        Effect::Deliver {
+            session: S1,
+            text: text(said),
+            copy_only,
+        }
+    }
+
+    #[test]
+    fn a_refine_hotkey_records_and_warms_the_refiner() {
+        let mut h = Harness::new();
+        let fx = h.step(hotkey(RecordMode::Toggle, Some(RefineKind::Translate)));
+        let max = timer_for(&fx, MAX_RECORDING_MS);
+        assert_eq!(
+            fx,
+            vec![
+                Effect::StartCapture { session: S1 },
+                Effect::SetEscCapture(true),
+                arm(max, MAX_RECORDING_MS),
+                Effect::WarmRefiner {
+                    session: S1,
+                    kind: RefineKind::Translate,
+                },
+            ]
+        );
+        assert!(matches!(
+            h.state(),
+            State::Recording(Recording {
+                refine: Some(RefineKind::Translate),
+                ..
+            })
+        ));
+        assert_eq!(h.m.active_refine(), Some(RefineKind::Translate));
+        // A plain dictation warms nothing.
+        let mut h = Harness::new();
+        let fx = h.step(TOGGLE);
+        assert!(!fx.iter().any(|f| matches!(f, Effect::WarmRefiner { .. })));
+        assert_eq!(h.m.active_refine(), None);
+    }
+
+    #[test]
+    fn any_hotkey_stops_a_refine_recording_and_the_kind_stays() {
+        // Toggle: a press of another key (no refine, or another kind) stops it.
+        for press in [
+            hotkey(RecordMode::Toggle, None),
+            hotkey(RecordMode::Toggle, Some(RefineKind::Clean)),
+            hotkey(RecordMode::Toggle, Some(RefineKind::Translate)),
+        ] {
+            let mut h = recording_refine(RefineKind::Translate);
+            h.advance(2_000);
+            let fx = h.step(press);
+            assert!(fx.contains(&Effect::Transcribe { session: S1 }), "{fx:?}");
+            assert!(matches!(
+                h.state(),
+                State::Transcribing(Transcribing {
+                    refine: Some(RefineKind::Translate),
+                    ..
+                })
+            ));
+        }
+        // Push-to-talk: key repeat is ignored, the release stops.
+        let mut h = Harness::new();
+        h.step(hotkey(RecordMode::PushToTalk, Some(RefineKind::Translate)));
+        assert_eq!(
+            h.step(hotkey(RecordMode::PushToTalk, Some(RefineKind::Translate))),
+            vec![]
+        );
+        h.advance(1_000);
+        let fx = h.step(Event::HotkeyUp);
+        assert!(fx.contains(&Effect::Transcribe { session: S1 }));
+        assert_eq!(h.m.active_refine(), Some(RefineKind::Translate));
+    }
+
+    #[test]
+    fn a_hotkey_after_esc_while_recording_keeps_the_kind() {
+        let mut h = recording_refine(RefineKind::Translate);
+        h.advance(2_000);
+        h.step(Event::Esc);
+        assert_eq!(h.m.active_refine(), Some(RefineKind::Translate));
+        let fx = h.step(TOGGLE);
+        assert!(fx.contains(&Effect::Transcribe { session: S1 }));
+        assert!(matches!(
+            h.state(),
+            State::Transcribing(Transcribing {
+                refine: Some(RefineKind::Translate),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_short_or_long_cleanup_skips_the_model() {
+        let long = "長".repeat(refine::CLEAN_MAX_CHARS + 1);
+        for said in ["了解です。", long.as_str()] {
+            let (mut h, fx) = transcribed_refine(RefineKind::Clean, said);
+            let delivery = timer_for(&fx, DELIVERY_TIMEOUT_MS);
+            assert_eq!(
+                fx,
+                vec![
+                    Effect::SetEscCapture(false),
+                    deliver(said, None),
+                    arm(delivery, DELIVERY_TIMEOUT_MS),
+                ]
+            );
+            let fx = h.step(delivered(S1, DeliveryOutcome::Pasted));
+            assert_eq!(
+                fx[0],
+                Effect::SaveSuccess {
+                    session: S1,
+                    outcome: DeliveryOutcome::Pasted,
+                    refine: Some(RefineStatus::Skipped),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_marked_cleanup_and_every_translation_go_to_the_refiner() {
+        for (kind, said) in [
+            (RefineKind::Clean, MARKED),
+            (RefineKind::Translate, MARKED),
+            (RefineKind::Translate, "了解です。"),
+        ] {
+            let (h, fx) = transcribed_refine(kind, said);
+            let budget = refine::timeout_ms(kind, said);
+            let timer = timer_for(&fx, budget);
+            assert_eq!(
+                fx,
+                vec![
+                    Effect::Refine {
+                        session: S1,
+                        kind,
+                        text: text(said),
+                    },
+                    arm(timer, budget),
+                ],
+                "{kind:?}"
+            );
+            assert_eq!(
+                h.state(),
+                &State::Refining(Refining {
+                    session: S1,
+                    kind,
+                    text: text(said),
+                    budget_ms: budget,
+                    timeout_timer: timer,
+                    load_extended: false,
+                })
+            );
+            assert_eq!(h.view(), PillView::Refining { task: kind });
+            assert!(h.m.wants_esc(), "Esc stays captured while refining");
+            assert_eq!(h.m.active_session(), Some(S1));
+            assert_eq!(h.m.active_kind(), Some(SessionKind::Dictation));
+        }
+    }
+
+    #[test]
+    fn no_speech_and_failures_of_a_refine_session_behave_like_dictation() {
+        let mut h = recording_refine(RefineKind::Translate);
+        h.step(TOGGLE);
+        let fx = h.step(transcribed(S1, TranscribeOutcome::NoSpeech));
+        assert!(fx.contains(&Effect::DropAudio { session: S1 }));
+        let mut h = recording_refine(RefineKind::Translate);
+        h.step(TOGGLE);
+        let fx = h.step(transcribed(
+            S1,
+            TranscribeOutcome::Failed(FailureKind::Engine),
+        ));
+        assert!(fx.contains(&Effect::SaveFailure {
+            session: S1,
+            failure: FailureKind::Engine,
+        }));
+        assert!(!fx.iter().any(|f| matches!(f, Effect::Refine { .. })));
+    }
+
+    #[test]
+    fn a_refined_text_is_delivered_and_saved_as_ok() {
+        for kind in [RefineKind::Clean, RefineKind::Translate] {
+            let mut h = refining(kind, MARKED);
+            let fx = h.step(refined(S1, RefineOutcome::Text(text("refined"))));
+            let delivery = timer_for(&fx, DELIVERY_TIMEOUT_MS);
+            assert_eq!(
+                fx,
+                vec![
+                    Effect::SetEscCapture(false),
+                    deliver("refined", None),
+                    arm(delivery, DELIVERY_TIMEOUT_MS),
+                ]
+            );
+            let fx = h.step(delivered(S1, DeliveryOutcome::Pasted));
+            assert_eq!(
+                fx[0],
+                Effect::SaveSuccess {
+                    session: S1,
+                    outcome: DeliveryOutcome::Pasted,
+                    refine: Some(RefineStatus::Ok),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_cleanup_delivers_the_rule_text() {
+        for (outcome, status) in [
+            (RefineOutcome::Failed, RefineStatus::Failed),
+            (RefineOutcome::TimedOut, RefineStatus::Timeout),
+        ] {
+            let mut h = refining(RefineKind::Clean, MARKED);
+            let fx = h.step(refined(S1, outcome));
+            assert_eq!(
+                fx[..2],
+                [Effect::SetEscCapture(false), deliver(MARKED, None)]
+            );
+            assert_eq!(
+                h.state(),
+                &State::Delivering {
+                    session: S1,
+                    timer: timer_for(&fx, DELIVERY_TIMEOUT_MS),
+                    delivery: Delivery::Text {
+                        refine: Some(status)
+                    },
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_translation_copies_the_japanese_and_says_so() {
+        let mut h = refining(RefineKind::Translate, MARKED);
+        let fx = h.step(refined(S1, RefineOutcome::Failed));
+        assert_eq!(
+            fx[..2],
+            [
+                Effect::SetEscCapture(false),
+                deliver(MARKED, Some(CopyReason::RefineFailed)),
+            ]
+        );
+        let outcome = DeliveryOutcome::Copied {
+            reason: CopyReason::RefineFailed,
+        };
+        let fx = h.step(delivered(S1, outcome));
+        assert_eq!(
+            fx[0],
+            Effect::SaveSuccess {
+                session: S1,
+                outcome,
+                refine: Some(RefineStatus::Failed),
+            }
+        );
+        // The long notice (C5).
+        timer_for(&fx, NOTICE_ERROR_MS);
+        assert_eq!(
+            h.view(),
+            PillView::Notice {
+                notice: Notice::Delivered { outcome }
+            }
+        );
+    }
+
+    #[test]
+    fn the_refine_timer_cancels_and_falls_back() {
+        let mut h = refining(RefineKind::Translate, MARKED);
+        let timer = refine_timer(&h);
+        let fx = h.fire(timer);
+        assert_eq!(
+            fx[..3],
+            [
+                Effect::CancelRefine { session: S1 },
+                Effect::SetEscCapture(false),
+                deliver(MARKED, Some(CopyReason::RefineFailed)),
+            ]
+        );
+        assert!(matches!(
+            h.state(),
+            State::Delivering {
+                delivery: Delivery::Text {
+                    refine: Some(RefineStatus::Timeout)
+                },
+                ..
+            }
+        ));
+        // The late result is stale.
+        let before = h.state().clone();
+        assert_eq!(
+            h.step(refined(S1, RefineOutcome::Text(text("late")))),
+            vec![]
+        );
+        assert_eq!(h.state(), &before);
+    }
+
+    #[test]
+    fn a_model_load_extends_the_refine_timer_once() {
+        let mut h = refining(RefineKind::Translate, MARKED);
+        let budget = refine::timeout_ms(RefineKind::Translate, MARKED);
+        let old = refine_timer(&h);
+        let fx = h.step(Event::RefinerLoading { session: S1 });
+        let new = timer_for(&fx, MODEL_LOAD_TIMEOUT_MS + budget);
+        assert_ne!(new, old);
+        // Only once; another session's load is stale.
+        assert_eq!(h.step(Event::RefinerLoading { session: S1 }), vec![]);
+        assert_eq!(h.step(Event::RefinerLoading { session: S2 }), vec![]);
+        // The old timer is stale.
+        assert_eq!(h.step(Event::TimerFired(old)), vec![]);
+        assert!(matches!(h.state(), State::Refining(_)));
+        let fx = h.fire(new);
+        assert!(fx.contains(&Effect::CancelRefine { session: S1 }));
+    }
+
+    #[test]
+    fn esc_while_refining_holds_the_result_until_undone() {
+        let mut h = refining(RefineKind::Translate, MARKED);
+        let fx = h.step(Event::Esc);
+        timer_for(&fx, CANCEL_WINDOW_MS);
+        assert_eq!(
+            h.view(),
+            PillView::CancelPending {
+                remaining_ms: CANCEL_WINDOW_MS,
+                from_recording: false,
+            }
+        );
+        assert_eq!(h.m.active_refine(), Some(RefineKind::Translate));
+        // The result arrives during the countdown and is held.
+        assert_eq!(
+            h.step(refined(S1, RefineOutcome::Text(text("refined")))),
+            vec![]
+        );
+        // Undo: the held result goes out.
+        let fx = h.step(Event::PillClicked);
+        assert_eq!(
+            fx[..2],
+            [Effect::SetEscCapture(false), deliver("refined", None)]
+        );
+    }
+
+    #[test]
+    fn undo_before_the_result_goes_back_to_refining() {
+        let mut h = refining(RefineKind::Translate, MARKED);
+        let before = h.state().clone();
+        h.step(Event::Esc);
+        h.advance(500);
+        assert_eq!(h.step(Event::Esc), vec![]);
+        assert_eq!(h.state(), &before);
+    }
+
+    #[test]
+    fn the_countdown_while_refining_discards_everything() {
+        for held in [false, true] {
+            let mut h = refining(RefineKind::Translate, MARKED);
+            let fx = h.step(Event::Esc);
+            let countdown = timer_for(&fx, CANCEL_WINDOW_MS);
+            if held {
+                h.step(refined(S1, RefineOutcome::Text(text("refined"))));
+            }
+            let fx = h.fire(countdown);
+            assert_eq!(
+                fx,
+                vec![
+                    Effect::CancelRefine { session: S1 },
+                    Effect::SetEscCapture(false),
+                    Effect::DropAudio { session: S1 },
+                ],
+                "held {held}"
+            );
+            assert_eq!(h.state(), &State::Idle { notice: None });
+        }
+    }
+
+    #[test]
+    fn the_refine_timer_during_the_countdown_is_held_as_a_timeout() {
+        let mut h = refining(RefineKind::Clean, MARKED);
+        let timer = refine_timer(&h);
+        h.step(Event::Esc);
+        let fx = h.fire(timer);
+        assert_eq!(fx, vec![Effect::CancelRefine { session: S1 }]);
+        // A model load during the countdown can no longer help.
+        assert_eq!(h.step(Event::RefinerLoading { session: S1 }), vec![]);
+        let fx = h.step(Event::Esc);
+        assert_eq!(
+            fx[..2],
+            [Effect::SetEscCapture(false), deliver(MARKED, None)]
+        );
+        assert!(matches!(
+            h.state(),
+            State::Delivering {
+                delivery: Delivery::Text {
+                    refine: Some(RefineStatus::Timeout)
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_model_load_during_the_countdown_extends_the_refine_timer() {
+        let mut h = refining(RefineKind::Translate, MARKED);
+        h.step(Event::Esc);
+        let budget = refine::timeout_ms(RefineKind::Translate, MARKED);
+        let fx = h.step(Event::RefinerLoading { session: S1 });
+        timer_for(&fx, MODEL_LOAD_TIMEOUT_MS + budget);
+    }
+
+    #[test]
+    fn switching_a_refine_feature_off_ends_its_sessions() {
+        let off = |kind| Event::RefineDisabled { kind };
+        // Recording.
+        let mut h = recording_refine(RefineKind::Translate);
+        assert_eq!(h.step(off(RefineKind::Clean)), vec![]);
+        assert_eq!(
+            h.step(off(RefineKind::Translate)),
+            vec![
+                Effect::StopCapture { session: S1 },
+                Effect::SetEscCapture(false),
+                Effect::DropAudio { session: S1 },
+            ]
+        );
+        assert_eq!(h.state(), &State::Idle { notice: None });
+        // Transcribing.
+        let mut h = recording_refine(RefineKind::Translate);
+        h.step(TOGGLE);
+        assert_eq!(
+            h.step(off(RefineKind::Translate)),
+            vec![
+                Effect::CancelTranscription { session: S1 },
+                Effect::SetEscCapture(false),
+                Effect::DropAudio { session: S1 },
+            ]
+        );
+        // Refining, and paused while refining.
+        for paused in [false, true] {
+            let mut h = refining(RefineKind::Translate, MARKED);
+            if paused {
+                h.step(Event::Esc);
+            }
+            assert_eq!(
+                h.step(off(RefineKind::Translate)),
+                vec![
+                    Effect::CancelRefine { session: S1 },
+                    Effect::SetEscCapture(false),
+                    Effect::DropAudio { session: S1 },
+                ]
+            );
+            assert_eq!(h.state(), &State::Idle { notice: None });
+        }
+        // A delivery in flight finishes; plain dictation ignores it.
+        let mut h = refining(RefineKind::Translate, MARKED);
+        h.step(refined(S1, RefineOutcome::Text(text("refined"))));
+        assert_eq!(h.step(off(RefineKind::Translate)), vec![]);
+        assert!(matches!(h.state(), State::Delivering { .. }));
+        let mut h = recording(RecordMode::Toggle);
+        assert_eq!(h.step(off(RefineKind::Translate)), vec![]);
+        assert!(matches!(h.state(), State::Recording(_)));
+    }
+
+    #[test]
+    fn hotkeys_and_stale_results_are_ignored_while_refining() {
+        let mut h = refining(RefineKind::Translate, MARKED);
+        let before = h.state().clone();
+        for event in [
+            TOGGLE,
+            PTT,
+            hotkey(RecordMode::Toggle, Some(RefineKind::Translate)),
+            Event::HotkeyUp,
+            Event::AnnotationsHotkey,
+            Event::AnnotationsDisabled,
+            refined(S2, RefineOutcome::Failed),
+            Event::TimerFired(STALE_TIMER),
+            transcribed(S1, TranscribeOutcome::Text(text("again"))),
+            Event::CaptureFailed {
+                session: S1,
+                error: CaptureError::DeviceError,
+            },
+        ] {
+            assert_eq!(h.step(event.clone()), vec![], "{event:?}");
+            assert_eq!(h.state(), &before, "{event:?}");
+        }
+        // A result before the refine phase is ignored too.
+        let mut h = recording_refine(RefineKind::Translate);
+        h.step(TOGGLE);
+        assert_eq!(h.step(refined(S1, RefineOutcome::Failed)), vec![]);
+        assert_eq!(h.step(Event::RefinerLoading { session: S1 }), vec![]);
+    }
+
     // --- invariants over random event sequences ---
 
     /// xorshift64*: small, deterministic, no dependency.
@@ -3805,6 +4703,16 @@ mod tests {
         composed: BTreeSet<u64>,
         delivered: BTreeSet<u64>,
         terminals: BTreeMap<u64, Vec<String>>,
+        /// Refine sessions: the kind they warmed at the start.
+        warmed: BTreeMap<u64, RefineKind>,
+        /// Sessions whose text went to the refiner, and those whose refine is still running
+        /// (no `Refined` consumed and no `CancelRefine` yet).
+        refine_sent: BTreeSet<u64>,
+        refine_open: BTreeSet<u64>,
+        /// Coverage: deliveries after a refine, refine cancels, copy-only translation failures.
+        refined_deliveries: u32,
+        refine_cancels: u32,
+        failed_translations: u32,
     }
 
     impl Ledger {
@@ -3875,12 +4783,63 @@ mod tests {
                             "{session:?} composed twice"
                         );
                     }
-                    Effect::Deliver { session, .. } => {
+                    Effect::Deliver {
+                        session, copy_only, ..
+                    } => {
                         assert_eq!(self.transcribe_count.get(&session.0), Some(&1));
                         assert!(
                             self.delivered.insert(session.0),
                             "{session:?} delivered twice"
                         );
+                        if self.refine_sent.contains(&session.0) {
+                            assert!(
+                                !self.refine_open.contains(&session.0),
+                                "{session:?} delivered while its refine runs"
+                            );
+                            self.refined_deliveries += 1;
+                        }
+                        let warmed = self.warmed.get(&session.0).copied();
+                        if warmed == Some(RefineKind::Translate) {
+                            assert!(
+                                self.refine_sent.contains(&session.0),
+                                "a translation delivered without the refiner"
+                            );
+                        }
+                        if *copy_only == Some(CopyReason::RefineFailed) {
+                            assert_eq!(warmed, Some(RefineKind::Translate));
+                            self.failed_translations += 1;
+                        }
+                    }
+                    Effect::WarmRefiner { session, kind } => {
+                        assert!(
+                            self.started.contains(&session.0),
+                            "{f:?} before StartCapture"
+                        );
+                        assert!(
+                            self.warmed.insert(session.0, *kind).is_none(),
+                            "{session:?} warmed twice"
+                        );
+                    }
+                    Effect::Refine { session, kind, .. } => {
+                        assert_eq!(self.transcribe_count.get(&session.0), Some(&1));
+                        assert_eq!(self.warmed.get(&session.0), Some(kind), "{f:?}");
+                        assert!(
+                            self.refine_sent.insert(session.0),
+                            "{session:?} refined twice"
+                        );
+                        self.refine_open.insert(session.0);
+                    }
+                    Effect::CancelRefine { session } => {
+                        assert!(
+                            self.refine_sent.contains(&session.0),
+                            "{f:?} without Refine"
+                        );
+                        assert!(
+                            !self.terminals.contains_key(&session.0),
+                            "{f:?} after the session ended"
+                        );
+                        self.refine_open.remove(&session.0);
+                        self.refine_cancels += 1;
                     }
                     Effect::DeliverBundle { session } | Effect::DeliverText { session } => {
                         assert!(self.composed.contains(&session.0), "{f:?} before Compose");
@@ -3930,6 +4889,10 @@ mod tests {
                 self.started.contains(&session.0),
                 "{what} for unknown {session:?}"
             );
+            assert!(
+                !self.refine_open.contains(&session.0),
+                "{what} for {session:?} while its refine runs"
+            );
             // An annotation session must have released the screen before it ends.
             if self.screen_started.contains(&session.0) {
                 assert!(
@@ -3972,9 +4935,29 @@ mod tests {
                 SessionId(rng.below(6))
             }
         };
-        let event = match rng.below(18) {
+        let event = match rng.below(22) {
             0 => Event::HotkeyDown {
                 mode: rng.pick(&[RecordMode::Toggle, RecordMode::PushToTalk]),
+                refine: rng.pick(&[
+                    None,
+                    Some(RefineKind::Clean),
+                    Some(RefineKind::Translate),
+                    Some(RefineKind::Translate),
+                ]),
+            },
+            18 | 19 => Event::Refined {
+                session: session(rng),
+                outcome: match rng.below(4) {
+                    0 => RefineOutcome::Failed,
+                    1 => RefineOutcome::TimedOut,
+                    _ => RefineOutcome::Text(text("refined")),
+                },
+            },
+            20 => Event::RefinerLoading {
+                session: session(rng),
+            },
+            21 => Event::RefineDisabled {
+                kind: rng.pick(&[RefineKind::Clean, RefineKind::Translate]),
             },
             1 => Event::HotkeyUp,
             2 | 3 => Event::Esc,
@@ -4027,7 +5010,12 @@ mod tests {
                         FailureKind::EmptyResult,
                         FailureKind::ModelMissing,
                     ])),
-                    _ => TranscribeOutcome::Text(text("random")),
+                    // Short (a cleanup skips it), marked, and too long for a cleanup.
+                    _ => TranscribeOutcome::Text(text(&rng.pick(&[
+                        "random".to_owned(),
+                        "あの、明日の打ち合わせは三時からです。".to_owned(),
+                        "長".repeat(refine::CLEAN_MAX_CHARS + 1),
+                    ]))),
                 };
                 transcribed(session(rng), outcome)
             }
@@ -4056,10 +5044,22 @@ mod tests {
         Some(event)
     }
 
+    /// The session in the refine phase (refining, or paused while refining), if any.
+    fn refining_session(state: &State) -> Option<SessionId> {
+        match state {
+            State::Refining(r) => Some(r.session),
+            State::CancelPending {
+                paused: Paused::Refining { refining, .. },
+                ..
+            } => Some(refining.session),
+            _ => None,
+        }
+    }
+
     #[test]
     fn invariants_hold_over_random_event_sequences() {
         let mut endings: BTreeMap<String, u32> = BTreeMap::new();
-        for seed in 1..=400u64 {
+        for seed in 1..=1_000u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
             let mut h = Harness::new();
             let mut ledger = Ledger::default();
@@ -4071,10 +5071,40 @@ mod tests {
                     continue;
                 };
                 trace.push(event.clone());
+                let refining_before = refining_session(h.state());
+                // A result that the machine consumes ends the refine work of its session.
+                let consumed = match &event {
+                    Event::Refined { session, .. } if refining_before == Some(*session) => {
+                        !matches!(
+                            h.state(),
+                            State::CancelPending {
+                                paused: Paused::Refining { held: Some(_), .. },
+                                ..
+                            }
+                        )
+                    }
+                    _ => false,
+                };
                 let fx = match &event {
                     Event::TimerFired(id) if h.timers.iter().any(|(t, _)| t == id) => h.fire(*id),
                     _ => h.step(event.clone()),
                 };
+                if consumed && let Some(s) = refining_before {
+                    ledger.refine_open.remove(&s.0);
+                }
+                // Leaving the refine phase always delivers or cancels the refine.
+                if let Some(s) = refining_before
+                    && refining_session(h.state()) != Some(s)
+                {
+                    assert!(
+                        fx.iter().any(|f| matches!(
+                            f,
+                            Effect::Deliver { session, .. } | Effect::CancelRefine { session }
+                                if *session == s
+                        )),
+                        "seed {seed}: left Refining without Deliver or CancelRefine: {fx:?}"
+                    );
+                }
                 ledger.record(&fx);
                 assert_eq!(
                     ledger.esc_registered,
@@ -4100,7 +5130,20 @@ mod tests {
             // Drain: firing every armed timer must bring the machine to rest.
             let mut rounds = 0;
             while !h.timers.is_empty() {
+                let refining_before = refining_session(h.state());
                 let fx = h.fire_next();
+                if let Some(s) = refining_before
+                    && refining_session(h.state()) != Some(s)
+                {
+                    assert!(
+                        fx.iter().any(|f| matches!(
+                            f,
+                            Effect::Deliver { session, .. } | Effect::CancelRefine { session }
+                                if *session == s
+                        )),
+                        "seed {seed}: left Refining without Deliver or CancelRefine: {fx:?}"
+                    );
+                }
                 ledger.record(&fx);
                 assert_eq!(ledger.esc_registered, h.m.wants_esc(), "seed {seed}");
                 rounds += 1;
@@ -4116,17 +5159,25 @@ mod tests {
             for what in ledger.terminals.values().flatten() {
                 *endings.entry(what.clone()).or_default() += 1;
             }
+            *endings.entry("refined delivery".to_owned()).or_default() += ledger.refined_deliveries;
+            *endings.entry("CancelRefine".to_owned()).or_default() += ledger.refine_cancels;
+            *endings.entry("failed translation".to_owned()).or_default() +=
+                ledger.failed_translations;
         }
-        // The generator reached every kind of ending many times.
-        for what in [
-            "SaveSuccess",
-            "SaveFailure",
-            "DropAudio",
-            "SaveAnnotation",
-            "DropAll",
+        // The generator reached every kind of ending many times (a failed translation needs a
+        // translation hotkey, a long text or a failure, and no Esc on the way: rarer).
+        for (what, floor) in [
+            ("SaveSuccess", 50),
+            ("SaveFailure", 50),
+            ("DropAudio", 50),
+            ("SaveAnnotation", 50),
+            ("DropAll", 50),
+            ("refined delivery", 50),
+            ("CancelRefine", 50),
+            ("failed translation", 30),
         ] {
             assert!(
-                endings.get(what).is_some_and(|n| *n >= 50),
+                endings.get(what).is_some_and(|n| *n >= floor),
                 "{what} was rarely reached: {endings:?}"
             );
         }

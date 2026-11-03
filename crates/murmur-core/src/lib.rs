@@ -6,7 +6,8 @@
 //!
 //! Reading order: `session` (the state machine) -> `pipeline` (how audio becomes text)
 //! -> `text` (formatting) -> `metrics` -> `settings` -> `catalog` -> `ports`
-//! -> `annotations` (the experimental screen annotations: keyframes, marks, summary).
+//! -> `annotations` (the experimental screen annotations: keyframes, marks, summary)
+//! -> `refine` (the experimental local-LLM step: translation, and the cleanup before it).
 //! Run `rg "SOT:"` to list every source of truth in the repository.
 
 pub mod annotations;
@@ -14,6 +15,7 @@ pub mod catalog;
 pub mod metrics;
 pub mod pipeline;
 pub mod ports;
+pub mod refine;
 pub mod session;
 pub mod settings;
 pub mod text;

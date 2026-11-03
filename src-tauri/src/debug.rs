@@ -169,7 +169,10 @@ pub fn install(
                     if annotations_hotkey {
                         controller.send(Msg::AnnotationsHotkey);
                     } else {
-                        controller.event(Event::HotkeyDown { mode: RecordMode::Toggle });
+                        controller.event(Event::HotkeyDown {
+                            mode: RecordMode::Toggle,
+                            refine: None,
+                        });
                     }
                 }
                 Some(()) = esc.recv() => controller.event(Event::Esc),

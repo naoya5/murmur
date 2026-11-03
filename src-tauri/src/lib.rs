@@ -155,6 +155,7 @@ fn hotkey_callback(
     Arc::new(move |event| match event {
         HotkeyEvent::MainDown => controller.event(Event::HotkeyDown {
             mode: services.settings().record_mode,
+            refine: None,
         }),
         HotkeyEvent::MainUp | HotkeyEvent::AlternateUp => controller.event(Event::HotkeyUp),
         HotkeyEvent::AlternateDown => {
@@ -215,6 +216,7 @@ fn on_tray(app: &AppHandle, services: &Arc<App>, action: TrayAction) {
             if let Some(controller) = services.controller() {
                 controller.event(Event::HotkeyDown {
                     mode: murmur_core::settings::RecordMode::Toggle,
+                    refine: None,
                 });
             }
         }

@@ -204,6 +204,15 @@ pub fn format(
     chars.into_iter().collect()
 }
 
+/// The dictionary replacements of `format` alone, for text that did not come from the speech
+/// model (the LLM cleanup applies them again to its output, D5).
+pub fn replace_dictionary(text: &str, lang: Language, dictionary: &[DictionaryEntry]) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    apply_dictionary(&chars, lang, dictionary)
+        .into_iter()
+        .collect()
+}
+
 fn apply_dictionary(chars: &[char], lang: Language, dictionary: &[DictionaryEntry]) -> Vec<char> {
     // (what the model wrote, what to write instead), longest first.
     let mut patterns: Vec<(Vec<char>, &str)> = Vec::new();

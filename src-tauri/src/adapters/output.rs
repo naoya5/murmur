@@ -78,6 +78,16 @@ pub fn deliver(text: &str, opts: DeliverOptions) -> DeliveryOutcome {
         .unwrap_or(DeliveryOutcome::Unconfirmed)
 }
 
+/// Puts the text on the clipboard and does not paste it; the outcome is `Copied` with `reason`
+/// (a failed translation leaves the Japanese there, C5). `Unconfirmed` when the clipboard cannot
+/// be written. Blocking but short; the controller bounds it like `deliver`.
+pub fn copy_only(text: &str, reason: CopyReason) -> DeliveryOutcome {
+    match copy_text(text) {
+        Ok(()) => DeliveryOutcome::Copied { reason },
+        Err(_) => DeliveryOutcome::Unconfirmed,
+    }
+}
+
 fn deliver_blocking(text: &str, opts: DeliverOptions) -> DeliveryOutcome {
     // Decide first, so the previous clipboard is only read when we will paste.
     let skip_reason = if !opts.auto_paste {

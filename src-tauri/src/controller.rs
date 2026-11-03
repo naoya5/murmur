@@ -18,9 +18,9 @@ use murmur_core::Language;
 use murmur_core::annotations as ann;
 use murmur_core::ports::{CancelToken, RawTranscript};
 use murmur_core::session::{
-    self, AnnotationsRefusal, CaptureError, ComposeOutcome, ComposeWords, DeliveryOutcome, Effect,
-    Event, FailureKind, Machine, Notice, Paused, PillView, PlanCounts, SessionId, SessionKind,
-    State, TranscribeOutcome, TranscriptText,
+    self, AnnotationsRefusal, CaptureError, ComposeOutcome, ComposeWords, CopyReason,
+    DeliveryOutcome, Effect, Event, FailureKind, Machine, Notice, Paused, PillView, PlanCounts,
+    SessionId, SessionKind, State, TranscribeOutcome, TranscriptText,
 };
 use murmur_core::text::{self, FormatOptions};
 use serde::Serialize;
@@ -312,6 +312,7 @@ impl Controller {
                 self.language_override = Some(language);
                 Some(Event::HotkeyDown {
                     mode: self.services.settings().record_mode,
+                    refine: None,
                 })
             }
             Msg::AnnotationsHotkey => self.on_annotations_hotkey(),
@@ -506,8 +507,15 @@ impl Controller {
                     self.cancel_stream(ctx);
                 }
             }
-            Effect::Deliver { session, text } => self.deliver(session, text),
-            Effect::SaveSuccess { session, outcome } => self.save_success(session, outcome),
+            Effect::Deliver {
+                session,
+                text,
+                copy_only,
+            } => self.deliver(session, text, copy_only),
+            // The refine status goes to the history with the refine columns (stage 1, M2).
+            Effect::SaveSuccess {
+                session, outcome, ..
+            } => self.save_success(session, outcome),
             Effect::SaveFailure { session, failure } => self.save_failure(session, failure),
             Effect::DropAudio { session } => self.drop_audio(session),
             Effect::SetEscCapture(on) => {
@@ -538,7 +546,19 @@ impl Controller {
             Effect::DeliverText { session } => self.deliver_annotation(session, false),
             Effect::SaveAnnotation { session, outcome } => self.save_annotation(session, outcome),
             Effect::DropAll { session } => self.drop_all(session),
+            // --- refine (stage 1, M1): no refiner is wired yet, so a refine fails at once and
+            // the machine takes its fallback. Nothing produces a refine kind before M2.
+            Effect::WarmRefiner { .. } | Effect::CancelRefine { .. } => {}
+            Effect::Refine { session, .. } => self.send_self(Msg::Core(Event::Refined {
+                session,
+                outcome: session::RefineOutcome::Failed,
+            })),
         }
+    }
+
+    fn send_self(&self, msg: Msg) {
+        // The loop only stops at shutdown; a failed send then is expected and harmless.
+        let _ = self.tx.send(msg);
     }
 
     /// Start and stop sounds, read from settings at the moment they play.
@@ -794,7 +814,7 @@ impl Controller {
         });
     }
 
-    fn deliver(&mut self, session: SessionId, text: TranscriptText) {
+    fn deliver(&mut self, session: SessionId, text: TranscriptText, copy_only: Option<CopyReason>) {
         let settings = self.services.settings();
         let opts = DeliverOptions {
             auto_paste: settings.auto_paste,
@@ -803,7 +823,10 @@ impl Controller {
         let t_stop = self.sessions.get(&session).and_then(|c| c.t_stop);
         let tx = self.tx.clone();
         tauri::async_runtime::spawn(async move {
-            let job = tauri::async_runtime::spawn_blocking(move || output::deliver(&text.0, opts));
+            let job = tauri::async_runtime::spawn_blocking(move || match copy_only {
+                Some(reason) => output::copy_only(&text.0, reason),
+                None => output::deliver(&text.0, opts),
+            });
             let outcome = match tokio::time::timeout(DELIVER_TIMEOUT, job).await {
                 Ok(Ok(outcome)) => outcome,
                 _ => DeliveryOutcome::Unconfirmed,

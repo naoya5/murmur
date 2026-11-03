@@ -434,6 +434,7 @@ pub fn toggle_recording(services: Services<'_>) {
     if let Some(controller) = services.controller() {
         controller.event(Event::HotkeyDown {
             mode: murmur_core::settings::RecordMode::Toggle,
+            refine: None,
         });
     }
 }

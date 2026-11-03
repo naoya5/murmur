@@ -257,7 +257,8 @@ export default function Pill() {
 
   const view = state.view;
   const recording = view.kind === "recording";
-  const busy = view.kind === "transcribing" || view.kind === "delivering";
+  const busy =
+    view.kind === "transcribing" || view.kind === "refining" || view.kind === "delivering";
   const bars = useWaveform(recording, reducedMotion);
 
   // Elapsed time: resynced on every recording event, ticked locally. Synced before paint, so a new
