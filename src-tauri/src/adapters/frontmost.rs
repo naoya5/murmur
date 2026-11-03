@@ -228,11 +228,16 @@ mod tests {
     }
 
     /// The active app is the one System Events names (read only: nothing is activated).
-    /// Skipped where System Events does not answer (no session, no automation permission),
-    /// while the screen is locked (NSWorkspace then names loginwindow, but System Events still
-    /// names the app from before the lock), and when the front app changes between the reads.
+    /// Skipped where System Events does not answer (no session, no automation permission), on CI
+    /// (`CI` is set: nobody uses a hosted runner's desktop, and there NSWorkspace and System
+    /// Events name two different processes), while the screen is locked (NSWorkspace then names
+    /// loginwindow, but System Events still names the app from before the lock), and when the
+    /// front app changes between the reads.
     #[test]
     fn front_app_agrees_with_system_events() {
+        if std::env::var_os("CI").is_some() {
+            return;
+        }
         let truth = || {
             std::process::Command::new("osascript")
                 .args(["-e", r#"tell application "System Events" to get unix id of first process whose frontmost is true"#])
