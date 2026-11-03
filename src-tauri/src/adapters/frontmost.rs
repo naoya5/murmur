@@ -228,18 +228,36 @@ mod tests {
     }
 
     /// The active app is the one System Events names (read only: nothing is activated).
-    /// Skipped where System Events does not answer (no session, no automation permission).
+    /// Skipped where System Events does not answer (no session, no automation permission), on CI
+    /// (`CI` is set: nobody uses a hosted runner's desktop, and there NSWorkspace and System
+    /// Events name two different processes), while the screen is locked (NSWorkspace then names
+    /// loginwindow, but System Events still names the app from before the lock), and when the
+    /// front app changes between the reads.
     #[test]
     fn front_app_agrees_with_system_events() {
-        let truth = std::process::Command::new("osascript")
-            .args(["-e", r#"tell application "System Events" to get unix id of first process whose frontmost is true"#])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-            .unwrap_or_default();
-        let Ok(truth) = truth.parse::<i32>() else {
+        if std::env::var_os("CI").is_some() {
+            return;
+        }
+        let truth = || {
+            std::process::Command::new("osascript")
+                .args(["-e", r#"tell application "System Events" to get unix id of first process whose frontmost is true"#])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<i32>().ok())
+        };
+        let is_login_window = |pid: i32| {
+            NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+                .and_then(|app| app.bundleIdentifier())
+                .is_some_and(|id| id.to_string() == "com.apple.loginwindow")
+        };
+        let Some(before) = truth() else {
             return;
         };
-        assert_eq!(active_pid(), Some(truth));
+        let active = active_pid();
+        if active.is_some_and(is_login_window) || truth() != Some(before) {
+            return;
+        }
+        assert_eq!(active, Some(before));
     }
 
     /// Needs the screen: TextEdit comes back although Safari was brought in front, with the

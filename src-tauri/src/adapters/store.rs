@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use murmur_core::Language;
 use murmur_core::metrics::{Counts, DayTotals};
+use murmur_core::refine::{RefineKind, RefineStatus};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +65,14 @@ const MIGRATIONS: &[&str] = &[
         error TEXT
     );
     CREATE INDEX idx_annotations_created ON annotations(created_at);",
+    // Migration 3: the optional model step after the rule formatting (experimental). `text` stays
+    // what was delivered; `pre_refine_text` keeps the rule-formatted text (the Japanese of a
+    // translation). `refine_model_id` names every model that ran, joined with "+".
+    "ALTER TABLE transcripts ADD COLUMN refine_kind TEXT;
+    ALTER TABLE transcripts ADD COLUMN refine_status TEXT;
+    ALTER TABLE transcripts ADD COLUMN pre_refine_text TEXT;
+    ALTER TABLE transcripts ADD COLUMN refine_model_id TEXT;
+    ALTER TABLE transcripts ADD COLUMN refine_ms INTEGER;",
 ];
 
 const ANNOTATION_COLUMNS: &str = "id, created_at, status, folder, duration_ms, keyframes, marks,                                   language, model_id, latency_ms, asr_ms, compose_ms, error";
@@ -124,7 +133,8 @@ pub struct AnnotationRow {
 }
 
 const COLUMNS: &str = "id, created_at, status, text, raw_text, language, duration_ms, latin_words, \
-                       cjk_chars, model_id, latency_ms, asr_ms, audio_path, error";
+                       cjk_chars, model_id, latency_ms, asr_ms, audio_path, error, refine_kind, \
+                       refine_status, pre_refine_text, refine_model_id, refine_ms";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "snake_case")]
@@ -173,6 +183,16 @@ pub struct TranscriptRow {
     pub asr_ms: Option<u64>,
     pub audio_path: Option<String>,
     pub error: Option<String>,
+    /// The model step of the session (experimental), when it had one.
+    pub refine_kind: Option<RefineKind>,
+    pub refine_status: Option<RefineStatus>,
+    /// The rule-formatted text before the model step (a translation's Japanese).
+    pub pre_refine_text: Option<String>,
+    /// Every model that ran, joined with "+" (`catalog::refine_model_ids`).
+    pub refine_model_id: Option<String>,
+    /// Time from the refine request to the delivery: the model step's share of `latency_ms`.
+    #[specta(type = Option<f64>)]
+    pub refine_ms: Option<u64>,
 }
 
 /// G7: never print transcript text, not even through `{:?}`.
@@ -195,6 +215,11 @@ impl std::fmt::Debug for TranscriptRow {
             .field("asr_ms", &self.asr_ms)
             .field("audio_path", &self.audio_path)
             .field("error", &self.error)
+            .field("refine_kind", &self.refine_kind)
+            .field("refine_status", &self.refine_status)
+            .field("pre_refine_text", &redact(&self.pre_refine_text))
+            .field("refine_model_id", &self.refine_model_id)
+            .field("refine_ms", &self.refine_ms)
             .finish()
     }
 }
@@ -258,7 +283,7 @@ impl Store {
 
     fn insert_on(conn: &Connection, row: &TranscriptRow) -> Result<(), StoreError> {
         conn.execute(
-            &format!("INSERT INTO transcripts ({COLUMNS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"),
+            &format!("INSERT INTO transcripts ({COLUMNS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)"),
             params![
                 row.id,
                 row.created_at_ms,
@@ -274,6 +299,11 @@ impl Store {
                 row.asr_ms.map(to_i64),
                 row.audio_path,
                 row.error,
+                row.refine_kind.map(RefineKind::code),
+                row.refine_status.map(RefineStatus::code),
+                row.pre_refine_text,
+                row.refine_model_id,
+                row.refine_ms.map(to_i64),
             ],
         )?;
         Ok(())
@@ -381,7 +411,7 @@ impl Store {
         let conn = self.conn();
         let mut stmt = conn.prepare_cached(&format!(
             "SELECT {COLUMNS} FROM transcripts
-             WHERE (?1 IS NULL OR text LIKE ?1 ESCAPE '\\')
+             WHERE (?1 IS NULL OR text LIKE ?1 ESCAPE '\\' OR pre_refine_text LIKE ?1 ESCAPE '\\')
              ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3"
         ))?;
         let rows = stmt.query_map(params![like_pattern(query), limit, offset], read_row)?;
@@ -394,7 +424,8 @@ impl Store {
 
     pub fn count(&self, query: &str) -> Result<u32, StoreError> {
         let n: i64 = self.conn().query_row(
-            "SELECT COUNT(*) FROM transcripts WHERE (?1 IS NULL OR text LIKE ?1 ESCAPE '\\')",
+            "SELECT COUNT(*) FROM transcripts
+             WHERE (?1 IS NULL OR text LIKE ?1 ESCAPE '\\' OR pre_refine_text LIKE ?1 ESCAPE '\\')",
             [like_pattern(query)],
             |r| r.get(0),
         )?;
@@ -723,6 +754,20 @@ fn read_row(r: &Row<'_>) -> rusqlite::Result<Result<TranscriptRow, StoreError>> 
     let Some(status) = TranscriptStatus::parse(&status) else {
         return Ok(Err(StoreError::BadValue("transcripts.status")));
     };
+    let refine_kind = match r.get::<_, Option<String>>(14)?.as_deref() {
+        None => None,
+        Some(code) => match RefineKind::from_code(code) {
+            Some(kind) => Some(kind),
+            None => return Ok(Err(StoreError::BadValue("transcripts.refine_kind"))),
+        },
+    };
+    let refine_status = match r.get::<_, Option<String>>(15)?.as_deref() {
+        None => None,
+        Some(code) => match RefineStatus::from_code(code) {
+            Some(status) => Some(status),
+            None => return Ok(Err(StoreError::BadValue("transcripts.refine_status"))),
+        },
+    };
     let language = match language.as_deref() {
         None => None,
         Some(code) => match parse_language(code) {
@@ -745,6 +790,11 @@ fn read_row(r: &Row<'_>) -> rusqlite::Result<Result<TranscriptRow, StoreError>> 
         asr_ms: r.get::<_, Option<i64>>(11)?.map(to_u64),
         audio_path: r.get(12)?,
         error: r.get(13)?,
+        refine_kind,
+        refine_status,
+        pre_refine_text: r.get(16)?,
+        refine_model_id: r.get(17)?,
+        refine_ms: r.get::<_, Option<i64>>(18)?.map(to_u64),
     }))
 }
 
@@ -778,6 +828,11 @@ mod tests {
             asr_ms: Some(90),
             audio_path: None,
             error: None,
+            refine_kind: None,
+            refine_status: None,
+            pre_refine_text: None,
+            refine_model_id: None,
+            refine_ms: None,
         }
     }
 
@@ -1064,6 +1119,35 @@ mod tests {
     }
 
     #[test]
+    fn refine_columns_round_trip_and_the_japanese_is_searchable() {
+        let store = Store::open_in_memory().unwrap();
+        let translated = TranscriptRow {
+            language: Some(Language::Ja),
+            refine_kind: Some(RefineKind::Translate),
+            refine_status: Some(RefineStatus::Ok),
+            pre_refine_text: Some("会議は4時からです。".into()),
+            refine_model_id: Some("a+b".into()),
+            refine_ms: Some(640),
+            ..row("translated", 1_700_000_000_000, "The meeting is at four.")
+        };
+        store.insert_success(&translated).unwrap();
+        store
+            .insert(&row("plain", 1_700_000_000_001, "other words"))
+            .unwrap();
+        assert_eq!(store.get("translated").unwrap(), Some(translated.clone()));
+        assert_eq!(store.get("plain").unwrap().unwrap().refine_kind, None);
+        // The history finds a translation by its English and by its Japanese.
+        for query in ["meeting", "4時"] {
+            let found = store.list(query, 10, 0).unwrap();
+            assert_eq!(found.len(), 1, "{query}");
+            assert_eq!(found[0].id, "translated");
+            assert_eq!(store.count(query).unwrap(), 1, "{query}");
+        }
+        // G7: the Japanese is redacted like the other texts.
+        assert!(!format!("{translated:?}").contains("会議"));
+    }
+
+    #[test]
     fn migration_one_is_frozen() {
         // Shipped migrations never change: any edit to migration 1 changes this checksum (FNV-1a).
         let hash = MIGRATIONS[0]
@@ -1267,11 +1351,11 @@ mod tests {
         assert_eq!(store.count("").unwrap(), 1);
         store.delete_all().unwrap();
         assert_eq!(store.list_annotations_oldest_first().unwrap().len(), 0);
-        // The database opened fresh has both migrations applied.
+        // The database opened fresh has every migration applied.
         let v: i64 = store
             .conn()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v as usize, MIGRATIONS.len());
     }
 }

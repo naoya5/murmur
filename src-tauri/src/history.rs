@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use murmur_core::Language;
 use murmur_core::metrics;
+use murmur_core::refine::{RefineKind, RefineStatus};
 use murmur_core::session::FailureKind;
 use murmur_core::settings::HistoryRetention;
 use murmur_core::text::{self, FormatOptions};
@@ -30,6 +31,19 @@ pub struct Record {
     pub latency_ms: Option<u64>,
     pub asr_ms: Option<u64>,
     pub failure: Option<FailureKind>,
+    /// The model step of a delivered dictation, when it had one.
+    pub refine: Option<RefineRecord>,
+}
+
+/// How the model step of a session went (history columns `refine_*`).
+pub struct RefineRecord {
+    pub kind: RefineKind,
+    pub status: RefineStatus,
+    /// The rule-formatted text before the model step (a translation's Japanese).
+    pub pre_refine_text: Option<String>,
+    /// `catalog::refine_model_ids` of the calls made; `None` when no model ran.
+    pub model_id: Option<String>,
+    pub refine_ms: Option<u64>,
 }
 
 fn now_ms() -> i64 {
@@ -68,7 +82,13 @@ pub fn failure_text(failure: FailureKind) -> &'static str {
 pub fn save_success(app: AppHandle, store: Arc<Store>, record: Record, spool: PathBuf) {
     tauri::async_runtime::spawn_blocking(move || {
         let text = record.text.unwrap_or_default();
-        let counts = metrics::count(&text);
+        let refine = record.refine;
+        // The totals count what was spoken: a translation's Japanese, not its English.
+        let spoken = refine
+            .as_ref()
+            .and_then(|r| r.pre_refine_text.as_deref())
+            .unwrap_or(&text);
+        let counts = metrics::count(spoken);
         let created_at_ms = now_ms();
         let row = TranscriptRow {
             id: uuid::Uuid::new_v4().to_string(),
@@ -85,6 +105,11 @@ pub fn save_success(app: AppHandle, store: Arc<Store>, record: Record, spool: Pa
             asr_ms: record.asr_ms,
             audio_path: None,
             error: None,
+            refine_kind: refine.as_ref().map(|r| r.kind),
+            refine_status: refine.as_ref().map(|r| r.status),
+            refine_ms: refine.as_ref().and_then(|r| r.refine_ms),
+            refine_model_id: refine.as_ref().and_then(|r| r.model_id.clone()),
+            pre_refine_text: refine.and_then(|r| r.pre_refine_text),
         };
         // Keep the audio if the row cannot be written: the spool recovery then brings it back.
         match store.insert_success(&row) {
@@ -114,6 +139,12 @@ pub fn save_failure(app: AppHandle, store: Arc<Store>, record: Record, spool: Pa
             asr_ms: record.asr_ms,
             audio_path,
             error: record.failure.map(|f| failure_text(f).to_owned()),
+            // Nothing was refined: a retry transcribes again and delivers nothing.
+            refine_kind: None,
+            refine_status: None,
+            pre_refine_text: None,
+            refine_model_id: None,
+            refine_ms: None,
         };
         if let Err(error) = store.insert(&row) {
             tracing::error!(%error, "could not save a failed transcript");
@@ -284,6 +315,11 @@ pub fn recover_spool(store: &Store, spool_dir: &Path) -> usize {
             asr_ms: None,
             audio_path: Some(path_text),
             error: None,
+            refine_kind: None,
+            refine_status: None,
+            pre_refine_text: None,
+            refine_model_id: None,
+            refine_ms: None,
         };
         match store.insert(&row) {
             Ok(()) => recovered += 1,

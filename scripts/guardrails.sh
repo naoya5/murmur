@@ -21,6 +21,8 @@ REQUIRED_SOT_IDS=(
   ui-strings
   design-tokens
   annotations
+  refine
+  llm-sidecar-protocol
 )
 
 # G2: the only file that may use the speech SDK crate.

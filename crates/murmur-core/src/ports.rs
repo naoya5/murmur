@@ -1,6 +1,6 @@
 //! SOT: ports
 //! What: the traits that adapters implement for third-party speech tech: recognition engines,
-//!       voice activity detection and (future) text refiners such as a local LLM.
+//!       voice activity detection, and the local LLM of the refine step (experimental).
 //! Why: engines change (speech.cpp today; Apple SpeechAnalyzer, cloud models with the user's own
 //!      key later). The app depends on these traits, never on an SDK (guardrail G2).
 //! Where: `src-tauri/src/adapters/engine.rs` implements `SpeechEngine` and `VoiceDetector` with
@@ -9,6 +9,8 @@
 //!        the streaming detection (S1) while recording; the dictionary is read once when the
 //!        stream starts, so every chunk of one recording uses the same vocabulary (a PLAN 2.9
 //!        deviation: a dictionary edit applies from the next recording).
+//!        `src-tauri/src/adapters/refiner.rs` implements `TextRefiner` with the murmur-llm
+//!        sidecar; `src-tauri/src/refine_session.rs` makes the calls that `refine::Run` asks for.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,9 +19,10 @@ use serde::Serialize;
 use specta::Type;
 use thiserror::Error;
 
-use crate::Language;
 use crate::catalog::ModelEntry;
+use crate::refine::{ChatMessage, RefineKind, Rejection};
 use crate::settings::DictionaryEntry;
+use crate::{Language, Millis};
 
 /// Cooperative cancellation shared between the controller and an engine call in flight.
 #[derive(Debug, Clone, Default)]
@@ -143,15 +146,76 @@ pub trait VoiceDetector: Send {
     fn stream_cancel(&mut self);
 }
 
-/// Context for a text refiner.
-#[derive(Debug, Clone)]
-pub struct RefineContext {
-    pub language: Language,
+/// Why a model call of the refine step did not produce a usable text. The strings are fixed
+/// error codes (the sidecar's or the adapter's), never text from a prompt or an answer (G7).
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum RefineError {
+    /// The model file for the step is not downloaded.
+    #[error("refine model is missing")]
+    ModelMissing,
+    /// The sidecar could not start or load the model, or it is paused after repeated crashes.
+    #[error("refiner unavailable: {0}")]
+    Unavailable(String),
+    /// The step's budget ran out (the request was cancelled or the process stopped).
+    #[error("timed out")]
+    Timeout,
+    #[error("cancelled")]
+    Cancelled,
+    /// The answer broke validation rules (`refine::finish`).
+    #[error("rejected: {0:?}")]
+    Rejected(Vec<Rejection>),
+    /// Any other sidecar or protocol error.
+    #[error("refiner error: {0}")]
+    Failed(String),
 }
 
-/// Rewrites the formatted text (future: a local LLM, opt-in, v1.1). The MVP uses the rules in
-/// `text.rs` only, so no adapter implements this yet; the port exists so that adding one does not
-/// touch the pipeline.
-pub trait TextRefiner: Send + Sync {
-    fn refine(&self, text: &str, ctx: &RefineContext) -> String;
+/// One model call: the whole conversation (`refine::messages`), the output cap and the time
+/// the call may take once the model is loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerateRequest {
+    pub messages: Vec<ChatMessage>,
+    pub max_tokens: u32,
+    pub budget_ms: Millis,
+}
+
+/// The raw answer of a model. `Debug` hides the content (G7).
+#[derive(Clone, PartialEq, Eq)]
+pub struct Generated {
+    pub text: String,
+    /// The model stopped at `max_tokens` (the answer is incomplete).
+    pub truncated: bool,
+}
+
+impl std::fmt::Debug for Generated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Generated")
+            .field(
+                "text",
+                &format_args!("<redacted {} chars>", self.text.chars().count()),
+            )
+            .field("truncated", &self.truncated)
+            .finish()
+    }
+}
+
+/// The local LLM behind the optional refine step (experimental). One model per step
+/// (`catalog::refine_model`); the adapter starts a model when it is first needed. All rules
+/// (prompts, validation, steps, budgets) are in `refine.rs`; an implementation only runs models.
+pub trait TextRefiner: Send {
+    /// Starts the model for `step` if it is not running, and caches `prefix` (the fixed system
+    /// prompt and example turns) so that a later `generate` with the same prefix starts from it.
+    /// Called when a recording that may need the step starts.
+    fn warm(&mut self, step: RefineKind, prefix: &[ChatMessage]) -> Result<(), RefineError>;
+    /// Whether the model for `step` is loaded and running now. `false` means the next call
+    /// starts or loads it first (the session's timer then gets the load budget once). Never waits.
+    fn ready(&self, step: RefineKind) -> bool;
+    /// Generates the answer at temperature 0. Must return `Err(Cancelled)` soon after `cancel` is
+    /// set and `Err(Timeout)` once `request.budget_ms` has passed after the model was ready; the
+    /// adapter enforces both (G5).
+    fn generate(
+        &mut self,
+        step: RefineKind,
+        request: &GenerateRequest,
+        cancel: &CancelToken,
+    ) -> Result<Generated, RefineError>;
 }

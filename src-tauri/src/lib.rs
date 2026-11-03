@@ -2,8 +2,9 @@
 //!
 //! Start-up order: paths -> logging -> settings -> history store (+ spool recovery) -> inference
 //! thread -> services -> windows -> controller -> hotkeys -> settings side effects -> tray.
-//! Exit: the controller stops capture (the spool is kept for recovery) and the inference thread
-//! frees the model before the process ends (Metal aborts if a model is still loaded).
+//! Exit: the controller stops capture (the spool is kept for recovery), the refine sidecars stop,
+//! and the inference thread frees the model before the process ends (Metal aborts if a model is
+//! still loaded).
 
 mod adapters;
 mod annotation_session;
@@ -15,6 +16,7 @@ mod history;
 mod inference;
 mod ipc;
 mod platform;
+mod refine_session;
 mod settings_apply;
 mod tray;
 mod updater;
@@ -24,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use murmur_core::Language;
+use murmur_core::refine::RefineStatus;
 use murmur_core::session::{Event, PillView};
 use tauri::{AppHandle, Manager, RunEvent};
 use tauri_specta::Event as _;
@@ -33,7 +36,7 @@ use crate::adapters::{engine, settings_file, store::Store};
 use crate::app::{App, Paths};
 use crate::controller::{ControllerHandle, Msg};
 use crate::inference::Inference;
-use crate::tray::{TrayAction, TrayModel};
+use crate::tray::{RecentItem, TrayAction, TrayModel};
 
 /// How often the idle check runs for the "unload model after N minutes" setting.
 const IDLE_CHECK: Duration = Duration::from_secs(60);
@@ -155,8 +158,12 @@ fn hotkey_callback(
     Arc::new(move |event| match event {
         HotkeyEvent::MainDown => controller.event(Event::HotkeyDown {
             mode: services.settings().record_mode,
+            refine: None,
         }),
-        HotkeyEvent::MainUp | HotkeyEvent::AlternateUp => controller.event(Event::HotkeyUp),
+        HotkeyEvent::MainUp | HotkeyEvent::AlternateUp | HotkeyEvent::TranslateUp => {
+            controller.event(Event::HotkeyUp)
+        }
+        HotkeyEvent::TranslateDown => controller.send(Msg::TranslateHotkey),
         HotkeyEvent::AlternateDown => {
             let other = match services.settings().language {
                 Language::Ja => Language::En,
@@ -176,7 +183,19 @@ pub fn tray_model(services: &App) -> TrayModel {
         .list("", 5, 0)
         .map(|rows| {
             rows.into_iter()
-                .filter_map(|row| Some((row.id, row.text?)))
+                .filter_map(|row| {
+                    // Only a successful model step changed the text; a failed one delivered the
+                    // text from before it.
+                    let before = match (row.refine_kind, row.refine_status, row.pre_refine_text) {
+                        (Some(kind), Some(RefineStatus::Ok), Some(text)) => Some((kind, text)),
+                        _ => None,
+                    };
+                    Some(RecentItem {
+                        id: row.id,
+                        text: row.text?,
+                        before,
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -215,6 +234,7 @@ fn on_tray(app: &AppHandle, services: &Arc<App>, action: TrayAction) {
             if let Some(controller) = services.controller() {
                 controller.event(Event::HotkeyDown {
                     mode: murmur_core::settings::RecordMode::Toggle,
+                    refine: None,
                 });
             }
         }
@@ -241,6 +261,16 @@ fn on_tray(app: &AppHandle, services: &Arc<App>, action: TrayAction) {
             tauri::async_runtime::spawn_blocking(move || {
                 if let Ok(Some(row)) = services.store().get(&id)
                     && let Some(text) = row.text
+                {
+                    copy_text_now(&text);
+                }
+            });
+        }
+        TrayAction::CopyRecentBefore(id) => {
+            let services = services.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Ok(Some(row)) = services.store().get(&id)
+                    && let Some(text) = row.pre_refine_text
                 {
                     copy_text_now(&text);
                 }
@@ -273,12 +303,15 @@ fn copy_text_now(text: &str) {
     }
 }
 
-/// Frees the model after the configured idle time. Off by default (speed first).
+/// Frees the model after the configured idle time. Off by default (speed first). The refine
+/// sidecars stop after their own fixed idle time (D3).
 fn spawn_idle_unload(services: Arc<App>) {
     tauri::async_runtime::spawn(async move {
         let mut idle_minutes = 0u32;
         loop {
             tokio::time::sleep(IDLE_CHECK).await;
+            let refiner = services.refiner().clone();
+            tauri::async_runtime::spawn_blocking(move || refiner.stop_idle());
             let busy = !matches!(
                 services.pill_state().view,
                 PillView::Hidden | PillView::Notice { .. }
@@ -304,6 +337,8 @@ fn shutdown(handle: &AppHandle) {
         if let Some(controller) = services.controller() {
             controller.send(Msg::Shutdown);
         }
+        // A sidecar also exits by itself when Murmur's end closes its input.
+        services.refiner().shutdown();
         services.inference().shutdown(Duration::from_secs(10));
     }
 }

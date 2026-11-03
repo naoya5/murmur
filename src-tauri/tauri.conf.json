@@ -3,9 +3,9 @@
   "productName": "Murmur",
   "identifier": "io.github.naoya5.murmur",
   "build": {
-    "beforeDevCommand": "pnpm dev",
+    "beforeDevCommand": "bash scripts/build-sidecar.sh && pnpm dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "bash scripts/build-sidecar.sh && pnpm build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -60,6 +60,13 @@
       "icons/icon.ico"
     ],
     "createUpdaterArtifacts": true,
+    "externalBin": [
+      "binaries/murmur-llm"
+    ],
+    "resources": {
+      "binaries/default.metallib": "default.metallib",
+      "binaries/ggml-tensor.metallib": "ggml-tensor.metallib"
+    },
     "macOS": {
       "minimumSystemVersion": "14.0",
       "hardenedRuntime": true,

@@ -54,14 +54,15 @@ function Item({ row, onRetried, onDelete }: ItemProps) {
   const t = useT();
   const toast = useToast();
   const [expanded, setExpanded] = useState(false);
+  const [showBefore, setShowBefore] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const [retryError, setRetryError] = useState<string | null>(null);
 
-  const copy = async () => {
-    if (!row.text) {
+  const copyText = async (text: string | null) => {
+    if (!text) {
       return;
     }
-    const result = await commands.copyText(row.text);
+    const result = await commands.copyText(text);
     if (result.status === "ok") {
       toast(t.common.copied);
     }
@@ -82,6 +83,12 @@ function Item({ row, onRetried, onDelete }: ItemProps) {
   const failed = row.status === "failed";
   const text = row.text ?? "";
   const clamp = !expanded && needsClamp(text);
+  const refine = row.refine_kind;
+  const refined = refine !== null && row.refine_status === "ok";
+  // A failed model step delivered the text from before it: nothing else to show.
+  const before = refined ? row.pre_refine_text : null;
+  const refineFailed =
+    refine !== null && (row.refine_status === "failed" || row.refine_status === "timeout");
 
   return (
     <div className="hist__item">
@@ -101,6 +108,8 @@ function Item({ row, onRetried, onDelete }: ItemProps) {
         <div className="hist__meta">
           <span>{formatWhen(row.created_at_ms, t.locale)}</span>
           {failed && <Badge tone="warn">{t.history.statusFailed}</Badge>}
+          {refine && refined && <Badge tone="accent">{t.history.refine[refine]}</Badge>}
+          {refine && refineFailed && <Badge tone="warn">{t.history.refineFailed[refine]}</Badge>}
           {row.status === "recovered" && <Badge tone="ok">{t.history.statusRecovered}</Badge>}
           {retrying && <span>{t.history.retrying}</span>}
         </div>
@@ -109,10 +118,39 @@ function Item({ row, onRetried, onDelete }: ItemProps) {
         ) : (
           <p className={`hist__text selectable${clamp ? " hist__text--clamp" : ""}`}>{text}</p>
         )}
-        {!failed && needsClamp(text) && (
-          <button type="button" className="hist__expand" onClick={() => setExpanded((v) => !v)}>
-            {expanded ? t.history.collapse : t.history.expand}
-          </button>
+        {!failed && (needsClamp(text) || (refine && before)) && (
+          <div className="hist__links">
+            {needsClamp(text) && (
+              <button type="button" className="hist__expand" onClick={() => setExpanded((v) => !v)}>
+                {expanded ? t.history.collapse : t.history.expand}
+              </button>
+            )}
+            {refine && before && (
+              <button
+                type="button"
+                className="hist__expand"
+                aria-expanded={showBefore}
+                onClick={() => setShowBefore((v) => !v)}
+              >
+                {showBefore ? t.history.hideBefore[refine] : t.history.showBefore[refine]}
+              </button>
+            )}
+          </div>
+        )}
+        {refine && before && showBefore && (
+          <div className="hist__before">
+            <p className="hist__text selectable" lang="ja">
+              {before}
+            </p>
+            <Button
+              size="sm"
+              variant="quiet"
+              icon={<Copy aria-hidden="true" />}
+              onClick={() => copyText(before)}
+            >
+              {t.history.copyBefore[refine]}
+            </Button>
+          </div>
         )}
         {retryError && (
           <p className="row__error" role="alert">
@@ -139,7 +177,7 @@ function Item({ row, onRetried, onDelete }: ItemProps) {
             icon={<Copy aria-hidden="true" />}
             title={t.common.copy}
             aria-label={t.common.copy}
-            onClick={copy}
+            onClick={() => copyText(row.text)}
           />
         )}
         <Button

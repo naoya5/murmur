@@ -129,12 +129,20 @@ pub struct Settings {
     pub annotations_hotkey: String,
     /// How many days an annotation bundle is kept on disk.
     pub annotations_retention_days: u32,
+    /// Experimental: translation (speak Japanese, English is pasted) by local models
+    /// (`refine.rs`). Off by default; while off, no hotkey, no process, no model runs.
+    pub translate_enabled: bool,
+    /// Hotkey that records Japanese for translation (accelerator string), same record modes as
+    /// the main hotkey. Registered only while translation is on.
+    pub translate_hotkey: String,
 }
 
 /// Default accelerator of the annotations hotkey.
 pub const DEFAULT_ANNOTATIONS_HOTKEY: &str = "Option+Shift+KeyS";
 pub const DEFAULT_ANNOTATIONS_RETENTION_DAYS: u32 = 7;
 pub const ANNOTATIONS_RETENTION_DAYS_RANGE: std::ops::RangeInclusive<u32> = 1..=90;
+/// Default accelerator of the translation hotkey.
+pub const DEFAULT_TRANSLATE_HOTKEY: &str = "Alt+Shift+KeyE";
 
 impl Default for Settings {
     fn default() -> Self {
@@ -166,6 +174,8 @@ impl Default for Settings {
             annotations_enabled: false,
             annotations_hotkey: DEFAULT_ANNOTATIONS_HOTKEY.to_owned(),
             annotations_retention_days: DEFAULT_ANNOTATIONS_RETENTION_DAYS,
+            translate_enabled: false,
+            translate_hotkey: DEFAULT_TRANSLATE_HOTKEY.to_owned(),
         }
     }
 }
@@ -197,6 +207,8 @@ pub enum SettingKey {
     AnnotationsEnabled,
     AnnotationsHotkey,
     AnnotationsRetentionDays,
+    TranslateEnabled,
+    TranslateHotkey,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -240,6 +252,8 @@ impl Settings {
             annotations_enabled,
             annotations_hotkey,
             annotations_retention_days,
+            translate_enabled,
+            translate_hotkey,
         } = self;
         let mut keys = Vec::new();
         let mut check = |changed: bool, key: SettingKey| {
@@ -306,6 +320,14 @@ impl Settings {
             *annotations_retention_days != new.annotations_retention_days,
             SettingKey::AnnotationsRetentionDays,
         );
+        check(
+            *translate_enabled != new.translate_enabled,
+            SettingKey::TranslateEnabled,
+        );
+        check(
+            *translate_hotkey != new.translate_hotkey,
+            SettingKey::TranslateHotkey,
+        );
         keys
     }
 
@@ -340,8 +362,11 @@ impl Settings {
             (Language::Ja, &self.models.ja),
             (Language::En, &self.models.en),
         ] {
+            // Only a recognition model transcribes; the refine models list languages too.
             match crate::catalog::find(id) {
-                Some(m) if m.languages.contains(&lang) => {}
+                Some(m)
+                    if m.role == crate::catalog::Role::Recognition
+                        && m.languages.contains(&lang) => {}
                 _ => return invalid(SettingKey::Models, "unknown model for language"),
             }
         }
@@ -356,8 +381,12 @@ impl Settings {
         if !ANNOTATIONS_RETENTION_DAYS_RANGE.contains(&self.annotations_retention_days) {
             return invalid(SettingKey::AnnotationsRetentionDays, "must be 1 to 90");
         }
-        // The annotations hotkey is registered only while the feature is on, so a clash with an
-        // unused key must not make the settings file invalid (the loader would reset the field).
+        if self.translate_hotkey.trim().is_empty() {
+            return invalid(SettingKey::TranslateHotkey, "empty");
+        }
+        // The annotations and translation hotkeys are registered only while their feature is on,
+        // so a clash with an unused key must not make the settings file invalid (the loader would
+        // reset the field).
         if self.annotations_enabled {
             let clashes = |other: &str| same_accelerator(&self.annotations_hotkey, other);
             if clashes(&self.hotkey) {
@@ -374,6 +403,31 @@ impl Settings {
                 return invalid(
                     SettingKey::AnnotationsHotkey,
                     "same key as the alternate language hotkey",
+                );
+            }
+        }
+        if self.translate_enabled {
+            let clashes = |other: &str| same_accelerator(&self.translate_hotkey, other);
+            if clashes(&self.hotkey) {
+                return invalid(
+                    SettingKey::TranslateHotkey,
+                    "same key as the dictation hotkey",
+                );
+            }
+            if self
+                .alternate_language_hotkey
+                .as_deref()
+                .is_some_and(clashes)
+            {
+                return invalid(
+                    SettingKey::TranslateHotkey,
+                    "same key as the alternate language hotkey",
+                );
+            }
+            if self.annotations_enabled && clashes(&self.annotations_hotkey) {
+                return invalid(
+                    SettingKey::TranslateHotkey,
+                    "same key as the annotations hotkey",
                 );
             }
         }
@@ -494,6 +548,8 @@ mod tests {
         assert!(!s.annotations_enabled);
         assert_eq!(s.annotations_hotkey, "Option+Shift+KeyS");
         assert_eq!(s.annotations_retention_days, 7);
+        assert!(!s.translate_enabled);
+        assert_eq!(s.translate_hotkey, "Alt+Shift+KeyE");
     }
 
     #[test]
@@ -529,6 +585,74 @@ mod tests {
         // While the feature is off the clash is not an error: the key is not registered.
         let s = Settings {
             hotkey: "Option+Shift+KeyS".to_owned(),
+            ..Settings::default()
+        };
+        assert_eq!(s.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_refine_model_cannot_be_the_speech_model() {
+        let mut s = Settings::default();
+        s.models.ja = crate::catalog::DEFAULT_CLEAN_MODEL.to_owned();
+        assert!(matches!(
+            s.validate(),
+            Err(SettingsError::Invalid {
+                key: SettingKey::Models,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn translate_hotkey_may_not_clash_while_enabled() {
+        let clash = |mutate: &dyn Fn(&mut Settings)| {
+            let mut s = Settings {
+                translate_enabled: true,
+                ..Settings::default()
+            };
+            mutate(&mut s);
+            s.validate()
+        };
+        assert_eq!(clash(&|_| {}), Ok(()));
+        assert_eq!(
+            clash(&|s| s.hotkey = "Shift+Option+E".to_owned()),
+            Err(SettingsError::Invalid {
+                key: SettingKey::TranslateHotkey,
+                reason: "same key as the dictation hotkey".to_owned(),
+            })
+        );
+        assert!(matches!(
+            clash(&|s| s.alternate_language_hotkey = Some("alt+shift+keye".to_owned())),
+            Err(SettingsError::Invalid {
+                key: SettingKey::TranslateHotkey,
+                ..
+            })
+        ));
+        // The annotations hotkey counts only while annotations are on too.
+        assert_eq!(
+            clash(&|s| s.annotations_hotkey = "Alt+Shift+KeyE".to_owned()),
+            Ok(())
+        );
+        assert_eq!(
+            clash(&|s| {
+                s.annotations_enabled = true;
+                s.translate_hotkey = "Option+Shift+KeyS".to_owned();
+            }),
+            Err(SettingsError::Invalid {
+                key: SettingKey::TranslateHotkey,
+                reason: "same key as the annotations hotkey".to_owned(),
+            })
+        );
+        assert!(matches!(
+            clash(&|s| s.translate_hotkey = " ".to_owned()),
+            Err(SettingsError::Invalid {
+                key: SettingKey::TranslateHotkey,
+                ..
+            })
+        ));
+        // While translation is off the clash is not an error: the key is not registered.
+        let s = Settings {
+            hotkey: "Alt+Shift+KeyE".to_owned(),
             ..Settings::default()
         };
         assert_eq!(s.validate(), Ok(()));
@@ -721,6 +845,14 @@ mod tests {
                 Box::new(|s| s.annotations_retention_days = 30),
                 SettingKey::AnnotationsRetentionDays,
             ),
+            (
+                Box::new(|s| s.translate_enabled = true),
+                SettingKey::TranslateEnabled,
+            ),
+            (
+                Box::new(|s| s.translate_hotkey = "Alt+Shift+KeyT".to_owned()),
+                SettingKey::TranslateHotkey,
+            ),
         ];
         let old = Settings::default();
         let mut seen = Vec::new();
@@ -734,7 +866,7 @@ mod tests {
         // Every key is exercised exactly once (keep this list in step with `SettingKey`).
         seen.sort_by_key(|k| format!("{k:?}"));
         seen.dedup();
-        assert_eq!(seen.len(), 23);
+        assert_eq!(seen.len(), 25);
     }
 
     #[test]
@@ -836,6 +968,8 @@ mod tests {
             alternate_language_hotkey: Some("Alt+Shift+Space".to_owned()),
             annotations_enabled: true,
             annotations_retention_days: 14,
+            translate_enabled: true,
+            translate_hotkey: "Ctrl+Alt+KeyT".to_owned(),
             ..Settings::default()
         };
         let json = serde_json::to_string_pretty(&s).unwrap();

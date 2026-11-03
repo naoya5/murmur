@@ -34,6 +34,7 @@ fn main() {
             "submit_ink_stroke",
             "open_annotations_folder",
             "overlay_ready",
+            "get_refiner_status",
         ]));
     if let Err(error) = tauri_build::try_build(attributes) {
         eprintln!("tauri build failed: {error:#}");

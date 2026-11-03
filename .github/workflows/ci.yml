@@ -11,12 +11,21 @@ concurrency:
 
 jobs:
   check:
-    runs-on: macos-latest # Apple silicon (arm64)
+    # macOS 26 image (Apple silicon): each Xcode on it is 26.x, and the sidecar's tensor
+    # metallib needs the macOS 26 SDK (scripts/build-sidecar.sh). macos-latest moves on its own.
+    runs-on: macos-26
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Install Metal Toolchain when missing
+        run: |
+          if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun -sdk macosx metal --version
 
       - uses: dtolnay/rust-toolchain@stable
         with:

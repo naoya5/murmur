@@ -11,6 +11,7 @@ pub mod image;
 pub mod models;
 pub mod output;
 pub mod pointer;
+pub mod refiner;
 pub mod screen;
 pub mod settings_file;
 pub mod sounds;

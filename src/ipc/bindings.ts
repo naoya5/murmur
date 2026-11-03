@@ -209,6 +209,13 @@ async openAnnotationsFolder() : Promise<Result<null, IpcError>> {
  */
 async overlayReady() : Promise<void> {
     await TAURI_INVOKE("overlay_ready");
+},
+/**
+ * The last failure to start each translation model, for the settings (experimental). Reading it
+ * never starts anything.
+ */
+async getRefinerStatus() : Promise<RefinerStatus> {
+    return await TAURI_INVOKE("get_refiner_status");
 }
 }
 
@@ -298,7 +305,11 @@ export type CopyReason = "auto_paste_off" | "no_accessibility" | "secure_input" 
  * The app the annotation was started in is not in front (it quit, or macOS refused to
  * bring it back), so nothing was pasted anywhere else.
  */
-"target_not_in_front"
+"target_not_in_front" | 
+/**
+ * The translation failed: the Japanese is on the clipboard and nothing was pasted (C5).
+ */
+"refine_failed"
 /**
  * Everything the Home screen shows.
  */
@@ -405,7 +416,11 @@ export type Family =
 /**
  * Silero voice activity detection.
  */
-"silero_vad"
+"silero_vad" | 
+/**
+ * A chat LLM in GGUF, run by the murmur-llm sidecar (llama.cpp), never in the app process.
+ */
+"llm"
 /**
  * The history changed (insert, update, delete). The UI reloads what it shows.
  */
@@ -434,7 +449,17 @@ export type ModelEntry = { id: string; display_name: string; family: Family; rol
 /**
  * Credit text that must be shown (CC-BY models). Empty when none is required.
  */
-attribution: string; capabilities: Capabilities }
+attribution: string; capabilities: Capabilities; 
+/**
+ * What a `Role::Refinement` model does. Empty for every other role.
+ */
+tasks: RefineKind[]; 
+/**
+ * About how much memory the model takes while it runs (the peak resident size of its sidecar
+ * in the stage 0 / M2 measurements, the mapped file included). Shown for the refine models;
+ * `None` where it was not measured.
+ */
+memory_bytes: number | null }
 /**
  * A catalog entry with its state on this Mac.
  */
@@ -508,13 +533,21 @@ screen_recording?: boolean | null }
  */
 export type PillState = { view: PillView; language: Language; 
 /**
+ * Present while the session has a model step (the pill shows "JA -> EN" for a translation).
+ */
+refine?: RefineKind | null; 
+/**
  * Present while the session is a screen annotation (absent: dictation or idle).
  */
 annotation?: AnnotationPill | null }
 /**
  * What the pill shows. Derived from the state; the controller emits it after every step.
  */
-export type PillView = { kind: "hidden" } | { kind: "recording"; elapsed_ms: number; mode: RecordMode } | { kind: "cancel_pending"; remaining_ms: number; from_recording: boolean } | { kind: "transcribing" } | { kind: "delivering" } | { kind: "notice"; notice: Notice }
+export type PillView = { kind: "hidden" } | { kind: "recording"; elapsed_ms: number; mode: RecordMode } | { kind: "cancel_pending"; remaining_ms: number; from_recording: boolean } | { kind: "transcribing" } | 
+/**
+ * A model is cleaning or translating the text.
+ */
+{ kind: "refining"; task: RefineKind } | { kind: "delivering" } | { kind: "notice"; notice: Notice }
 /**
  * Which pane of System Settings > Privacy & Security to open.
  */
@@ -528,8 +561,49 @@ export type RecordMode =
  * Record while the hotkey is held.
  */
 "push_to_talk"
+/**
+ * What a model does with the text. Also the history's `refine_kind` and the catalog's tasks.
+ */
+export type RefineKind = 
+/**
+ * Light cleanup of Japanese: fillers, self-corrections, punctuation, marked lists.
+ */
+"clean" | 
+/**
+ * Japanese to English (`TRANSLATE_FROM` to `TRANSLATE_TO`).
+ */
+"translate"
+/**
+ * How the refine step of a session ended. Stored in the history (`refine_status`).
+ */
+export type RefineStatus = 
+/**
+ * The model's output was delivered.
+ */
+"ok" | 
+/**
+ * The model was not asked (a short or a long cleanup).
+ */
+"skipped" | 
+/**
+ * The model failed, was unavailable, or its output broke a validation rule.
+ */
+"failed" | 
+/**
+ * The time budget ran out.
+ */
+"timeout"
+/**
+ * What the settings show about the sidecars: the last failure to start a step's sidecar or load
+ * its model, until a start succeeds. A missing model is not listed (the Models screen shows it).
+ */
+export type RefinerStatus = { translate_error: string | null; clean_error: string | null }
 export type RetryError = { kind: "not_found" } | { kind: "audio_missing" } | { kind: "model_missing" } | { kind: "no_speech" } | { kind: "failed"; message: string }
-export type Role = "recognition" | "voice_detection"
+export type Role = "recognition" | "voice_detection" | 
+/**
+ * The refine step after the text rules (`tasks` says which).
+ */
+"refinement"
 /**
  * All user settings. Stored in `settings.json`.
  */
@@ -566,7 +640,17 @@ annotations_hotkey: string;
 /**
  * How many days an annotation bundle is kept on disk.
  */
-annotations_retention_days: number }
+annotations_retention_days: number; 
+/**
+ * Experimental: translation (speak Japanese, English is pasted) by local models
+ * (`refine.rs`). Off by default; while off, no hotkey, no process, no model runs.
+ */
+translate_enabled: boolean; 
+/**
+ * Hotkey that records Japanese for translation (accelerator string), same record modes as
+ * the main hotkey. Registered only while translation is on.
+ */
+translate_hotkey: string }
 /**
  * Settings were saved; every window re-reads what it shows.
  */
@@ -588,7 +672,23 @@ export type Tier =
  * Internal helper model (VAD). Not chosen by the user.
  */
 "internal"
-export type TranscriptRow = { id: string; created_at_ms: number; status: TranscriptStatus; text: string | null; raw_text: string | null; language: Language | null; duration_ms: number; latin_words: number; cjk_chars: number; model_id: string | null; latency_ms: number | null; asr_ms: number | null; audio_path: string | null; error: string | null }
+export type TranscriptRow = { id: string; created_at_ms: number; status: TranscriptStatus; text: string | null; raw_text: string | null; language: Language | null; duration_ms: number; latin_words: number; cjk_chars: number; model_id: string | null; latency_ms: number | null; asr_ms: number | null; audio_path: string | null; error: string | null; 
+/**
+ * The model step of the session (experimental), when it had one.
+ */
+refine_kind: RefineKind | null; refine_status: RefineStatus | null; 
+/**
+ * The rule-formatted text before the model step (a translation's Japanese).
+ */
+pre_refine_text: string | null; 
+/**
+ * Every model that ran, joined with "+" (`catalog::refine_model_ids`).
+ */
+refine_model_id: string | null; 
+/**
+ * Time from the refine request to the delivery: the model step's share of `latency_ms`.
+ */
+refine_ms: number | null }
 export type TranscriptStatus = "ok" | "failed" | "recovered"
 export type UiLanguage = "system" | "en" | "ja"
 /**

@@ -192,7 +192,11 @@ function noticeContent(
         case "pasted":
           return { icon: "ok", text: t.pill.pasted };
         case "copied":
-          return { icon: "ok", text: t.pill.copiedReason[notice.outcome.reason] };
+          return {
+            // A failed translation is a failure, even though the Japanese is on the clipboard.
+            icon: notice.outcome.reason === "refine_failed" ? "warn" : "ok",
+            text: t.pill.copiedReason[notice.outcome.reason],
+          };
         case "unconfirmed":
           return { icon: "info", text: t.pill.unconfirmed };
       }
@@ -257,7 +261,8 @@ export default function Pill() {
 
   const view = state.view;
   const recording = view.kind === "recording";
-  const busy = view.kind === "transcribing" || view.kind === "delivering";
+  const busy =
+    view.kind === "transcribing" || view.kind === "refining" || view.kind === "delivering";
   const bars = useWaveform(recording, reducedMotion);
 
   // Elapsed time: resynced on every recording event, ticked locally. Synced before paint, so a new
@@ -303,8 +308,9 @@ export default function Pill() {
     if (view.kind === "cancel_pending") {
       return `${view.kind}:${t.pill.escToUndo}`;
     }
-    return `${view.kind}:${state.language}:${annotation ? `shot${annotation.images}${annotation.screen_lost}${showHint}` : ""}`;
-  }, [view, notice, state.language, t, annotation, showHint]);
+    const task = view.kind === "refining" ? view.task : "";
+    return `${view.kind}:${task}:${state.language}:${state.refine ?? ""}:${annotation ? `shot${annotation.images}${annotation.screen_lost}${showHint}` : ""}`;
+  }, [view, notice, state.language, state.refine, t, annotation, showHint]);
 
   // Width: measured from the content on every layout change and sent to the native side, which cuts
   // the glass to it. The page's capsule changes at the next paint, the glass at once. The glass must
@@ -349,6 +355,8 @@ export default function Pill() {
   }
 
   const langTitle = state.language === "ja" ? t.common.japanese : t.common.english;
+  const translating = state.refine === "translate";
+  const busyLabel = view.kind === "refining" ? t.pill.refining[view.task] : t.pill.transcribing;
 
   const contentClass =
     recording || busy ? "pill pill--wave" : notice ? "pill pill--notice" : "pill";
@@ -367,7 +375,7 @@ export default function Pill() {
               : view.kind === "cancel_pending"
                 ? t.pill.escToUndo
                 : busy
-                  ? t.pill.transcribing
+                  ? busyLabel
                   : (notice?.text ?? "")
           }
         >
@@ -380,9 +388,18 @@ export default function Pill() {
                 </span>
                 {annotation && <ScreenMark annotation={annotation} t={t} />}
                 {recording && <span className="pill__time">{formatClock(elapsedMs)}</span>}
-                <span className="pill__lang" title={langTitle}>
-                  {state.language === "ja" ? "あ" : "A"}
-                </span>
+                {translating ? (
+                  <span className="pill__lang pill__lang--pair" title={t.pill.translateMark}>
+                    JA → EN
+                  </span>
+                ) : (
+                  <span className="pill__lang" title={langTitle}>
+                    {state.language === "ja" ? "あ" : "A"}
+                  </span>
+                )}
+                {view.kind === "refining" && (
+                  <span className="pill__hint">{t.pill.refining[view.task]}</span>
+                )}
                 {recording && annotation?.screen_lost && (
                   <span className="pill__hint pill__hint--warn">
                     {t.pill.annotation.screenLost}

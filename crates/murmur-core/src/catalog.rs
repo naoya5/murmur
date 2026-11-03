@@ -4,18 +4,26 @@
 //! Why: one table drives downloads, verification, the Models screen, the licenses screen and the
 //!      engine. Adding a model is a change to this file only (PLAN 2.16).
 //! Where: download and verify in `src-tauri/src/adapters/models.rs`; load in
-//!        `src-tauri/src/adapters/engine.rs`. Values are copied from speech.cpp v0.10.0
-//!        `tools/catalog/catalog.json` and the Hugging Face API (HANDOFF 7.2). Raise the
-//!        speech.cpp version and these revisions together, then run the engine tests.
+//!        `src-tauri/src/adapters/engine.rs` (speech) and `src-tauri/src/adapters/refiner.rs`
+//!        (the LLMs of the refine step, run by the murmur-llm sidecar). Speech values are copied
+//!        from speech.cpp v0.10.0 `tools/catalog/catalog.json` and the Hugging Face API (HANDOFF
+//!        7.2). Raise the speech.cpp version and these revisions together, then run the engine
+//!        tests. The LLM rows were chosen in the stage 0 eval (spec 6.7); to switch a model, add
+//!        its row, point `DEFAULT_*_MODEL` at it and rerun that eval set.
 
 use serde::Serialize;
 use specta::Type;
 
 use crate::Language;
+use crate::refine::RefineKind;
 
 pub const DEFAULT_JA_MODEL: &str = "haas-ja-v1.0-q8_0";
 pub const DEFAULT_EN_MODEL: &str = "parakeet-tdt-0.6b-v3-q8_0";
 pub const VAD_MODEL: &str = "silero-vad-v6.2";
+/// The translation model (A3: a translation-only model never answered in stage 0).
+pub const DEFAULT_TRANSLATE_MODEL: &str = "lfm2-350m-enjp-mt-q4_k_m";
+/// The cleanup model, used before a translation when the text has a marker (E1, E3).
+pub const DEFAULT_CLEAN_MODEL: &str = "qwen3.5-0.8b-q4_k_m";
 
 /// The model family decides how the engine adapter drives the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
@@ -27,6 +35,8 @@ pub enum Family {
     Qwen3Asr,
     /// Silero voice activity detection.
     SileroVad,
+    /// A chat LLM in GGUF, run by the murmur-llm sidecar (llama.cpp), never in the app process.
+    Llm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
@@ -34,6 +44,8 @@ pub enum Family {
 pub enum Role {
     Recognition,
     VoiceDetection,
+    /// The refine step after the text rules (`tasks` says which).
+    Refinement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
@@ -79,6 +91,13 @@ pub struct ModelEntry {
     /// Credit text that must be shown (CC-BY models). Empty when none is required.
     pub attribution: &'static str,
     pub capabilities: Capabilities,
+    /// What a `Role::Refinement` model does. Empty for every other role.
+    pub tasks: &'static [RefineKind],
+    /// About how much memory the model takes while it runs (the peak resident size of its sidecar
+    /// in the stage 0 / M2 measurements, the mapped file included). Shown for the refine models;
+    /// `None` where it was not measured.
+    #[specta(type = Option<f64>)]
+    pub memory_bytes: Option<u64>,
 }
 
 impl ModelEntry {
@@ -105,6 +124,14 @@ const FASTCONFORMER_PARAKEET: Capabilities = Capabilities {
     language_id: false,
 };
 
+/// For models that do not recognize speech.
+const NO_SPEECH_CAPABILITIES: Capabilities = Capabilities {
+    custom_vocabulary: false,
+    prompt_vocabulary: false,
+    punctuation: false,
+    language_id: false,
+};
+
 pub static CATALOG: &[ModelEntry] = &[
     ModelEntry {
         id: DEFAULT_JA_MODEL,
@@ -121,6 +148,8 @@ pub static CATALOG: &[ModelEntry] = &[
         license: "Apache-2.0",
         attribution: "Haas-ja-v1.0 by Third Intelligence, Apache-2.0",
         capabilities: FASTCONFORMER_HAAS,
+        tasks: &[],
+        memory_bytes: None,
     },
     ModelEntry {
         id: "haas-ja-v1.0-q5_k",
@@ -137,6 +166,8 @@ pub static CATALOG: &[ModelEntry] = &[
         license: "Apache-2.0",
         attribution: "Haas-ja-v1.0 by Third Intelligence, Apache-2.0",
         capabilities: FASTCONFORMER_HAAS,
+        tasks: &[],
+        memory_bytes: None,
     },
     ModelEntry {
         id: DEFAULT_EN_MODEL,
@@ -153,6 +184,8 @@ pub static CATALOG: &[ModelEntry] = &[
         license: "CC-BY-4.0",
         attribution: "NVIDIA parakeet-tdt-0.6b-v3, licensed under CC-BY-4.0. Converted to GGUF by sakasegawa.",
         capabilities: FASTCONFORMER_PARAKEET,
+        tasks: &[],
+        memory_bytes: None,
     },
     ModelEntry {
         id: "qwen3-asr-0.6b-q8_0",
@@ -174,6 +207,8 @@ pub static CATALOG: &[ModelEntry] = &[
             punctuation: true,
             language_id: true,
         },
+        tasks: &[],
+        memory_bytes: None,
     },
     ModelEntry {
         id: VAD_MODEL,
@@ -189,12 +224,47 @@ pub static CATALOG: &[ModelEntry] = &[
         sha256: "2fc312514e5fc4fa4ffd02b25c76a4853fa4130e8fb9777d01502183b01238cb",
         license: "MIT",
         attribution: "Silero VAD by Silero Team, MIT",
-        capabilities: Capabilities {
-            custom_vocabulary: false,
-            prompt_vocabulary: false,
-            punctuation: false,
-            language_id: false,
-        },
+        capabilities: NO_SPEECH_CAPABILITIES,
+        tasks: &[],
+        memory_bytes: None,
+    },
+    ModelEntry {
+        id: DEFAULT_TRANSLATE_MODEL,
+        display_name: "LFM2-350M-ENJP-MT (Q4_K_M)",
+        family: Family::Llm,
+        role: Role::Refinement,
+        tier: Tier::Standard,
+        languages: &[Language::Ja, Language::En],
+        repository: "LiquidAI/LFM2-350M-ENJP-MT-GGUF",
+        revision: "889c88c3d3681b4f342ae210a1d2a1369aba0e10",
+        file: "LFM2-350M-ENJP-MT-Q4_K_M.gguf",
+        bytes: 229_310_240,
+        sha256: "574ef7980dd20d69b494bce82565db5f25124d404be02052bbca62277d33077b",
+        license: "LFM Open License v1.0",
+        attribution: "LFM2-350M-ENJP-MT by Liquid AI, LFM Open License v1.0",
+        capabilities: NO_SPEECH_CAPABILITIES,
+        tasks: &[RefineKind::Translate],
+        // crates/murmur-llm/PERFORMANCE.md: 352 to 355 MiB.
+        memory_bytes: Some(355 * 1024 * 1024),
+    },
+    ModelEntry {
+        id: DEFAULT_CLEAN_MODEL,
+        display_name: "Qwen3.5-0.8B (Q4_K_M)",
+        family: Family::Llm,
+        role: Role::Refinement,
+        tier: Tier::Standard,
+        languages: &[Language::Ja],
+        repository: "unsloth/Qwen3.5-0.8B-GGUF",
+        revision: "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+        file: "Qwen3.5-0.8B-Q4_K_M.gguf",
+        bytes: 532_517_120,
+        sha256: "bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517",
+        license: "Apache-2.0",
+        attribution: "Qwen3.5-0.8B by the Qwen team, Apache-2.0. GGUF by Unsloth.",
+        capabilities: NO_SPEECH_CAPABILITIES,
+        tasks: &[RefineKind::Clean],
+        // crates/murmur-llm/PERFORMANCE.md: 701 to 741 MiB.
+        memory_bytes: Some(741 * 1024 * 1024),
     },
 ];
 
@@ -204,10 +274,31 @@ pub fn find(id: &str) -> Option<&'static ModelEntry> {
 
 pub fn vad() -> &'static ModelEntry {
     // VAD_MODEL is in CATALOG; the test below guards it.
-    CATALOG
+    find(VAD_MODEL).unwrap_or(&CATALOG[0])
+}
+
+/// The model that runs one refine step. Both ids are in CATALOG; the tests below guard it.
+pub fn refine_model(step: RefineKind) -> &'static ModelEntry {
+    let id = match step {
+        RefineKind::Clean => DEFAULT_CLEAN_MODEL,
+        RefineKind::Translate => DEFAULT_TRANSLATE_MODEL,
+    };
+    find(id).unwrap_or(&CATALOG[0])
+}
+
+/// The history's `refine_model_id`: the model of each call in order, joined with "+" (a
+/// translation that was cleaned first names both models). Ids only, never text.
+pub fn refine_model_ids(steps: &[RefineKind]) -> String {
+    steps
         .iter()
-        .find(|m| m.id == VAD_MODEL)
-        .unwrap_or(&CATALOG[CATALOG.len() - 1])
+        .map(|step| refine_model(*step).id)
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+/// The refine models (the Models screen's "cleanup and translation" section).
+pub fn refinement_models() -> impl Iterator<Item = &'static ModelEntry> {
+    CATALOG.iter().filter(|m| m.role == Role::Refinement)
 }
 
 /// Recognition models the user can pick for a language, standard first.
@@ -306,7 +397,60 @@ mod tests {
             match m.role {
                 Role::Recognition => assert!(!m.languages.is_empty(), "{}", m.id),
                 Role::VoiceDetection => assert!(m.languages.is_empty(), "{}", m.id),
+                Role::Refinement => assert!(m.languages.contains(&Language::Ja), "{}", m.id),
             }
+        }
+    }
+
+    #[test]
+    fn only_refinement_models_have_tasks_and_they_are_llms() {
+        for m in CATALOG {
+            assert_eq!(m.role == Role::Refinement, !m.tasks.is_empty(), "{}", m.id);
+            // The Models screen shows a memory estimate for each refine model.
+            assert_eq!(
+                m.role == Role::Refinement,
+                m.memory_bytes.is_some_and(|b| b > m.bytes),
+                "{}",
+                m.id
+            );
+            assert_eq!(
+                m.role == Role::Refinement,
+                m.family == Family::Llm,
+                "{}",
+                m.id
+            );
+        }
+    }
+
+    #[test]
+    fn each_refine_step_has_its_model() {
+        for step in [RefineKind::Clean, RefineKind::Translate] {
+            let m = refine_model(step);
+            assert_eq!(m.role, Role::Refinement);
+            assert!(m.tasks.contains(&step), "{}", m.id);
+        }
+        assert_eq!(
+            refine_model(RefineKind::Translate).id,
+            DEFAULT_TRANSLATE_MODEL
+        );
+        assert_eq!(refine_model(RefineKind::Clean).id, DEFAULT_CLEAN_MODEL);
+        assert_eq!(
+            refine_model_ids(&[RefineKind::Clean, RefineKind::Translate]),
+            format!("{DEFAULT_CLEAN_MODEL}+{DEFAULT_TRANSLATE_MODEL}")
+        );
+        assert_eq!(
+            refine_model_ids(&[RefineKind::Translate]),
+            DEFAULT_TRANSLATE_MODEL
+        );
+        assert_eq!(refine_model_ids(&[]), "");
+        let ids: Vec<&str> = refinement_models().map(|m| m.id).collect();
+        assert_eq!(ids, vec![DEFAULT_TRANSLATE_MODEL, DEFAULT_CLEAN_MODEL]);
+        // D2: both together stay under 1 GB of files.
+        let total: u64 = refinement_models().map(|m| m.bytes).sum();
+        assert!(total < 1_000_000_000, "{total}");
+        // Neither is a speech model for any language.
+        for lang in Language::ALL {
+            assert!(for_language(lang).all(|m| m.role == Role::Recognition));
         }
     }
 
