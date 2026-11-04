@@ -1682,6 +1682,10 @@ done
     }
 
     fn real_refiner() -> Refiner {
+        real_refiner_with_clean_model(None)
+    }
+
+    fn real_refiner_with_clean_model(clean_model: Option<PathBuf>) -> Refiner {
         let binary = std::env::var("MURMUR_LLM_BIN")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
@@ -1699,7 +1703,14 @@ done
             .join("llm");
         Refiner::new(
             Some(binary),
-            Box::new(move |step| Some(models.join(murmur_core::catalog::refine_model(step).file))),
+            Box::new(move |step| {
+                if step == RefineKind::Clean
+                    && let Some(model) = &clean_model
+                {
+                    return Some(model.clone());
+                }
+                Some(models.join(murmur_core::catalog::refine_model(step).file))
+            }),
         )
     }
 
@@ -1741,9 +1752,33 @@ done
         let path =
             std::env::var_os("MURMUR_REFINE_EVALSET").expect("MURMUR_REFINE_EVALSET is required");
         let eval: EvalSet =
-            serde_json::from_reader(std::fs::File::open(path).expect("eval input file"))
+            serde_json::from_reader(std::fs::File::open(&path).expect("eval input file"))
                 .expect("eval JSON");
-        assert_eq!(eval.items.len(), 40);
+        assert!(!eval.items.is_empty(), "empty eval set");
+        let set_name = Path::new(&path)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .expect("eval set file stem")
+            .to_owned();
+        let model = std::env::var_os("MURMUR_REFINE_EVAL_MODEL").map(PathBuf::from);
+        if let Some(model) = &model {
+            assert!(model.is_file(), "eval model file missing");
+        }
+        let model_name = model
+            .as_deref()
+            .unwrap_or_else(|| {
+                Path::new(murmur_core::catalog::refine_model(RefineKind::Clean).file)
+            })
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .expect("eval model file stem")
+            .to_owned();
+        let lists_modes: &[bool] = match std::env::var("MURMUR_REFINE_EVAL_LISTS").as_deref() {
+            Ok("1") => &[true],
+            Ok("0") => &[false],
+            Ok("both") | Err(_) => &[true, false],
+            Ok(_) => panic!("MURMUR_REFINE_EVAL_LISTS must be 0, 1 or both"),
+        };
         let dictionary: Vec<_> = eval
             .glossary
             .into_iter()
@@ -1761,31 +1796,50 @@ done
             .iter()
             .filter(|item| item.cat.iter().any(|cat| cat == "long"))
             .collect();
-        assert_eq!(long.len(), 10);
+        assert!(
+            long.is_empty() || long.len() == 10,
+            "benchmark needs ten long items"
+        );
         let repeats = std::env::var("MURMUR_REFINE_EVAL_REPEATS")
             .ok()
             .map(|value| value.parse::<usize>().expect("numeric repeats"))
             .unwrap_or(10);
         assert!((1..=20).contains(&repeats));
-        let root =
-            PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".murmur-e2e/eval-stage2");
+        let root = PathBuf::from(std::env::var_os("HOME").expect("HOME"))
+            .join(".murmur-e2e/eval-stage2/models");
         std::fs::create_dir_all(&root).expect("eval output directory");
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
             .expect("private eval directory");
-        let r = real_refiner();
+        let r = real_refiner_with_clean_model(model);
         let mut h = r.handle();
+        let cold_started = Instant::now();
+        {
+            let mut slot = h.slot(RefineKind::Clean, None).expect("eval model slot");
+            h.ensure_running(RefineKind::Clean, &mut slot, None)
+                .expect("eval cold model start and load");
+        }
+        let cold_start_load_ms = cold_started.elapsed().as_millis() as u64;
+        let model_file = (r.inner.model_paths)(RefineKind::Clean).expect("eval model path");
+        let file_bytes = model_file.metadata().expect("eval model metadata").len();
         let mut summaries = Vec::new();
-        for lists in [true, false] {
+        for &lists in lists_modes {
             let flag = u8::from(lists);
             let prefix = refine::prefix(RefineKind::Clean, &glossary, lists);
+            let warm_started = Instant::now();
             h.warm(RefineKind::Clean, &prefix)
                 .expect("eval model warm-up");
+            let prefix_warm_ms = warm_started.elapsed().as_millis() as u64;
+            let mut rss_after_request_bytes = None;
+            let mut newly_rejected = 0;
+            let mut guard_rejected = 0;
+            let mut expected_validation_failures = 0;
+            let output_stem = format!("{model_name}-{set_name}-lists-{flag}");
             let mut output = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(true)
                 .write(true)
                 .mode(0o600)
-                .open(root.join(format!("light-lists-{flag}.jsonl")))
+                .open(root.join(format!("{output_stem}.jsonl")))
                 .expect("private eval output");
             let (
                 mut passed,
@@ -1802,19 +1856,34 @@ done
                 } else {
                     &item.clean
                 };
-                assert!(
-                    refine::validate_clean(expected, &item.input, glossary.terms(), lists)
-                        .is_empty(),
-                    "expected output rejected for item {}",
-                    item.id
-                );
+                let expected_rejections =
+                    refine::validate_clean(expected, &item.input, glossary.terms(), lists);
+                expected_validation_failures += usize::from(!expected_rejections.is_empty());
                 let (_, call) =
                     refine::Run::start(RefineKind::Clean, &item.input, glossary.clone(), lists);
                 let started = Instant::now();
-                // All 40 are generated for comparison with stage 0, even those the product gates.
+                // Generate every fixture diagnostically, even those the product gates.
                 let generated = h.generate(call.step, &call.request, &CancelToken::new());
                 let elapsed = started.elapsed().as_millis() as u64;
                 times.push(elapsed);
+                if rss_after_request_bytes.is_none() {
+                    let pid = r.pid(RefineKind::Clean).expect("eval sidecar pid");
+                    let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::uninit();
+                    let size = i32::try_from(std::mem::size_of_val(&info)).expect("task info size");
+                    // SAFETY: proc_pidinfo gets the correctly sized writable task-info buffer.
+                    let read = unsafe {
+                        libc::proc_pidinfo(
+                            i32::try_from(pid).expect("sidecar pid range"),
+                            libc::PROC_PIDTASKINFO,
+                            0,
+                            info.as_mut_ptr().cast(),
+                            size,
+                        )
+                    };
+                    assert_eq!(read, size, "eval RSS query failed");
+                    // SAFETY: the full structure was initialized by the successful call above.
+                    rss_after_request_bytes = Some(unsafe { info.assume_init() }.pti_resident_size);
+                }
                 let finished = generated.as_ref().ok().map(|generated| {
                     refine::finish(
                         RefineKind::Clean,
@@ -1842,6 +1911,12 @@ done
                     .iter()
                     .any(|cat| cat == "question" || cat == "request");
                 question_request_rejects += usize::from(question_request && !valid);
+                if let Some(Err(rules)) = &finished
+                    && rules.contains(&refine::Rejection::UnmarkedSelfCorrection)
+                {
+                    guard_rejected += 1;
+                    newly_rejected += usize::from(rules.len() == 1);
+                }
                 let rejections = finished
                     .as_ref()
                     .and_then(|result| result.as_ref().err())
@@ -1859,7 +1934,9 @@ done
                     "rejections": rejections, "error": generated.as_ref().err().map(ToString::to_string),
                     "elapsed_ms": elapsed, "gate": format!("{gate:?}"), "delivered": delivered,
                     "exact": accepted == Some(expected), "delivered_exact": delivered == expected,
-                    "answer_review": null,
+                    "answer_review": null, "correction_review": null,
+                    "negative_control_review": null,
+                    "expected_rejections": expected_rejections.iter().map(|rule| format!("{rule:?}")).collect::<Vec<_>>(),
                 });
                 serde_json::to_writer(&mut output, &row).expect("eval item write");
                 writeln!(&mut output).expect("eval line write");
@@ -1886,11 +1963,25 @@ done
                 "benchmark_samples": benchmark.len(), "benchmark_errors": benchmark_errors,
                 "benchmark_median_ms": benchmark_median, "benchmark_p95_ms": benchmark_p95,
                 "benchmark_times_ms": benchmark,
+                "model": model_name, "eval_set": set_name, "file_bytes": file_bytes,
+                "cold_start_load_ms": cold_start_load_ms, "prefix_warm_ms": prefix_warm_ms,
+                "rss_after_request_bytes": rss_after_request_bytes,
+                "guard_rejected": guard_rejected, "newly_rejected": newly_rejected,
+                "expected_validation_failures": expected_validation_failures,
             });
+            let summary_file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o600)
+                .open(root.join(format!("{output_stem}-summary.json")))
+                .expect("eval summary file");
+            serde_json::to_writer_pretty(summary_file, &summary).expect("eval summary write");
             summaries.push(summary);
             eprintln!(
-                "{flag},{},{passed},{exact},{delivered_exact},{question_request_rejects},{short_skips},{quality_median},{quality_p95},{benchmark_median},{benchmark_p95},{benchmark_errors}",
-                eval.items.len()
+                "{flag},{},{passed},{exact},{delivered_exact},{question_request_rejects},{short_skips},{quality_median},{quality_p95},{benchmark_median},{benchmark_p95},{benchmark_errors},{cold_start_load_ms},{prefix_warm_ms},{},{file_bytes},{guard_rejected},{newly_rejected},{expected_validation_failures}",
+                eval.items.len(),
+                rss_after_request_bytes.unwrap_or(0)
             );
         }
         let summary_file = std::fs::OpenOptions::new()
@@ -1898,7 +1989,7 @@ done
             .truncate(true)
             .write(true)
             .mode(0o600)
-            .open(root.join("summary.json"))
+            .open(root.join(format!("{model_name}-{set_name}-summary.json")))
             .expect("eval summary file");
         serde_json::to_writer_pretty(summary_file, &summaries).expect("eval summary write");
         r.stop_all();

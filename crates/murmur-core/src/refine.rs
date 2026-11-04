@@ -602,6 +602,8 @@ pub enum Rejection {
     QuestionMark,
     /// S3: the sentence ending changed without a list (an answer or a statement).
     Ending,
+    /// A replaced clause survived after its self-correction marker was removed.
+    UnmarkedSelfCorrection,
     Kana,
 }
 
@@ -708,8 +710,99 @@ fn has_list_line(text: &str) -> bool {
     text.lines().any(|line| line.trim_start().starts_with("- "))
 }
 
-/// Rules for a cleanup output: length ratio, no preface, bigram overlap, glossary kept, and the
-/// rules S1 to S3 that stage 0 found necessary (without them answers passed).
+// Unlike the gate's broad substring markers, these phrases must start a clause. The apology
+// form counts only with its interjection between clauses; ordinary apologies stay untouched.
+const CORRECTION_PHRASES: &[&str] = &[
+    "あ、すみません",
+    "いや",
+    "じゃなくて",
+    "ではなく",
+    "違う",
+    "間違えた",
+    "間違えました",
+    "訂正します",
+    "訂正",
+];
+const CORRECTION_INTERJECTIONS: &[&str] = &["あ", "あっ", "え", "えっ"];
+
+fn correction_delimiter(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '、' | ',' | '。' | '？' | '?' | '！' | '!' | '；' | ';')
+}
+
+fn replaced_clause(before: &str) -> Option<&str> {
+    before
+        .rsplit(correction_delimiter)
+        .find(|part| !part.is_empty() && !CORRECTION_INTERJECTIONS.contains(part))
+}
+
+fn correction_in_context(before: &str, phrase: &str, after: &str) -> bool {
+    if !before.chars().next_back().is_some_and(correction_delimiter) {
+        return false;
+    }
+    // These words can introduce disagreement or enthusiasm, rather than replace a value.
+    let next = after.trim_start_matches(correction_delimiter);
+    if next.is_empty()
+        || next.starts_with(['ー', '〜', '～'])
+        || next.starts_with("そうじゃなく")
+        || next.starts_with("そうではなく")
+    {
+        return false;
+    }
+    // Bare correction nouns/verbs must end here, not be part of "訂正印" or "違うので".
+    if matches!(phrase, "訂正" | "違う" | "間違えた" | "間違えました")
+        && !after.chars().next().is_some_and(correction_delimiter)
+    {
+        return false;
+    }
+    true
+}
+
+fn unmarked_copies(text: &str, clause: &str, markers: &[String]) -> usize {
+    text.match_indices(clause)
+        .filter(|(start, _)| {
+            let rest = &text[start + clause.len()..];
+            let marked = |rest: &str| markers.iter().any(|marker| rest.starts_with(marker));
+            !marked(rest)
+                && !CORRECTION_INTERJECTIONS
+                    .iter()
+                    .any(|interjection| rest.strip_prefix(interjection).is_some_and(marked))
+        })
+        .count()
+}
+
+fn has_unmarked_self_correction(out: &str, source: &str) -> bool {
+    let src_content: String = content_chars(source).into_iter().collect();
+    let out_content: String = content_chars(out).into_iter().collect();
+    if src_content == out_content {
+        return false;
+    }
+    let markers: Vec<String> = CORRECTION_PHRASES
+        .iter()
+        .map(|phrase| content_chars(phrase).into_iter().collect())
+        .collect();
+    // The replaced span is the previous punctuation-delimited, non-interjection clause.
+    // Reject only newly unmarked copies of that literal span. Copies already elsewhere in
+    // the input remain allowed, including a corrected value containing it ("3時" -> "13時").
+    CORRECTION_PHRASES.iter().any(|phrase| {
+        source.match_indices(phrase).any(|(start, _)| {
+            let before = &source[..start];
+            let after = &source[start + phrase.len()..];
+            if !correction_in_context(before, phrase, after) {
+                return false;
+            }
+            let Some(clause) = replaced_clause(before) else {
+                return false;
+            };
+            let clause: String = content_chars(clause).into_iter().collect();
+            !clause.is_empty()
+                && unmarked_copies(&out_content, &clause, &markers)
+                    > unmarked_copies(&src_content, &clause, &markers)
+        })
+    })
+}
+
+/// Rules for a cleanup output: length ratio, no preface, bigram overlap, glossary kept,
+/// self-correction preservation, and S1 to S3 (without them answers passed in stage 0).
 pub fn validate_clean(out: &str, source: &str, glossary: &[String], lists: bool) -> Vec<Rejection> {
     if out.trim().is_empty() {
         return vec![Rejection::Empty];
@@ -753,6 +846,9 @@ pub fn validate_clean(out: &str, source: &str, glossary: &[String], lists: bool)
     let tail = |chars: &[char]| chars[chars.len().saturating_sub(2)..].to_vec();
     if (!lists || !has_list_line(out)) && tail(&out_chars) != tail(&src_chars) {
         fails.push(Rejection::Ending);
+    }
+    if has_unmarked_self_correction(out, source) {
+        fails.push(Rejection::UnmarkedSelfCorrection);
     }
     fails
 }
@@ -1094,6 +1190,166 @@ mod tests {
         let src = "今どこですか？";
         assert!(
             validate_clean("今どこですか。", src, &[], true).contains(&Rejection::QuestionMark)
+        );
+    }
+
+    #[test]
+    fn correction_guard_preserves_all_seven_calibration_fixes_and_unchanged_inputs() {
+        let cal = calibration();
+        for id in [5, 6, 7, 8, 24, 38, 40] {
+            let item = cal
+                .items
+                .iter()
+                .find(|item| item.id == id)
+                .expect("item id");
+            let marker_only = item
+                .input
+                .replace("あ、すみません、", "")
+                .replace("あ、違う、", "")
+                .replace("じゃなくて", "")
+                .replace("いや", "");
+            assert_ne!(marker_only, item.input, "item {id}");
+            for lists in [false, true] {
+                for safe in [&item.input, &item.clean] {
+                    assert!(
+                        validate_clean(safe, &item.input, &cal.glossary, lists).is_empty(),
+                        "safe output for item {id}"
+                    );
+                }
+                assert!(
+                    validate_clean(&marker_only, &item.input, &cal.glossary, lists)
+                        .contains(&Rejection::UnmarkedSelfCorrection),
+                    "marker-only removal for item {id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn correction_guard_ignores_obvious_non_correction_contexts() {
+        for (source, out) in [
+            ("いやー、今日はよく歩きました。", "今日はよく歩きました。"),
+            (
+                "疲れましたね、いやー、今日はよく歩きました。",
+                "疲れましたね、今日はよく歩きました。",
+            ),
+            (
+                "いや、そうじゃなくて、別の話です。",
+                "そうじゃなくて、別の話です。",
+            ),
+            (
+                "同じ話ですか、いや、そうじゃなくて、別の話です。",
+                "同じ話ですか、そうじゃなくて、別の話です。",
+            ),
+            (
+                "これは誤りではなく表記の違いです。",
+                "これは誤りではなく表記の違いです。",
+            ),
+            (
+                "古い訂正印ですが、訂正印としてまだ使えます。",
+                "古い訂正印ですが、印としてまだ使えます。",
+            ),
+            (
+                "種類が違うので、別々に数えます。",
+                "種類が違うので、別々に数えます。",
+            ),
+            (
+                "この道です、間違えたので戻ります。",
+                "この道です、戻ります。",
+            ),
+            (
+                "お待たせしてすみません、準備できました。",
+                "お待たせしてすみません、準備できました。",
+            ),
+            ("台詞は「いや」です。", "台詞は「いや」です。"),
+        ] {
+            assert!(!has_unmarked_self_correction(out, source));
+            assert!(!has_unmarked_self_correction(source, source));
+        }
+    }
+
+    #[test]
+    fn correction_guard_counts_each_replaced_clause_without_rejecting_shared_text() {
+        for (source, out, rejected) in [
+            ("3時、いや13時で。", "13時で。", false),
+            ("3時、いや13時で。", "3時、13時で。", true),
+            ("東京、いや東京都内です。", "東京都内です。", false),
+            ("東京、いや東京都内です。", "東京、東京都内です。", true),
+            ("3時、いや3時で。", "3時で。", false),
+            (
+                "3時、いや4時で。別の受付は3時です。",
+                "4時で。別の受付は3時です。",
+                false,
+            ),
+            (
+                "3時、いや4時で。別の受付は3時です。",
+                "3時、4時で。別の受付は3時です。",
+                true,
+            ),
+            (
+                "集合は1時、いや2時、解散は3時、いや4時です。",
+                "集合は1時、2時、解散は3時、いや4時です。",
+                true,
+            ),
+            (
+                "集合は1時、いや2時、解散は3時、いや4時です。",
+                "集合は2時、解散は4時です。",
+                false,
+            ),
+            (
+                "会議は3時から、あ、違う、4時からでお願いします。",
+                "会議は3時から、違う、4時からでお願いします。",
+                false,
+            ),
+            (
+                "会議は3時から、いや4時からでお願いします。",
+                "会議は3時から、ではなく4時からでお願いします。",
+                false,
+            ),
+            (
+                "会議は3時から、いや4時からでお願いします。",
+                "会議は3時から、または4時からでお願いします。",
+                true,
+            ),
+            (
+                "会議は3時から、いや4時からでお願いします。",
+                "会議は3時から、いや、4時からでお願いします。",
+                false,
+            ),
+        ] {
+            assert_eq!(has_unmarked_self_correction(out, source), rejected);
+        }
+    }
+
+    #[test]
+    fn a_marker_only_cleanup_fails_and_translation_uses_the_rule_text() {
+        let source = "会議は3時から、いや4時からでお願いします。";
+        let harmful = "会議は3時から、4時からでお願いします。";
+        let (report, _) = drive(RefineKind::Clean, source, vec![ok(harmful)]);
+        assert_eq!(
+            report.result,
+            Err(RefineError::Rejected(vec![
+                Rejection::UnmarkedSelfCorrection
+            ]))
+        );
+        let (report, calls) = drive(
+            RefineKind::Translate,
+            source,
+            vec![ok(harmful), ok("Please make the meeting at four.")],
+        );
+        assert_eq!(
+            report.pre_clean,
+            PreClean::Failed(RefineError::Rejected(vec![
+                Rejection::UnmarkedSelfCorrection
+            ]))
+        );
+        assert_eq!(
+            calls[1]
+                .request
+                .messages
+                .last()
+                .map(|message| message.content.as_str()),
+            Some(source)
         );
     }
 
