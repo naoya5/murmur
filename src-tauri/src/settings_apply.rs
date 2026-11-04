@@ -118,6 +118,27 @@ pub fn update(
             }
         },
     )?;
+    // Refiner teardown happens only after the new settings are durable and published.
+    for (was_on, is_on, kind) in [
+        (old.refine_enabled, next.refine_enabled, RefineKind::Clean),
+        (
+            old.translate_enabled,
+            next.translate_enabled,
+            RefineKind::Translate,
+        ),
+    ] {
+        if was_on
+            && !is_on
+            && let Some(controller) = services.controller()
+        {
+            controller.event(Event::RefineDisabled { kind });
+        }
+    }
+    // update_settings already runs on the blocking pool. Keep the update lock through the
+    // bounded stop, so a quick off/on cannot retire a newly enabled recording's lifecycle.
+    for step in refine_shutdown_steps(&old, &next) {
+        services.refiner().stop(step);
+    }
     if keys.contains(&SettingKey::AnnotationsRetentionDays) {
         spawn_bundle_cleanup(services, next.annotations_retention_days);
     }
@@ -146,6 +167,21 @@ pub fn update(
         Some(error) => Err(error),
         None => Ok(next),
     }
+}
+
+/// Cleanup is shared with translation. Stop it only after both features are off.
+fn refine_shutdown_steps(old: &Settings, next: &Settings) -> Vec<RefineKind> {
+    let mut steps = Vec::new();
+    if old.translate_enabled && !next.translate_enabled {
+        steps.push(RefineKind::Translate);
+    }
+    if (old.refine_enabled || old.translate_enabled)
+        && !next.refine_enabled
+        && !next.translate_enabled
+    {
+        steps.push(RefineKind::Clean);
+    }
+    steps
 }
 
 /// Publish only after the atomic file replacement; undo external changes on save failure.
@@ -385,11 +421,13 @@ fn apply(
         }
         // The cleanup runs after the settings commit in `update`.
         SettingKey::AnnotationsRetentionDays => Ok(()),
-        // Translation (experimental). On: the hotkey only; the sidecars start with the first
-        // translation recording (D3), and the UI guides to the Models screen while a model is
-        // missing. Off: the hotkey goes, a recording in progress is dropped and one past its
-        // recording is copied unrefined (`Event::RefineDisabled`), and both sidecars stop (the
-        // cleanup model serves only the translation in stage 1).
+        // Cleanup starts no process on enable. The UI guides to Models if its model is missing;
+        // disable is applied after save, keeping a shared cleanup sidecar while translation is on.
+        SettingKey::RefineEnabled => Ok(()),
+        // Carried by the core RefinePlan from the next hotkey press, including warm-up.
+        SettingKey::RefineLists => Ok(()),
+        // Translation registers only its hotkey here. Teardown is applied after save and keeps
+        // the shared cleanup model while dictation cleanup is on.
         SettingKey::TranslateEnabled => {
             if next.translate_enabled {
                 let Some(hotkeys) = services.hotkeys() else {
@@ -407,13 +445,6 @@ fn apply(
                 {
                     tracing::warn!(%error, "could not unregister the translation hotkey");
                 }
-                if let Some(controller) = services.controller() {
-                    controller.event(Event::RefineDisabled {
-                        kind: RefineKind::Translate,
-                    });
-                }
-                let refiner = services.refiner().clone();
-                tauri::async_runtime::spawn_blocking(move || refiner.stop_all());
                 Ok(())
             }
         }
@@ -502,6 +533,37 @@ mod tests {
         .unwrap();
         assert_eq!(*memory.borrow(), next);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn shared_cleanup_stops_only_when_both_features_are_off() {
+        for old_clean in [false, true] {
+            for old_translate in [false, true] {
+                for clean in [false, true] {
+                    for translate in [false, true] {
+                        let old = Settings {
+                            refine_enabled: old_clean,
+                            translate_enabled: old_translate,
+                            ..Settings::default()
+                        };
+                        let next = Settings {
+                            refine_enabled: clean,
+                            translate_enabled: translate,
+                            ..Settings::default()
+                        };
+                        let stops = refine_shutdown_steps(&old, &next);
+                        assert_eq!(
+                            stops.contains(&RefineKind::Translate),
+                            old_translate && !translate
+                        );
+                        assert_eq!(
+                            stops.contains(&RefineKind::Clean),
+                            (old_clean || old_translate) && !clean && !translate
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

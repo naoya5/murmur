@@ -80,6 +80,21 @@ Translation (experimental) adds five columns to `transcripts`: `refine_kind`, `r
 `+`) and `refine_ms`. `text` stays what went out. The day totals count `pre_refine_text`, what was spoken. The
 two models are ordinary catalog entries in `models/`.
 
+## Cleanup (experimental)
+
+`refine_enabled` opts Japanese dictation into the existing model step; English and annotation
+sessions keep their ordinary path. Main and alternate-language hotkeys choose from the resolved
+spoken language. The core `RefinePlan` snapshots `refine_lists` at the press and carries it through
+recording, transcription, warm-up and generation. Translation uses its own fixed lists-on pre-clean.
+Failed, timed-out and over-limit cleanup deliver the rule text and emit a short `CleanupSkipped`
+notice; the short-text skip stays silent. History keeps the original text and the true status.
+
+Settings changes start no sidecars. After a successful settings save, disabling a feature tells the
+controller to fall back, then performs bounded teardown on the settings command's blocking thread.
+The adapter has a separate lifecycle per model: disabling translation can stop only translation,
+and cleanup stops only when neither feature needs it. The settings update lock prevents an off/on
+race with that teardown. The settings block and notice presentation are wired in the UI milestone.
+
 ## Translation (experimental)
 
 Off by default (`translate_enabled`). While it is off nothing of it runs: no hotkey, no process, no model. A
@@ -94,9 +109,9 @@ New parts:
 | Where | Role |
 |---|---|
 | `crates/murmur-core/src/refine.rs` | Pure rules: marker gating, prompts and example turns, output cap, post-processing, validation (stage 0 calibration in its tests), time budgets, sidecar timings, the restart budget, and `Run`, which says which model call comes next. |
-| `crates/murmur-core/src/{session,catalog,settings,ports}.rs` | The `Refining` state and its rows, the two LLM catalog rows, the two `Translate*` settings, the `TextRefiner` port. |
+| `crates/murmur-core/src/{session,catalog,settings,ports}.rs` | The `Refining` state and its rows, the two LLM catalog rows, `Refine*` / `Translate*` settings, the `TextRefiner` port. |
 | `src-tauri/src/refine_session.rs` | Makes the calls that `Run` asks for (on a blocking thread) and warms the models at recording start. |
-| `adapters/refiner.rs` | The `TextRefiner`: one sidecar process per model, JSON Lines (protocol SOT: `crates/murmur-llm/src/main.rs`) through a writer and a reader thread, every wait bounded, cancel then kill, children reaped (also when dropped), three restarts per ten minutes after crashes, stopped after five idle minutes. A lifecycle token ends the calls of a switched-off feature before its processes stop. |
+| `adapters/refiner.rs` | The `TextRefiner`: one sidecar process per model, JSON Lines (protocol SOT: `crates/murmur-llm/src/main.rs`) through a writer and a reader thread, every wait bounded, cancel then kill, children reaped (also when dropped), three restarts per ten minutes after crashes, stopped after five idle minutes. Per-model lifecycle tokens end retired model calls before their processes stop. |
 | `src/views/{Settings,Models,History}.tsx`, `src/pill/Pill.tsx`, `tray.rs` | The translation block under Experimental (hotkey, model state, start failures from `get_refiner_status`), the "Cleanup and translation" models section (size, memory, license), the pill's `JA → EN` mark and "Translating", the history's badges and the Japanese to open and copy, and a menu bar item that copies a translation's Japanese. |
 
 Flow at a glance:

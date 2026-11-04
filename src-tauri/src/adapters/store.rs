@@ -1148,6 +1148,38 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_history_keeps_the_original_and_true_status_for_every_outcome() {
+        let store = Store::open_in_memory().unwrap();
+        for status in [
+            RefineStatus::Ok,
+            RefineStatus::Skipped,
+            RefineStatus::Failed,
+            RefineStatus::Timeout,
+        ] {
+            let id = format!("clean-{}", status.code());
+            let cleaned = TranscriptRow {
+                language: Some(Language::Ja),
+                refine_kind: Some(RefineKind::Clean),
+                refine_status: Some(status),
+                pre_refine_text: Some("あの、会議は4時からです。".into()),
+                refine_model_id: (status != RefineStatus::Skipped).then(|| "qwen".into()),
+                refine_ms: (status != RefineStatus::Skipped).then_some(320),
+                ..row(&id, 1_700_000_000_000, "会議は4時からです。")
+            };
+            store.insert_success(&cleaned).unwrap();
+            assert_eq!(store.get(&id).unwrap(), Some(cleaned));
+        }
+        // Both the history and tray read these same rows; originals remain searchable.
+        let rows = store.list("あの", 10, 0).unwrap();
+        assert_eq!(rows.len(), 4);
+        assert!(
+            rows.iter()
+                .all(|row| row.refine_kind == Some(RefineKind::Clean)
+                    && row.pre_refine_text.is_some())
+        );
+    }
+
+    #[test]
     fn migration_one_is_frozen() {
         // Shipped migrations never change: any edit to migration 1 changes this checksum (FNV-1a).
         let hash = MIGRATIONS[0]

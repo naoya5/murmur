@@ -184,10 +184,15 @@ pub fn tray_model(services: &App) -> TrayModel {
         .map(|rows| {
             rows.into_iter()
                 .filter_map(|row| {
-                    // Only a successful model step changed the text; a failed one delivered the
-                    // text from before it.
+                    // Cleanup originals stay accessible for every status, including skips.
+                    // Translation keeps its existing successful-translation copy entry.
                     let before = match (row.refine_kind, row.refine_status, row.pre_refine_text) {
-                        (Some(kind), Some(RefineStatus::Ok), Some(text)) => Some((kind, text)),
+                        (Some(kind), status, Some(text))
+                            if kind == murmur_core::refine::RefineKind::Clean
+                                || status == Some(RefineStatus::Ok) =>
+                        {
+                            Some((kind, text))
+                        }
                         _ => None,
                     };
                     Some(RecentItem {

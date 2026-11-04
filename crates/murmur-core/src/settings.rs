@@ -135,6 +135,10 @@ pub struct Settings {
     /// Hotkey that records Japanese for translation (accelerator string), same record modes as
     /// the main hotkey. Registered only while translation is on.
     pub translate_hotkey: String,
+    /// Experimental: light cleanup of Japanese dictation by a local model.
+    pub refine_enabled: bool,
+    /// Convert spoken enumerations into bullet lists. Snapshotted at recording start.
+    pub refine_lists: bool,
 }
 
 /// Default accelerator of the annotations hotkey.
@@ -176,6 +180,8 @@ impl Default for Settings {
             annotations_retention_days: DEFAULT_ANNOTATIONS_RETENTION_DAYS,
             translate_enabled: false,
             translate_hotkey: DEFAULT_TRANSLATE_HOTKEY.to_owned(),
+            refine_enabled: false,
+            refine_lists: true,
         }
     }
 }
@@ -209,6 +215,8 @@ pub enum SettingKey {
     AnnotationsRetentionDays,
     TranslateEnabled,
     TranslateHotkey,
+    RefineEnabled,
+    RefineLists,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -222,6 +230,15 @@ pub enum SettingsError {
 }
 
 impl Settings {
+    /// The optional cleanup plan for a dictation in its resolved spoken language. Translation
+    /// chooses its own plan; English dictation never uses the Japanese-only cleanup rules.
+    pub fn dictation_refine(&self, language: Language) -> Option<crate::refine::RefinePlan> {
+        (self.refine_enabled && language == Language::Ja).then_some(crate::refine::RefinePlan::new(
+            crate::refine::RefineKind::Clean,
+            self.refine_lists,
+        ))
+    }
+
     /// The keys whose values differ between `self` (old) and `new`.
     ///
     /// Destructures every field without `..`: adding a field breaks the build here until it gets
@@ -254,6 +271,8 @@ impl Settings {
             annotations_retention_days,
             translate_enabled,
             translate_hotkey,
+            refine_enabled,
+            refine_lists,
         } = self;
         let mut keys = Vec::new();
         let mut check = |changed: bool, key: SettingKey| {
@@ -328,6 +347,11 @@ impl Settings {
             *translate_hotkey != new.translate_hotkey,
             SettingKey::TranslateHotkey,
         );
+        check(
+            *refine_enabled != new.refine_enabled,
+            SettingKey::RefineEnabled,
+        );
+        check(*refine_lists != new.refine_lists, SettingKey::RefineLists);
         keys
     }
 
@@ -550,6 +574,8 @@ mod tests {
         assert_eq!(s.annotations_retention_days, 7);
         assert!(!s.translate_enabled);
         assert_eq!(s.translate_hotkey, "Alt+Shift+KeyE");
+        assert!(!s.refine_enabled);
+        assert!(s.refine_lists);
     }
 
     #[test]
@@ -853,6 +879,14 @@ mod tests {
                 Box::new(|s| s.translate_hotkey = "Alt+Shift+KeyT".to_owned()),
                 SettingKey::TranslateHotkey,
             ),
+            (
+                Box::new(|s| s.refine_enabled = true),
+                SettingKey::RefineEnabled,
+            ),
+            (
+                Box::new(|s| s.refine_lists = false),
+                SettingKey::RefineLists,
+            ),
         ];
         let old = Settings::default();
         let mut seen = Vec::new();
@@ -866,7 +900,7 @@ mod tests {
         // Every key is exercised exactly once (keep this list in step with `SettingKey`).
         seen.sort_by_key(|k| format!("{k:?}"));
         seen.dedup();
-        assert_eq!(seen.len(), 25);
+        assert_eq!(seen.len(), 27);
     }
 
     #[test]
@@ -980,6 +1014,45 @@ mod tests {
         assert!(json.contains("\"record_mode\": \"push_to_talk\""));
         assert!(json.contains("\"kind\": \"days\""));
         assert!(json.contains("\"language\": \"en\""));
+    }
+
+    #[test]
+    fn cleanup_settings_validate_and_round_trip_in_every_combination() {
+        for enabled in [false, true] {
+            for lists in [false, true] {
+                for language in [Language::Ja, Language::En] {
+                    let s = Settings {
+                        refine_enabled: enabled,
+                        refine_lists: lists,
+                        language,
+                        ..Settings::default()
+                    };
+                    assert_eq!(s.validate(), Ok(()));
+                    assert_eq!(
+                        s.dictation_refine(language),
+                        (enabled && language == Language::Ja).then_some(
+                            crate::refine::RefinePlan::new(crate::refine::RefineKind::Clean, lists)
+                        )
+                    );
+                    let json = serde_json::to_string(&s).unwrap();
+                    assert_eq!(Settings::migrate(&json).unwrap(), s);
+                }
+            }
+        }
+        for bad in [r#"{"refine_enabled":"true"}"#, r#"{"refine_lists":0}"#] {
+            assert!(matches!(
+                Settings::migrate(bad),
+                Err(SettingsError::Parse(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn old_settings_keep_cleanup_off_and_lists_on() {
+        let s = Settings::migrate(r#"{"translate_enabled":true}"#).unwrap();
+        assert!(!s.refine_enabled);
+        assert!(s.refine_lists);
+        assert!(s.translate_enabled);
     }
 
     #[test]

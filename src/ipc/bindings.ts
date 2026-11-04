@@ -488,7 +488,11 @@ export type Navigate = { view: string }
 /**
  * Short feedback the pill shows before it hides.
  */
-export type Notice = { kind: "delivered"; outcome: DeliveryOutcome } | { kind: "no_speech" } | 
+export type Notice = { kind: "delivered"; outcome: DeliveryOutcome } | 
+/**
+ * Cleanup failed, timed out, or was too long; the rule text was delivered instead.
+ */
+{ kind: "cleanup_skipped"; outcome: DeliveryOutcome } | { kind: "no_speech" } | 
 /**
  * The audio is saved in the history and can be retried.
  */
@@ -650,7 +654,15 @@ translate_enabled: boolean;
  * Hotkey that records Japanese for translation (accelerator string), same record modes as
  * the main hotkey. Registered only while translation is on.
  */
-translate_hotkey: string }
+translate_hotkey: string; 
+/**
+ * Experimental: light cleanup of Japanese dictation by a local model.
+ */
+refine_enabled: boolean; 
+/**
+ * Convert spoken enumerations into bullet lists. Snapshotted at recording start.
+ */
+refine_lists: boolean }
 /**
  * Settings were saved; every window re-reads what it shows.
  */

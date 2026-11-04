@@ -15,9 +15,10 @@
 //! answer text reaches the log (G7): only ids, error codes, token counts and times.
 //!
 //! Lifecycle: `Refiner::handle` gives a `RefinerHandle` (the `ports::TextRefiner`) bound to the
-//! current lifecycle. `stop_all` and `shutdown` end that lifecycle before they stop anything: the
-//! handles taken before can start nothing more, and their calls in progress stop at once. Handles
-//! taken afterwards (a later recording) belong to the next lifecycle.
+//! current lifecycle of each model. `stop(step)` retires only that model; `stop_all` and
+//! `shutdown` retire both. Old handles cannot restart a retired model, and its calls in progress
+//! stop promptly. The other model remains usable, so translation and cleanup can share cleanup's
+//! process. Later recordings take fresh lifecycle tokens.
 //!
 //! Only transport lives here. Prompts, validation and the order of the steps are in
 //! `murmur_core::refine`; `crate::refine_session` makes the calls.
@@ -98,7 +99,8 @@ pub struct Refiner {
 #[derive(Clone)]
 pub struct RefinerHandle {
     inner: Arc<Inner>,
-    lifecycle: CancelToken,
+    clean_lifecycle: CancelToken,
+    translate_lifecycle: CancelToken,
 }
 
 struct Inner {
@@ -107,13 +109,13 @@ struct Inner {
     origin: Instant,
     clean: Sidecar,
     translate: Sidecar,
-    /// Cancelled when the lifecycle ends; replaced by a fresh token at once.
-    lifecycle: Mutex<CancelToken>,
 }
 
 #[derive(Default)]
 struct Sidecar {
     slot: Mutex<Slot>,
+    /// Each model has its own lifecycle: stopping translation must not end shared cleanup calls.
+    lifecycle: Mutex<CancelToken>,
     /// The process runs with its model loaded. Read without the slot (`ready`).
     loaded: AtomicBool,
     /// Why the last start or model load failed, until a start succeeds (`status`).
@@ -578,7 +580,6 @@ impl Refiner {
                 origin: Instant::now(),
                 clean: Sidecar::default(),
                 translate: Sidecar::default(),
-                lifecycle: Mutex::new(CancelToken::new()),
             }),
         }
     }
@@ -587,7 +588,8 @@ impl Refiner {
     pub fn handle(&self) -> RefinerHandle {
         RefinerHandle {
             inner: Arc::clone(&self.inner),
-            lifecycle: lock_ignoring_poison(&self.inner.lifecycle).clone(),
+            clean_lifecycle: lock_ignoring_poison(&self.inner.clean.lifecycle).clone(),
+            translate_lifecycle: lock_ignoring_poison(&self.inner.translate.lifecycle).clone(),
         }
     }
 
@@ -616,25 +618,32 @@ impl Refiner {
         }
     }
 
-    /// Ends the lifecycle and stops both processes (the feature was switched off, or a model was
-    /// deleted).
+    /// Ends both model lifecycles and stops both processes (for example, on model deletion).
     pub fn stop_all(&self) {
-        self.stop_processes(STOP_WAIT);
+        self.stop_processes(&[RefineKind::Clean, RefineKind::Translate], STOP_WAIT);
     }
 
     /// The same as the app quits, with a shorter wait. A process left busy also exits by itself
     /// once Murmur's end closes its input.
     pub fn shutdown(&self) {
-        self.stop_processes(SHUTDOWN_WAIT);
+        self.stop_processes(&[RefineKind::Clean, RefineKind::Translate], SHUTDOWN_WAIT);
     }
 
-    fn stop_processes(&self, wait: Duration) {
-        // First end the lifecycle: the handles taken before start nothing more, and their calls
-        // in progress stop. Later handles belong to the fresh lifecycle.
-        let ended = std::mem::take(&mut *lock_ignoring_poison(&self.inner.lifecycle));
-        ended.cancel();
+    /// Stops just one model, without invalidating the other model's handles or calls.
+    pub fn stop(&self, step: RefineKind) {
+        self.stop_processes(&[step], STOP_WAIT);
+    }
+
+    fn stop_processes(&self, steps: &[RefineKind], wait: Duration) {
+        // Invalidate every affected handle before waiting for any busy process slot.
+        for &step in steps {
+            let ended = std::mem::take(&mut *lock_ignoring_poison(
+                &self.inner.sidecar(step).lifecycle,
+            ));
+            ended.cancel();
+        }
         let deadline = Instant::now() + wait;
-        for step in [RefineKind::Clean, RefineKind::Translate] {
+        for &step in steps {
             let sidecar = self.inner.sidecar(step);
             match lock_slot(&sidecar.slot, deadline, None, None) {
                 Ok(mut slot) => {
@@ -729,6 +738,13 @@ impl Inner {
 // --- the calls of one lifecycle ---
 
 impl RefinerHandle {
+    fn lifecycle(&self, step: RefineKind) -> &CancelToken {
+        match step {
+            RefineKind::Clean => &self.clean_lifecycle,
+            RefineKind::Translate => &self.translate_lifecycle,
+        }
+    }
+
     fn sidecar(&self, step: RefineKind) -> &Sidecar {
         self.inner.sidecar(step)
     }
@@ -743,11 +759,11 @@ impl RefinerHandle {
             &self.sidecar(step).slot,
             Instant::now() + SLOT_WAIT,
             session,
-            Some(&self.lifecycle),
+            Some(self.lifecycle(step)),
         )?;
         // Checked under the slot: a stop sweep ends the lifecycle before it takes any slot, so
         // nothing of an ended lifecycle starts after the sweep has passed.
-        if self.lifecycle.is_cancelled() {
+        if self.lifecycle(step).is_cancelled() {
             return Err(RefineError::Unavailable(STOPPED.to_owned()));
         }
         Ok(slot)
@@ -758,7 +774,7 @@ impl RefinerHandle {
     fn after_call_error(&self, step: RefineKind, slot: &mut Slot, error: CallError) -> RefineError {
         match &error {
             CallError::Exited => {
-                let crashed = !self.lifecycle.is_cancelled();
+                let crashed = !self.lifecycle(step).is_cancelled();
                 self.inner.drop_process(step, slot, crashed);
             }
             CallError::Fatal(_) | CallError::Killed(_) => {
@@ -822,7 +838,7 @@ impl RefinerHandle {
                 Map::from_iter([("target".to_owned(), json!("start"))]),
                 started + ms(refine::REFINER_START_TIMEOUT_MS),
                 session,
-                &self.lifecycle,
+                self.lifecycle(step),
             )
             .and_then(|response| match error_code(&response) {
                 Some(code) => Err(CallError::Fatal(code)),
@@ -841,7 +857,7 @@ impl RefinerHandle {
                 fields,
                 Instant::now() + ms(refine::REFINER_LOAD_TIMEOUT_MS),
                 session,
-                &self.lifecycle,
+                self.lifecycle(step),
             )
         });
         slot.process = Some(process);
@@ -850,7 +866,7 @@ impl RefinerHandle {
             Err(error) => {
                 // A start that does not get going counts as a crash only when the process
                 // itself ended; a timeout, a cancel, a fatal report or a stop just stops it.
-                let crashed = error == CallError::Exited && !self.lifecycle.is_cancelled();
+                let crashed = error == CallError::Exited && !self.lifecycle(step).is_cancelled();
                 self.inner.drop_process(step, slot, crashed);
                 return Err(match error {
                     CallError::Interrupted(Why::Deadline) | CallError::Killed(Why::Deadline) => {
@@ -893,7 +909,7 @@ impl TextRefiner for RefinerHandle {
         let deadline = Instant::now() + ms(refine::REFINER_WARM_TIMEOUT_MS);
         let fields = Map::from_iter([("messages".to_owned(), messages_json(prefix))]);
         let result = match slot.process.as_mut() {
-            Some(process) => process.call("warm", fields, deadline, None, &self.lifecycle),
+            Some(process) => process.call("warm", fields, deadline, None, self.lifecycle(step)),
             None => Err(CallError::Exited),
         };
         slot.last_used = Instant::now();
@@ -932,9 +948,13 @@ impl TextRefiner for RefinerHandle {
             ("max_tokens".to_owned(), json!(request.max_tokens)),
         ]);
         let result = match slot.process.as_mut() {
-            Some(process) => {
-                process.call("generate", fields, deadline, Some(cancel), &self.lifecycle)
-            }
+            Some(process) => process.call(
+                "generate",
+                fields,
+                deadline,
+                Some(cancel),
+                self.lifecycle(step),
+            ),
             None => Err(CallError::Exited),
         };
         slot.last_used = Instant::now();
@@ -1156,6 +1176,7 @@ done
             RefineKind::Translate,
             "会議は4時からです。",
             Glossary::default(),
+            true,
         );
         GenerateRequest {
             budget_ms,
@@ -1176,7 +1197,7 @@ done
         let (script, log) = fake_sidecar("ok", "ok");
         let r = refiner(script);
         let mut h = r.handle();
-        let prefix = refine::prefix(RefineKind::Translate, &Glossary::default());
+        let prefix = refine::prefix(RefineKind::Translate, &Glossary::default(), true);
         assert!(!h.ready(RefineKind::Translate));
         h.warm(RefineKind::Translate, &prefix).unwrap();
         assert!(h.ready(RefineKind::Translate));
@@ -1356,7 +1377,7 @@ done
         std::fs::write(flag(&log, "fail"), "").unwrap();
         let r = refiner(script);
         let mut h = r.handle();
-        let prefix = refine::prefix(RefineKind::Clean, &Glossary::default());
+        let prefix = refine::prefix(RefineKind::Clean, &Glossary::default(), true);
         assert_eq!(
             h.warm(RefineKind::Clean, &prefix),
             Err(RefineError::Unavailable("model_load_failed".to_owned()))
@@ -1456,7 +1477,7 @@ done
         let (script, log) = fake_sidecar("warmfail", "ok");
         let r = refiner(script);
         let mut h = r.handle();
-        let plain = refine::prefix(RefineKind::Clean, &Glossary::default());
+        let plain = refine::prefix(RefineKind::Clean, &Glossary::default(), true);
         let other = refine::prefix(
             RefineKind::Clean,
             &Glossary::new(&[murmur_core::settings::DictionaryEntry {
@@ -1465,6 +1486,7 @@ done
                 readings: vec!["マーマー".to_owned()],
                 scope: murmur_core::settings::DictionaryScope::Ja,
             }]),
+            true,
         );
         h.warm(RefineKind::Clean, &plain).unwrap();
         std::fs::write(flag(&log, "warmfail"), "").unwrap();
@@ -1483,10 +1505,22 @@ done
         let mut warming = r.handle();
         let old = r.handle();
         let task = thread::spawn(move || {
-            crate::refine_session::warm(RefineKind::Translate, &Glossary::default(), &mut warming)
+            crate::refine_session::warm(
+                refine::RefinePlan::new(RefineKind::Translate, true),
+                &Glossary::default(),
+                &mut warming,
+            )
         });
         // Barrier: the translation model is loading (the cleanup one comes next).
-        assert!(wait_until(Duration::from_secs(3), || count(&log, "load") == 1));
+        let loading = wait_until(ms(refine::REFINER_START_TIMEOUT_MS + 1_000), || {
+            count(&log, "load") == 1
+        });
+        if !loading {
+            // Do not strand the blocked fake if a slow test host misses the startup barrier.
+            r.stop_all();
+            task.join().unwrap();
+            panic!("the fake sidecar did not reach the load barrier");
+        }
         let started = Instant::now();
         r.stop_all();
         // The cancel reply and a kill (0.7 s), not the slot wait of a load (75 s), with room for
@@ -1512,6 +1546,52 @@ done
         r.handle().warm(RefineKind::Clean, &[]).ok();
         assert!(r.handle().ready(RefineKind::Clean));
         assert_eq!(count(&log, "start"), 2);
+        r.stop_all();
+    }
+
+    #[test]
+    fn stopping_one_model_keeps_the_other_models_lifecycle_and_process() {
+        for stopped in [RefineKind::Clean, RefineKind::Translate] {
+            let (script, log) = fake_sidecar("shared", "ok");
+            let r = refiner(script);
+            let mut old = r.handle();
+            for step in [RefineKind::Clean, RefineKind::Translate] {
+                old.warm(step, &[]).unwrap();
+            }
+            let kept = match stopped {
+                RefineKind::Clean => RefineKind::Translate,
+                RefineKind::Translate => RefineKind::Clean,
+            };
+            let stopped_pid = r.pid(stopped).unwrap();
+            let kept_pid = r.pid(kept);
+            r.stop(stopped);
+            assert_eq!(r.pid(stopped), None);
+            assert_eq!(r.pid(kept), kept_pid);
+            assert!(wait_until(Duration::from_secs(2), || reaped(stopped_pid)));
+            assert_eq!(
+                old.warm(stopped, &[]),
+                Err(RefineError::Unavailable(STOPPED.to_owned()))
+            );
+            old.generate(kept, &request(2_000), &CancelToken::new())
+                .unwrap();
+            assert_eq!(count(&log, "start"), 2);
+            r.handle().warm(stopped, &[]).unwrap();
+            assert_eq!(count(&log, "start"), 3);
+            r.stop_all();
+        }
+    }
+
+    #[test]
+    fn changing_lists_rewarms_only_when_the_prefix_changes() {
+        let (script, log) = fake_sidecar("lists", "ok");
+        let r = refiner(script);
+        let mut h = r.handle();
+        for lists in [true, true, false, false, true] {
+            let prefix = refine::prefix(RefineKind::Clean, &Glossary::default(), lists);
+            h.warm(RefineKind::Clean, &prefix).unwrap();
+        }
+        assert_eq!(count(&log, "start"), 1);
+        assert_eq!(count(&log, "warm"), 3);
         r.stop_all();
     }
 
@@ -1632,7 +1712,11 @@ done
         );
         let mut h = r.handle();
         let glossary = Glossary::default();
-        refine_session::warm(RefineKind::Translate, &glossary, &mut h);
+        refine_session::warm(
+            refine::RefinePlan::new(RefineKind::Translate, true),
+            &glossary,
+            &mut h,
+        );
         assert!(h.ready(RefineKind::Translate) && h.ready(RefineKind::Clean));
         let mut loading = 0;
         for (text, cleaned_first) in [
@@ -1641,7 +1725,7 @@ done
         ] {
             let started = Instant::now();
             let report = refine_session::drive(
-                RefineKind::Translate,
+                refine::RefinePlan::new(RefineKind::Translate, true),
                 text,
                 glossary.clone(),
                 &mut h,
@@ -1661,6 +1745,32 @@ done
                 report.steps,
                 started.elapsed().as_millis()
             );
+        }
+        // The cleanup feature uses both prompt variants against the same real process.
+        let text = "あの、明日の会議の資料はSlackのチャンネルに上げておきました。";
+        for lists in [true, false] {
+            let plan = refine::RefinePlan::new(RefineKind::Clean, lists);
+            refine_session::warm(plan, &glossary, &mut h);
+            let prefix = refine::prefix(plan.kind, &glossary, lists);
+            assert_eq!(
+                lock_ignoring_poison(&r.inner.clean.slot).warmed.as_ref(),
+                Some(&prefix)
+            );
+            let report = refine_session::drive(
+                plan,
+                text,
+                glossary.clone(),
+                &mut h,
+                &CancelToken::new(),
+                &mut || loading += 1,
+            );
+            assert!(
+                report.result.is_ok(),
+                "cleanup validation failed: {:?}",
+                report.result.err()
+            );
+            assert_eq!(report.steps, vec![RefineKind::Clean]);
+            assert_eq!(report.pre_clean, PreClean::NotNeeded);
         }
         assert_eq!(loading, 0, "both models were warm");
         let pids = [

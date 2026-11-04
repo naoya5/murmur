@@ -6,19 +6,19 @@
 //! is in the core machine. No text reaches the log (G7).
 
 use murmur_core::ports::{CancelToken, RefineError, TextRefiner};
-use murmur_core::refine::{self, Glossary, Next, RefineKind, Run, RunReport};
+use murmur_core::refine::{self, Glossary, Next, RefinePlan, Run, RunReport};
 
 /// Runs the calls of a refine session on the rule-formatted `text`. `on_loading` is called before
 /// a call whose model is not loaded yet, so the machine can give the session the load budget.
 pub fn drive(
-    kind: RefineKind,
+    plan: RefinePlan,
     text: &str,
     glossary: Glossary,
     refiner: &mut dyn TextRefiner,
     cancel: &CancelToken,
     on_loading: &mut dyn FnMut(),
 ) -> RunReport {
-    let (mut run, mut call) = Run::start(kind, text, glossary);
+    let (mut run, mut call) = Run::start(plan.kind, text, glossary, plan.lists);
     loop {
         let answer = if cancel.is_cancelled() {
             Err(RefineError::Cancelled)
@@ -37,9 +37,9 @@ pub fn drive(
 
 /// Starts and warms every model a session of `kind` may need (a translation may clean first,
 /// E3). A failure only means the session's call starts or loads the model itself.
-pub fn warm(kind: RefineKind, glossary: &Glossary, refiner: &mut dyn TextRefiner) {
-    for step in refine::warm_steps(kind) {
-        if let Err(error) = refiner.warm(*step, &refine::prefix(*step, glossary)) {
+pub fn warm(plan: RefinePlan, glossary: &Glossary, refiner: &mut dyn TextRefiner) {
+    for step in refine::warm_steps(plan.kind) {
+        if let Err(error) = refiner.warm(*step, &refine::prefix(*step, glossary, plan.lists)) {
             tracing::info!(step = step.code(), %error, "refine warm-up did not finish");
         }
     }
@@ -50,7 +50,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use murmur_core::ports::{GenerateRequest, Generated};
-    use murmur_core::refine::{ChatMessage, PreClean};
+    use murmur_core::refine::{ChatMessage, PreClean, RefineKind};
     use murmur_core::session::TranscriptText;
 
     use super::*;
@@ -117,7 +117,7 @@ mod tests {
     fn run(fake: &mut Fake, text: &str, cancel: &CancelToken) -> (RunReport, u32) {
         let mut loading = 0;
         let report = drive(
-            RefineKind::Translate,
+            RefinePlan::new(RefineKind::Translate, true),
             text,
             Glossary::default(),
             fake,
@@ -154,7 +154,11 @@ mod tests {
             "会議は4時からでお願いします。",
             "Please make the meeting at four.",
         ]);
-        warm(RefineKind::Translate, &Glossary::default(), &mut fake);
+        warm(
+            RefinePlan::new(RefineKind::Translate, true),
+            &Glossary::default(),
+            &mut fake,
+        );
         // The translation model first, then the cleanup model for the marked texts.
         assert_eq!(
             fake.warmed.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
@@ -201,6 +205,31 @@ mod tests {
         let (report, _) = run(&mut fake, MARKED, &cancel);
         assert_eq!(report.result, Err(RefineError::Cancelled));
         assert_eq!(fake.calls.len(), 1);
+    }
+
+    #[test]
+    fn cleanup_uses_its_plan_for_both_warm_and_generate() {
+        for lists in [false, true] {
+            let plan = RefinePlan::new(RefineKind::Clean, lists);
+            let glossary = Glossary::default();
+            let mut fake = Fake::answering(&["会議は4時からでお願いします。"]);
+            warm(plan, &glossary, &mut fake);
+            assert_eq!(fake.warmed.len(), 1);
+            let prefix = refine::prefix(plan.kind, &glossary, lists);
+            let mut loads = 0;
+            let report = drive(
+                plan,
+                MARKED,
+                glossary,
+                &mut fake,
+                &CancelToken::new(),
+                &mut || loads += 1,
+            );
+            assert!(report.result.is_ok());
+            assert_eq!(report.steps, vec![RefineKind::Clean]);
+            assert_eq!(fake.calls[0].1.messages[..prefix.len()], prefix);
+            assert_eq!(loads, 0);
+        }
     }
 
     #[test]

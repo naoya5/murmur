@@ -18,7 +18,7 @@ use murmur_core::Language;
 use murmur_core::annotations as ann;
 use murmur_core::catalog;
 use murmur_core::ports::{CancelToken, RawTranscript, RefineError};
-use murmur_core::refine::{self, Glossary, RefineKind, RefineStatus, RunReport};
+use murmur_core::refine::{self, Glossary, RefineKind, RefinePlan, RefineStatus, RunReport};
 use murmur_core::session::{
     self, AnnotationsRefusal, CaptureError, ComposeOutcome, ComposeWords, CopyReason,
     DeliveryOutcome, Effect, Event, FailureKind, Machine, Notice, Paused, PillView, PlanCounts,
@@ -331,7 +331,12 @@ impl Controller {
     /// Turns a message into a core event, updating session context on the way.
     fn translate(&mut self, msg: Msg) -> Option<Event> {
         match msg {
-            Msg::Core(event) => {
+            Msg::Core(mut event) => {
+                if let Event::HotkeyDown { refine, .. } = &mut event {
+                    let settings = self.services.settings();
+                    self.language_override = Some(settings.language);
+                    *refine = settings.dictation_refine(settings.language);
+                }
                 // A click on the "Screen Recording is needed" notice opens the settings pane.
                 // This lives here, not in the core: it is a window action, not a transition.
                 if event == Event::PillClicked
@@ -346,9 +351,10 @@ impl Controller {
             }
             Msg::HotkeyDownWithLanguage(language) => {
                 self.language_override = Some(language);
+                let settings = self.services.settings();
                 Some(Event::HotkeyDown {
-                    mode: self.services.settings().record_mode,
-                    refine: None,
+                    mode: settings.record_mode,
+                    refine: settings.dictation_refine(language),
                 })
             }
             Msg::TranslateHotkey => {
@@ -361,7 +367,7 @@ impl Controller {
                 self.language_override = Some(refine::TRANSLATE_FROM);
                 Some(Event::HotkeyDown {
                     mode: settings.record_mode,
-                    refine: Some(RefineKind::Translate),
+                    refine: Some(RefinePlan::new(RefineKind::Translate, true)),
                 })
             }
             Msg::Refined { session, report } => self.on_refined(session, report),
@@ -629,12 +635,12 @@ impl Controller {
             Effect::SaveAnnotation { session, outcome } => self.save_annotation(session, outcome),
             Effect::DropAll { session } => self.drop_all(session),
             // --- the model step (experimental) ---
-            Effect::WarmRefiner { session, kind } => self.warm_refiner(session, kind),
+            Effect::WarmRefiner { session, plan } => self.warm_refiner(session, plan),
             Effect::Refine {
                 session,
-                kind,
+                plan,
                 text,
-            } => self.refine(session, kind, text),
+            } => self.refine(session, plan, text),
             Effect::CancelRefine { session } => {
                 if let Some(refine) = self.sessions.get(&session).and_then(|c| c.refine.as_ref()) {
                     refine.cancel.cancel();
@@ -644,11 +650,16 @@ impl Controller {
     }
 
     /// Starts and warms the models a session of `kind` may need, while the user speaks.
-    fn warm_refiner(&mut self, session: SessionId, kind: RefineKind) {
+    fn warm_refiner(&mut self, session: SessionId, plan: RefinePlan) {
+        let kind = plan.kind;
+        // Take the lifecycle before checking settings: an off transition either retires this
+        // handle or is already visible below. A delayed warm effect cannot restart an off model.
+        let mut refiner = self.services.refiner().handle();
+        let settings = self.services.settings();
         let Some(ctx) = self.sessions.get_mut(&session) else {
             return;
         };
-        let glossary = Glossary::new(&self.services.settings().dictionary);
+        let glossary = Glossary::new(&settings.dictionary);
         ctx.refine = Some(RefineCtx {
             kind,
             glossary: glossary.clone(),
@@ -658,15 +669,23 @@ impl Controller {
             started: None,
             refine_ms: None,
         });
-        let mut refiner = self.services.refiner().handle();
-        tauri::async_runtime::spawn_blocking(move || {
-            crate::refine_session::warm(kind, &glossary, &mut refiner);
-        });
+        let enabled = match kind {
+            RefineKind::Clean => settings.refine_enabled,
+            RefineKind::Translate => settings.translate_enabled,
+        };
+        if enabled {
+            tauri::async_runtime::spawn_blocking(move || {
+                crate::refine_session::warm(plan, &glossary, &mut refiner);
+            });
+        }
     }
 
     /// Sends the rule-formatted text through the model step on a blocking thread.
-    fn refine(&mut self, session: SessionId, kind: RefineKind, text: TranscriptText) {
-        let dictionary = self.services.settings().dictionary;
+    fn refine(&mut self, session: SessionId, plan: RefinePlan, text: TranscriptText) {
+        let kind = plan.kind;
+        let mut refiner = self.services.refiner().handle();
+        let settings = self.services.settings();
+        let dictionary = settings.dictionary;
         let Some(ctx) = self.sessions.get_mut(&session) else {
             return;
         };
@@ -687,14 +706,24 @@ impl Controller {
         let backstop = Duration::from_millis(
             refine::timeout_ms(kind, &text.0).saturating_add(REFINE_BACKSTOP_EXTRA_MS),
         );
-        let mut refiner = self.services.refiner().handle();
+        let enabled = match kind {
+            RefineKind::Clean => settings.refine_enabled,
+            RefineKind::Translate => settings.translate_enabled,
+        };
+        if !enabled {
+            let _ = self.tx.send(Msg::Core(Event::Refined {
+                session,
+                outcome: RefineOutcome::Failed,
+            }));
+            return;
+        }
         let tx = self.tx.clone();
         tauri::async_runtime::spawn(async move {
             let job_cancel = cancel.clone();
             let loading_tx = tx.clone();
             let job = tauri::async_runtime::spawn_blocking(move || {
                 crate::refine_session::drive(
-                    kind,
+                    plan,
                     &text.0,
                     glossary,
                     &mut refiner,

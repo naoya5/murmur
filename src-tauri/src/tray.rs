@@ -32,7 +32,7 @@ pub struct TrayModel {
 pub struct RecentItem {
     pub id: String,
     pub text: String,
-    /// The text before a successful model step (a translation's Japanese), with its kind.
+    /// The original cleanup text, or a successful translation's Japanese, with its kind.
     pub before: Option<(RefineKind, String)>,
 }
 

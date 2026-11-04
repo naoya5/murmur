@@ -87,6 +87,8 @@ let settings: Settings = {
   annotations_retention_days: 7,
   translate_enabled: params.has("translate"),
   translate_hotkey: "Alt+Shift+KeyE",
+  refine_enabled: false,
+  refine_lists: true,
 };
 
 /** A history row without a model step. */
