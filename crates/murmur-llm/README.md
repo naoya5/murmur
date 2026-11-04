@@ -76,6 +76,7 @@ CLI comparison, declined native-runtime experiment and the later precompiled-Met
 `benchmark.py` repeats the fixed-prefix 10-item x 10-run method against an explicit read-only
 request-set JSON. `metallib_bench.py` measures four simultaneous residents, three solo loads per
 model, and first prefill using synthetic text and the current core cleanup prompt. Both persist
-numeric measurements only. The historical Python cleanup-prefix reader in `metallib_bench.py`
-predates the lists-on/off example variants; current cleanup acceptance measurements use the ignored
-Rust tests in `src-tauri/src/adapters/refiner.rs`, which call the production prompt directly.
+numeric measurements only. The metallib benchmark obtains its cleanup prefix from the production
+Rust builder through `cargo run -p murmur --example cleanup-prefix`, before starting measurements.
+Use the app's Cargo build environment (`SPEECH_CPP_DIR` if needed); `--lists-off` selects the other
+cleanup variant. Model-free coverage: `python3 -m unittest discover -s crates/murmur-llm -p 'test_*.py'`.

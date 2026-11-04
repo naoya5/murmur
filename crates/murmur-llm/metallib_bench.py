@@ -2,13 +2,12 @@
 """Measure startup/prefill without saving prompts, answers or native stderr.
 
 Supply MURMUR_SIDECAR_BINARY and --output under target/. Models must already exist.
-The cleanup prefix is read from the core's current fixed prompt constants.
+The cleanup prefix comes from the production Rust builder via a development-only example.
 """
 import argparse
 import json
 import os
 from pathlib import Path
-import re
 import subprocess
 import threading
 import time
@@ -30,24 +29,14 @@ TEXT = ("えっと、来週の打ち合わせは火曜日の午後三時から�
         "必要な図と表も用意しておきます。")
 
 
-def clean_prefix():
-    source = (ROOT.parent / "murmur-core/src/refine.rs").read_text()
-
-    def constant(name):
-        match = re.search(r'const ' + name + r': &str = "((?:[^"\\]|\\.)*)";', source)
-        assert match, "Core prompt constant not found"
-        return json.loads('"' + match.group(1) + '"', strict=False)
-
-    block = source.split("const CLEAN_EXAMPLES:", 1)[1].split("];", 1)[0]
-    values = [json.loads('"' + value + '"', strict=False)
-              for value in re.findall(r'"((?:[^"\\]|\\.)*)"', block)]
-    assert len(values) == 12, "Expected six fixed cleanup examples"
-    messages = [dict(role="system", content=constant("CLEAN_SYSTEM_RULES")
-                     + constant("CLEAN_SYSTEM_END"))]
-    for index in range(0, len(values), 2):
-        messages += [dict(role="user", content=f"<transcript>{values[index]}</transcript>"),
-                     dict(role="assistant", content=values[index + 1])]
-    return messages
+def clean_prefix(lists=True):
+    # Capture the prompt as private IPC, never as benchmark output or a persisted fixture.
+    result = subprocess.run(
+        ["cargo", "run", "--quiet", "--package", "murmur", "--example", "cleanup-prefix",
+         "--", "lists-on" if lists else "lists-off"],
+        cwd=ROOT.parent.parent, capture_output=True, check=True, timeout=120,
+    )
+    return json.loads(result.stdout)
 
 
 class CompilerCpu:
@@ -96,8 +85,11 @@ def load(client, role):
                 gpu_offload_supported=answer["gpu_offload_supported"])
 
 
-def measure():
-    result = dict(four_live=[], solo=[], first_prefill=[], synthetic_input_chars=len(TEXT))
+def measure(lists=True):
+    # Resolve/build before timing any model work, not between measurement scenarios.
+    cleanup_prefix = clean_prefix(lists)
+    result = dict(four_live=[], solo=[], first_prefill=[], synthetic_input_chars=len(TEXT),
+                  cleanup_lists=int(lists))
     clients = []
     try:
         # Keep all earlier children alive so four simultaneous Metal device/cache users exist.
@@ -125,7 +117,7 @@ def measure():
             result["solo"].append(row)
 
     for role in FILES:
-        prefix = [dict(role="system", content="Translate to English.")] if role == "translate" else clean_prefix()
+        prefix = [dict(role="system", content="Translate to English.")] if role == "translate" else cleanup_prefix
         user = TEXT if role == "translate" else f"<transcript>{TEXT}</transcript>"
         with CompilerCpu() as cpu:
             client = Client()
@@ -153,11 +145,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--label", required=True)
+    parser.add_argument("--lists-off", action="store_true",
+                        help="Use the production lists-off cleanup prefix")
     args = parser.parse_args()
     assert os.environ.get("MURMUR_SIDECAR_BINARY"), "Explicit binary required"
     for name in FILES.values():
         assert (MODELS / name).is_file(), "Existing E2E model missing; no download allowed"
-    results = measure()
+    results = measure(lists=not args.lists_off)
     results["label"] = args.label
     args.output.write_text(json.dumps(results, indent=2) + "\n")
     print(json.dumps(results, indent=2))
