@@ -26,7 +26,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use murmur_core::Language;
-use murmur_core::refine::RefineStatus;
 use murmur_core::session::{Event, PillView};
 use tauri::{AppHandle, Manager, RunEvent};
 use tauri_specta::Event as _;
@@ -184,20 +183,16 @@ pub fn tray_model(services: &App) -> TrayModel {
         .map(|rows| {
             rows.into_iter()
                 .filter_map(|row| {
-                    // Cleanup originals stay accessible for every status, including skips.
-                    // Translation keeps its existing successful-translation copy entry.
-                    let before = match (row.refine_kind, row.refine_status, row.pre_refine_text) {
-                        (Some(kind), status, Some(text))
-                            if kind == murmur_core::refine::RefineKind::Clean
-                                || status == Some(RefineStatus::Ok) =>
-                        {
-                            Some((kind, text))
-                        }
-                        _ => None,
-                    };
+                    let text = row.text?;
+                    let before = tray::before_text(
+                        row.refine_kind,
+                        row.refine_status,
+                        row.pre_refine_text,
+                        &text,
+                    );
                     Some(RecentItem {
                         id: row.id,
-                        text: row.text?,
+                        text,
                         before,
                     })
                 })

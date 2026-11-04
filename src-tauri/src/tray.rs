@@ -1,14 +1,15 @@
 //! Menu bar icon and its menu.
 //!
 //! `create` builds the tray once; `update` rebuilds the menu from a `TrayModel` (recording state, language,
-//! recent items; a translated item also offers its Japanese, D4). Menu clicks become `TrayAction`s for the
-//! controller. Strings are kept here, English and Japanese, short. Previews are transcript text: they are
+//! recent items; cleanup offers a different original, successful translation its Japanese, D4).
+//! Menu clicks become `TrayAction`s for the controller. Strings are kept here, English and Japanese,
+//! short. Previews are transcript text: they are
 //! shown, never logged (G7).
 
 use std::sync::Arc;
 
 use murmur_core::Language;
-use murmur_core::refine::RefineKind;
+use murmur_core::refine::{RefineKind, RefineStatus};
 use tauri::AppHandle;
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
@@ -32,8 +33,26 @@ pub struct TrayModel {
 pub struct RecentItem {
     pub id: String,
     pub text: String,
-    /// The original cleanup text, or a successful translation's Japanese, with its kind.
+    /// A different cleanup original (any status), or a successful translation's Japanese.
     pub before: Option<(RefineKind, String)>,
+}
+
+/// Avoid duplicate cleanup entries without changing successful-translation original access.
+pub(crate) fn before_text(
+    kind: Option<RefineKind>,
+    status: Option<RefineStatus>,
+    before: Option<String>,
+    delivered: &str,
+) -> Option<(RefineKind, String)> {
+    match (kind, status, before) {
+        (Some(RefineKind::Clean), _, Some(text)) if text != delivered => {
+            Some((RefineKind::Clean, text))
+        }
+        (Some(RefineKind::Translate), Some(RefineStatus::Ok), Some(text)) => {
+            Some((RefineKind::Translate, text))
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,8 +348,84 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_originals_are_offered_only_when_changed_for_any_status() {
+        for status in [
+            None,
+            Some(RefineStatus::Ok),
+            Some(RefineStatus::Skipped),
+            Some(RefineStatus::Failed),
+            Some(RefineStatus::Timeout),
+        ] {
+            assert_eq!(
+                before_text(Some(RefineKind::Clean), status, Some("same".into()), "same"),
+                None
+            );
+            assert_eq!(
+                before_text(
+                    Some(RefineKind::Clean),
+                    status,
+                    Some("before".into()),
+                    "after"
+                ),
+                Some((RefineKind::Clean, "before".into()))
+            );
+            assert_eq!(
+                before_text(Some(RefineKind::Clean), status, None, "after"),
+                None
+            );
+        }
+        assert_eq!(
+            before_text(None, None, Some("before".into()), "after"),
+            None
+        );
+    }
+
+    #[test]
+    fn translation_originals_keep_success_only_access_even_when_identical() {
+        for status in [
+            None,
+            Some(RefineStatus::Ok),
+            Some(RefineStatus::Skipped),
+            Some(RefineStatus::Failed),
+            Some(RefineStatus::Timeout),
+        ] {
+            let expected = (status == Some(RefineStatus::Ok))
+                .then(|| (RefineKind::Translate, "same".to_owned()));
+            assert_eq!(
+                before_text(
+                    Some(RefineKind::Translate),
+                    status,
+                    Some("same".into()),
+                    "same"
+                ),
+                expected
+            );
+        }
+        assert_eq!(
+            before_text(
+                Some(RefineKind::Translate),
+                Some(RefineStatus::Ok),
+                Some("before".into()),
+                "after"
+            ),
+            Some((RefineKind::Translate, "before".into()))
+        );
+        assert_eq!(
+            before_text(
+                Some(RefineKind::Translate),
+                Some(RefineStatus::Ok),
+                None,
+                "after"
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn labels_exist_in_both_languages() {
         assert_ne!(labels(true).quit, labels(false).quit);
+        assert_eq!(labels(true).before_cleanup, "整形前");
+        assert_eq!(labels(false).before_cleanup, "Before cleanup");
         assert!(ICON.starts_with(b"\x89PNG"));
     }
 }

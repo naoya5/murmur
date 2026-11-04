@@ -75,7 +75,7 @@ start-up.
 Retention is a number of days (1 to 90, default 7) plus a 1 GiB cap on the whole folder; the cleanup runs on
 blocking threads after a paste and when the setting changes.
 
-Translation (experimental) adds five columns to `transcripts`: `refine_kind`, `refine_status`,
+Cleanup and translation (experimental) use five columns in `transcripts`: `refine_kind`, `refine_status`,
 `pre_refine_text` (the Japanese before the model step), `refine_model_id` (every model that ran, joined with
 `+`) and `refine_ms`. `text` stays what went out. The day totals count `pre_refine_text`, what was spoken. The
 two models are ordinary catalog entries in `models/`.
@@ -93,7 +93,11 @@ Settings changes start no sidecars. After a successful settings save, disabling 
 controller to fall back, then performs bounded teardown on the settings command's blocking thread.
 The adapter has a separate lifecycle per model: disabling translation can stop only translation,
 and cleanup stops only when neither feature needs it. The settings update lock prevents an off/on
-race with that teardown. The settings block and notice presentation are wired in the UI milestone.
+race with that teardown. The cleanup block under Recording > Experimental uses the same settings
+rows as translation, with model readiness, a Models link and the lists switch. The model section
+appears when either feature is on. The pill localizes CleanupSkipped and retains the delivery
+outcome. History and the tray offer a cleanup original only when it differs from the delivered text,
+regardless of cleanup status; translation originals remain available only for successful translations.
 
 ## Translation (experimental)
 

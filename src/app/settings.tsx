@@ -34,6 +34,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
   const [settings, setSettingsState] = useState<Settings | null>(null);
   // The latest value, for patches made before a re-render (two quick toggles).
   const latest = useRef<Settings | null>(null);
+  const pendingUpdates = useRef(Promise.resolve());
   const setSettings = useCallback((next: Settings) => {
     latest.current = next;
     setSettingsState(next);
@@ -60,11 +61,19 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
   );
 
   const update = useCallback(
-    async (patch: Partial<Settings>): Promise<ApplyError | null> => {
-      const current = latest.current ?? (await commands.getSettings());
-      const next = { ...current, ...patch };
-      latest.current = next;
-      return save(next);
+    (patch: Partial<Settings>): Promise<ApplyError | null> => {
+      // Merge patches only after prior saves settle, so a rejected opt-in cannot leak into
+      // an unrelated save, even when both controls are clicked before the first response.
+      const apply = async () => {
+        const current = latest.current ?? (await commands.getSettings());
+        return save({ ...current, ...patch });
+      };
+      const result = pendingUpdates.current.then(apply);
+      pendingUpdates.current = result.then(
+        () => undefined,
+        () => undefined,
+      );
+      return result;
     },
     [save],
   );

@@ -1681,16 +1681,7 @@ done
         assert!(!is_plain_code("Bad code: 会議"));
     }
 
-    /// The real sidecar and models: the staged binary (`scripts/build-sidecar.sh`, or
-    /// `MURMUR_LLM_BIN`) and the GGUF files in `$MURMUR_TEST_MODELS/llm` (default
-    /// `~/.murmur-dev-models/llm`). Run: `cargo test -p murmur refiner -- --ignored`.
-    #[test]
-    #[ignore = "needs the staged sidecar and the LLM models"]
-    fn translates_with_the_real_sidecar() {
-        use crate::refine_session;
-        use murmur_core::catalog;
-        use murmur_core::refine::PreClean;
-
+    fn real_refiner() -> Refiner {
         let binary = std::env::var("MURMUR_LLM_BIN")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
@@ -1706,10 +1697,223 @@ done
                 PathBuf::from(std::env::var("HOME").unwrap()).join(".murmur-dev-models")
             })
             .join("llm");
-        let r = Refiner::new(
+        Refiner::new(
             Some(binary),
-            Box::new(move |step| Some(models.join(catalog::refine_model(step).file))),
-        );
+            Box::new(move |step| Some(models.join(murmur_core::catalog::refine_model(step).file))),
+        )
+    }
+
+    /// Private synthetic evaluation. Item text is written only to the dedicated external folder;
+    /// stdout/stderr from this test contain numeric CSV summaries, never inputs or model text.
+    #[test]
+    #[ignore = "needs MURMUR_REFINE_EVALSET, staged sidecar and local cleanup model"]
+    fn evaluates_light_cleanup() {
+        use murmur_core::settings::{DictionaryEntry, DictionaryScope};
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        #[derive(serde::Deserialize)]
+        struct Term {
+            ja: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Item {
+            id: u32,
+            cat: Vec<String>,
+            input: String,
+            clean: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct EvalSet {
+            glossary: Vec<Term>,
+            items: Vec<Item>,
+        }
+        fn timing(values: &[u64]) -> (u64, u64) {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            let median = murmur_core::metrics::median(&sorted).unwrap_or(0);
+            let p95 = sorted
+                .get((sorted.len() * 95).div_ceil(100).saturating_sub(1))
+                .copied()
+                .unwrap_or(0);
+            (median, p95)
+        }
+
+        let path =
+            std::env::var_os("MURMUR_REFINE_EVALSET").expect("MURMUR_REFINE_EVALSET is required");
+        let eval: EvalSet =
+            serde_json::from_reader(std::fs::File::open(path).expect("eval input file"))
+                .expect("eval JSON");
+        assert_eq!(eval.items.len(), 40);
+        let dictionary: Vec<_> = eval
+            .glossary
+            .into_iter()
+            .enumerate()
+            .map(|(i, term)| DictionaryEntry {
+                id: format!("eval-{i}"),
+                written: term.ja,
+                readings: Vec::new(),
+                scope: DictionaryScope::Ja,
+            })
+            .collect();
+        let glossary = Glossary::new(&dictionary);
+        let long: Vec<_> = eval
+            .items
+            .iter()
+            .filter(|item| item.cat.iter().any(|cat| cat == "long"))
+            .collect();
+        assert_eq!(long.len(), 10);
+        let repeats = std::env::var("MURMUR_REFINE_EVAL_REPEATS")
+            .ok()
+            .map(|value| value.parse::<usize>().expect("numeric repeats"))
+            .unwrap_or(10);
+        assert!((1..=20).contains(&repeats));
+        let root =
+            PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".murmur-e2e/eval-stage2");
+        std::fs::create_dir_all(&root).expect("eval output directory");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("private eval directory");
+        let r = real_refiner();
+        let mut h = r.handle();
+        let mut summaries = Vec::new();
+        for lists in [true, false] {
+            let flag = u8::from(lists);
+            let prefix = refine::prefix(RefineKind::Clean, &glossary, lists);
+            h.warm(RefineKind::Clean, &prefix)
+                .expect("eval model warm-up");
+            let mut output = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o600)
+                .open(root.join(format!("light-lists-{flag}.jsonl")))
+                .expect("private eval output");
+            let (
+                mut passed,
+                mut exact,
+                mut delivered_exact,
+                mut question_request_rejects,
+                mut short_skips,
+            ) = (0, 0, 0, 0, 0);
+            let mut times = Vec::new();
+            for item in &eval.items {
+                // With lists disabled, the three enumeration fixtures keep their spoken prose.
+                let expected = if !lists && item.cat.iter().any(|cat| cat == "list") {
+                    &item.input
+                } else {
+                    &item.clean
+                };
+                assert!(
+                    refine::validate_clean(expected, &item.input, glossary.terms(), lists)
+                        .is_empty(),
+                    "expected output rejected for item {}",
+                    item.id
+                );
+                let (_, call) =
+                    refine::Run::start(RefineKind::Clean, &item.input, glossary.clone(), lists);
+                let started = Instant::now();
+                // All 40 are generated for comparison with stage 0, even those the product gates.
+                let generated = h.generate(call.step, &call.request, &CancelToken::new());
+                let elapsed = started.elapsed().as_millis() as u64;
+                times.push(elapsed);
+                let finished = generated.as_ref().ok().map(|generated| {
+                    refine::finish(
+                        RefineKind::Clean,
+                        &generated.text,
+                        generated.truncated,
+                        &item.input,
+                        &glossary,
+                        lists,
+                    )
+                });
+                let accepted = finished.as_ref().and_then(|result| result.as_ref().ok());
+                let valid = accepted.is_some();
+                passed += usize::from(valid);
+                exact += usize::from(accepted == Some(expected));
+                let gate = refine::clean_gate(&item.input);
+                short_skips += usize::from(gate == refine::CleanGate::SkipShort);
+                let delivered = if gate == refine::CleanGate::Run {
+                    accepted.unwrap_or(&item.input)
+                } else {
+                    &item.input
+                };
+                delivered_exact += usize::from(delivered == expected);
+                let question_request = item
+                    .cat
+                    .iter()
+                    .any(|cat| cat == "question" || cat == "request");
+                question_request_rejects += usize::from(question_request && !valid);
+                let rejections = finished
+                    .as_ref()
+                    .and_then(|result| result.as_ref().err())
+                    .map(|rules| {
+                        rules
+                            .iter()
+                            .map(|rule| format!("{rule:?}"))
+                            .collect::<Vec<_>>()
+                    });
+                let row = json!({
+                    "id": item.id, "lists": lists, "categories": item.cat, "input": item.input,
+                    "expected": expected, "raw": generated.as_ref().ok().map(|g| &g.text),
+                    "postprocessed": generated.as_ref().ok().map(|g| refine::postprocess(&g.text, &item.input)),
+                    "truncated": generated.as_ref().ok().map(|g| g.truncated), "valid": valid,
+                    "rejections": rejections, "error": generated.as_ref().err().map(ToString::to_string),
+                    "elapsed_ms": elapsed, "gate": format!("{gate:?}"), "delivered": delivered,
+                    "exact": accepted == Some(expected), "delivered_exact": delivered == expected,
+                    "answer_review": null,
+                });
+                serde_json::to_writer(&mut output, &row).expect("eval item write");
+                writeln!(&mut output).expect("eval line write");
+            }
+            let mut benchmark = Vec::new();
+            let mut benchmark_errors = 0;
+            for _ in 0..repeats {
+                for item in &long {
+                    let (_, call) =
+                        refine::Run::start(RefineKind::Clean, &item.input, glossary.clone(), lists);
+                    let started = Instant::now();
+                    let generated = h.generate(call.step, &call.request, &CancelToken::new());
+                    benchmark.push(started.elapsed().as_millis() as u64);
+                    benchmark_errors += usize::from(generated.is_err());
+                }
+            }
+            let (quality_median, quality_p95) = timing(&times);
+            let (benchmark_median, benchmark_p95) = timing(&benchmark);
+            let summary = json!({
+                "lists": lists, "items": eval.items.len(), "passed_validation": passed,
+                "accepted_exact": exact, "delivered_exact": delivered_exact,
+                "rejected_question_request_candidates": question_request_rejects,
+                "short_skips": short_skips, "quality_median_ms": quality_median, "quality_p95_ms": quality_p95,
+                "benchmark_samples": benchmark.len(), "benchmark_errors": benchmark_errors,
+                "benchmark_median_ms": benchmark_median, "benchmark_p95_ms": benchmark_p95,
+                "benchmark_times_ms": benchmark,
+            });
+            summaries.push(summary);
+            eprintln!(
+                "{flag},{},{passed},{exact},{delivered_exact},{question_request_rejects},{short_skips},{quality_median},{quality_p95},{benchmark_median},{benchmark_p95},{benchmark_errors}",
+                eval.items.len()
+            );
+        }
+        let summary_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(root.join("summary.json"))
+            .expect("eval summary file");
+        serde_json::to_writer_pretty(summary_file, &summaries).expect("eval summary write");
+        r.stop_all();
+    }
+
+    /// The real sidecar and models: the staged binary (`scripts/build-sidecar.sh`, or
+    /// `MURMUR_LLM_BIN`) and the GGUF files in `$MURMUR_TEST_MODELS/llm` (default
+    /// `~/.murmur-dev-models/llm`). Run: `cargo test -p murmur refiner -- --ignored`.
+    #[test]
+    #[ignore = "needs the staged sidecar and the LLM models"]
+    fn translates_with_the_real_sidecar() {
+        use crate::refine_session;
+        use murmur_core::refine::PreClean;
+
+        let r = real_refiner();
         let mut h = r.handle();
         let glossary = Glossary::default();
         refine_session::warm(
