@@ -1995,6 +1995,251 @@ done
         r.stop_all();
     }
 
+    /// Opt-in rollout measurements: private synthetic text stays outside the repository.
+    #[test]
+    #[ignore = "needs MURMUR_REFINE_TIMINGSET and the staged default models"]
+    fn measures_default_cleanup_rollout() {
+        use crate::refine_session;
+        use murmur_core::refine::{Glossary, RefinePlan, RefineStatus};
+        use murmur_core::session::{
+            DeliveryOutcome, Effect, Event, Machine, Notice, PillView, RefineOutcome, State,
+            TranscribeOutcome, TranscriptText,
+        };
+        use murmur_core::settings::{DictionaryEntry, DictionaryScope, RecordMode};
+        use std::os::unix::fs::OpenOptionsExt;
+
+        struct Timed<'a> {
+            inner: &'a mut RefinerHandle,
+            calls: Vec<(RefineKind, u64)>,
+        }
+        impl TextRefiner for Timed<'_> {
+            fn warm(
+                &mut self,
+                step: RefineKind,
+                prefix: &[ChatMessage],
+            ) -> Result<(), RefineError> {
+                self.inner.warm(step, prefix)
+            }
+            fn ready(&self, step: RefineKind) -> bool {
+                self.inner.ready(step)
+            }
+            fn generate(
+                &mut self,
+                step: RefineKind,
+                request: &GenerateRequest,
+                cancel: &CancelToken,
+            ) -> Result<Generated, RefineError> {
+                let started = Instant::now();
+                let result = self.inner.generate(step, request, cancel);
+                self.calls
+                    .push((step, started.elapsed().as_millis() as u64));
+                result
+            }
+        }
+        fn transcribed_machine(source: &str) -> Machine {
+            let mut machine = Machine::new();
+            let press = Event::HotkeyDown {
+                mode: RecordMode::Toggle,
+                refine: Some(RefinePlan::new(RefineKind::Clean, true)),
+            };
+            machine.step(press.clone(), 0);
+            let session = machine.active_session().expect("recording session");
+            machine.step(press, 50);
+            machine.step(
+                Event::Transcribed {
+                    session,
+                    outcome: TranscribeOutcome::Text(TranscriptText(source.to_owned())),
+                },
+                100,
+            );
+            machine
+        }
+
+        let path = std::env::var_os("MURMUR_REFINE_TIMINGSET").expect("timing fixture path");
+        let fixture: Value =
+            serde_json::from_reader(std::fs::File::open(path).expect("timing fixture"))
+                .expect("timing JSON");
+        let dictionary: Vec<_> = fixture["glossary"]
+            .as_array()
+            .expect("timing glossary")
+            .iter()
+            .enumerate()
+            .map(|(i, term)| DictionaryEntry {
+                id: format!("timing-{i}"),
+                written: term["ja"].as_str().expect("timing term").to_owned(),
+                readings: vec![],
+                scope: DictionaryScope::Ja,
+            })
+            .collect();
+        let glossary = Glossary::new(&dictionary);
+        let r = real_refiner();
+        let mut h = r.handle();
+        let plan = RefinePlan::new(RefineKind::Translate, true);
+        let warm_started = Instant::now();
+        refine_session::warm(plan, &glossary, &mut h);
+        assert!(h.ready(RefineKind::Clean) && h.ready(RefineKind::Translate));
+        let combined_start_load_warm_ms = warm_started.elapsed().as_millis() as u64;
+        let mut rows = Vec::new();
+        for repeat in 0..5 {
+            for item in fixture["items"].as_array().expect("timing items") {
+                let source = item["input"].as_str().expect("timing input");
+                let mut timed = Timed {
+                    inner: &mut h,
+                    calls: vec![],
+                };
+                let started = Instant::now();
+                let mut loads = 0;
+                let report = refine_session::drive(
+                    plan,
+                    source,
+                    glossary.clone(),
+                    &mut timed,
+                    &CancelToken::new(),
+                    &mut || loads += 1,
+                );
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                assert_eq!(loads, 0);
+                assert!(elapsed_ms < refine::timeout_ms(plan.kind, source));
+                rows.push(json!({"id": item["id"], "repeat": repeat,
+                    "chars": source.chars().count(), "elapsed_ms": elapsed_ms,
+                    "pre_clean": format!("{:?}", report.pre_clean),
+                    "steps": timed.calls.iter().map(|(step, elapsed)| json!({"step": step.code(), "ms": elapsed})).collect::<Vec<_>>(),
+                    "ok": report.result.is_ok(), "input": source,
+                    "result": report.result.as_ref().ok().map(|text| &text.0),
+                    "error": report.result.as_ref().err().map(ToString::to_string)}));
+            }
+        }
+        let pid = r.pid(RefineKind::Clean).expect("cleanup pid");
+        let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::uninit();
+        let size = i32::try_from(std::mem::size_of_val(&info)).expect("task info size");
+        // SAFETY: the correctly sized writable buffer is checked before it is read.
+        let read = unsafe {
+            libc::proc_pidinfo(
+                i32::try_from(pid).expect("pid range"),
+                libc::PROC_PIDTASKINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        assert_eq!(read, size);
+        // SAFETY: proc_pidinfo initialized the entire structure.
+        let rss_after_long_requests_bytes = unsafe { info.assume_init() }.pti_resident_size;
+        r.stop_all();
+
+        let cold = real_refiner();
+        let mut foreground = cold.handle();
+        let mut warming = cold.handle();
+        let prefix = refine::prefix(RefineKind::Clean, &Glossary::default(), true);
+        let worker = thread::spawn(move || warming.warm(RefineKind::Clean, &prefix));
+        assert!(wait_until(Duration::from_secs(2), || cold
+            .inner
+            .clean
+            .slot
+            .try_lock()
+            .is_err()));
+        thread::sleep(Duration::from_millis(50));
+        let source = "あの、準備した資料を机に置きます。";
+        let mut machine = transcribed_machine(source);
+        let session = machine.active_session().expect("cold session");
+        let mut loads = 0;
+        let started = Instant::now();
+        let report = refine_session::drive(
+            RefinePlan::new(RefineKind::Clean, true),
+            source,
+            Glossary::default(),
+            &mut foreground,
+            &CancelToken::new(),
+            &mut || {
+                loads += 1;
+                machine.step(Event::RefinerLoading { session }, 100);
+            },
+        );
+        let cold_stop_to_result_ms = started.elapsed().as_millis() as u64;
+        assert!(report.result.is_ok(), "cold cleanup failed");
+        assert_eq!(loads, 1);
+        assert!(matches!(machine.state(), State::Refining(state) if state.load_extended));
+        assert!(
+            cold_stop_to_result_ms
+                < refine::REFINER_LOAD_TIMEOUT_MS + refine::timeout_ms(RefineKind::Clean, source)
+        );
+        assert!(wait_until(SLOT_WAIT, || worker.is_finished()));
+        assert!(worker.join().expect("warm thread").is_ok());
+
+        // A short unmarked first recording never waits for a model call.
+        let short_started = Instant::now();
+        let short = transcribed_machine("お疲れさまです。");
+        assert!(matches!(short.state(), State::Delivering { .. }));
+        let short_skip_ms = short_started.elapsed().as_millis() as u64;
+        // Exercise the real adapter's deadline and a fresh session's rule-text fallback together.
+        let mut machine = transcribed_machine(source);
+        let session = machine.active_session().expect("fallback session");
+        let (_, mut call) =
+            refine::Run::start(RefineKind::Clean, source, Glossary::default(), true);
+        call.request.budget_ms = 1;
+        let started = Instant::now();
+        let timed_out = foreground.generate(RefineKind::Clean, &call.request, &CancelToken::new());
+        let forced_timeout_ms = started.elapsed().as_millis() as u64;
+        assert!(matches!(timed_out, Err(RefineError::Timeout)));
+        assert!(forced_timeout_ms < 1_000);
+        let fx = machine.step(
+            Event::Refined {
+                session,
+                outcome: RefineOutcome::TimedOut,
+            },
+            200,
+        );
+        assert!(fx.iter().any(|effect| matches!(effect, Effect::Deliver { text, copy_only: None, .. } if text.0 == source)));
+        let fx = machine.step(
+            Event::Delivered {
+                session,
+                outcome: DeliveryOutcome::Pasted,
+            },
+            201,
+        );
+        assert!(fx.iter().any(|effect| matches!(
+            effect,
+            Effect::SaveSuccess {
+                refine: Some(RefineStatus::Timeout),
+                ..
+            }
+        )));
+        assert!(matches!(
+            machine.view(201),
+            PillView::Notice {
+                notice: Notice::CleanupSkipped { .. }
+            }
+        ));
+        cold.stop_all();
+
+        let root = PathBuf::from(std::env::var_os("HOME").expect("HOME"))
+            .join(".murmur-e2e/eval-stage2/models");
+        let output = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(root.join(format!(
+                "rollout-m3c-limit-{}.json",
+                refine::CLEAN_MAX_CHARS
+            )))
+            .expect("rollout output");
+        serde_json::to_writer_pretty(
+            output,
+            &json!({"limit": refine::CLEAN_MAX_CHARS,
+            "combined_start_load_warm_ms": combined_start_load_warm_ms,
+            "rss_after_long_requests_bytes": rss_after_long_requests_bytes,
+            "cold_recording_ms": 50, "cold_stop_to_result_ms": cold_stop_to_result_ms,
+            "cold_loading_events": loads, "short_skip_ms": short_skip_ms,
+            "forced_timeout_ms": forced_timeout_ms, "translation": rows}),
+        )
+        .expect("rollout write");
+        eprintln!(
+            "{},{combined_start_load_warm_ms},{cold_stop_to_result_ms},{short_skip_ms},{forced_timeout_ms},{rss_after_long_requests_bytes}",
+            refine::CLEAN_MAX_CHARS
+        );
+    }
+
     /// The real sidecar and models: the staged binary (`scripts/build-sidecar.sh`, or
     /// `MURMUR_LLM_BIN`) and the GGUF files in `$MURMUR_TEST_MODELS/llm` (default
     /// `~/.murmur-dev-models/llm`). Run: `cargo test -p murmur refiner -- --ignored`.

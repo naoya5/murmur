@@ -88,6 +88,12 @@ spoken language. The core `RefinePlan` snapshots `refine_lists` at the press and
 recording, transcription, warm-up and generation. Translation uses its own fixed lists-on pre-clean.
 Failed, timed-out and over-limit cleanup deliver the rule text and emit a short `CleanupSkipped`
 notice; the short-text skip stays silent. History keeps the original text and the true status.
+Dictation and translation's pre-clean share Qwen3.5-2B Q4_K_M (1.28 GB on disk, about 1400 MiB
+resident). Cleanup skips texts over 150 characters: warm generation measured about 12 ms per input
+character, and a 196-character input already exceeded 2 seconds at p95. The generation deadline
+remains 2.5 seconds plus 10 ms per character (4 seconds at the gate), with separately bounded
+loading/warming; the gate is a latency policy, not a longer timeout. Near-limit translation can
+still approach 2 seconds before ASR/paste, so native end-to-end latency needs separate verification.
 
 Settings changes start no sidecars. After a successful settings save, disabling a feature tells the
 controller to fall back, then performs bounded teardown on the settings command's blocking thread.
@@ -103,8 +109,8 @@ regardless of cleanup status; translation originals remain available only for su
 
 Off by default (`translate_enabled`). While it is off nothing of it runs: no hotkey, no process, no model. A
 second hotkey (default Option+Shift+E, same record modes as the main one) records Japanese, and English is
-pasted. After the text rules, a text with a filler or self-correction marker (up to 200 characters) is first
-cleaned by Qwen3.5-0.8B, then LFM2-350M-ENJP-MT translates it. A failed cleanup is silent: the rule text is
+pasted. After the text rules, a text with a filler or self-correction marker (up to 150 characters) is first
+cleaned by Qwen3.5-2B, then LFM2-350M-ENJP-MT translates it. A failed cleanup is silent: the rule text is
 translated instead. A failed translation pastes nothing: the Japanese goes to the clipboard and the pill says so.
 The history keeps the Japanese.
 

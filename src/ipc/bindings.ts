@@ -455,8 +455,8 @@ attribution: string; capabilities: Capabilities;
  */
 tasks: RefineKind[]; 
 /**
- * About how much memory the model takes while it runs (the peak resident size of its sidecar
- * in the stage 0 / M2 measurements, the mapped file included). Shown for the refine models;
+ * About how much memory the model takes while it runs (measured resident size of its
+ * sidecar, the mapped file included). Shown for the refine models;
  * `None` where it was not measured.
  */
 memory_bytes: number | null }

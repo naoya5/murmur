@@ -315,7 +315,7 @@ const en = {
       refineStartFailed: (code: string) =>
         `The cleanup model could not start (${code}). The rule-formatted text is used until it starts.`,
       refineNote:
-        "Very short, unmarked texts and texts over 200 characters skip cleanup. If cleanup fails, the rule-formatted text is used. The model stops after 5 minutes without use.",
+        "Very short, unmarked texts and texts over 150 characters skip cleanup. If cleanup fails, the rule-formatted text is used. The model stops after 5 minutes without use.",
       translate: "Translation (Japanese → English)",
       translateHint:
         "Speak Japanese with its own hotkey, and the English is pasted. Models on this Mac do the translation.",
@@ -723,7 +723,7 @@ const ja: Strings = {
       refineStartFailed: (code) =>
         `整形のモデルを起動できませんでした (${code})。起動できるまで、ルールで整えた文を使います。`,
       refineNote:
-        "短い文は必要なときだけ整えます。200 文字を超える文や整形に失敗したときは、ルールで整えた文を使います。モデルは 5 分使わないと止まります。",
+        "短い文は必要なときだけ整えます。150 文字を超える文や整形に失敗したときは、ルールで整えた文を使います。モデルは 5 分使わないと止まります。",
       translate: "翻訳 (日本語 → 英語)",
       translateHint:
         "専用のホットキーで日本語を話すと、英語に訳して貼り付けます。訳すのはこの Mac の中のモデルです。",

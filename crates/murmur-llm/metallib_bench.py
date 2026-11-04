@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parent
 MODELS = Path(os.environ.get("MURMUR_TEST_MODELS", Path.home() / ".murmur-dev-models")) / "llm"
 FILES = {
     "translate": "LFM2-350M-ENJP-MT-Q4_K_M.gguf",
-    "clean": "Qwen3.5-0.8B-Q4_K_M.gguf",
+    "clean": "Qwen3.5-2B-Q4_K_M.gguf",
 }
 # Synthetic fixture only. No spoken or generated text is persisted by the runner.
 TEXT = ("えっと、来週の打ち合わせは火曜日の午後三時から会議室で行います。"

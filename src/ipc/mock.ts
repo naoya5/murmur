@@ -147,7 +147,7 @@ function translationRow(i: number): Partial<TranscriptRow> | null {
     refine_status: failed ? "timeout" : "ok",
     pre_refine_text: japanese,
     refine_model_id:
-      i === 4 ? "qwen3.5-0.8b-q4_k_m+lfm2-350m-enjp-mt-q4_k_m" : "lfm2-350m-enjp-mt-q4_k_m",
+      i === 4 ? "qwen3.5-2b-q4_k_m+lfm2-350m-enjp-mt-q4_k_m" : "lfm2-350m-enjp-mt-q4_k_m",
     refine_ms: failed ? 4_100 : 420,
   };
 }
@@ -173,7 +173,7 @@ function cleanupRow(i: number): Partial<TranscriptRow> | null {
     refine_kind: "clean",
     refine_status: status,
     pre_refine_text: original,
-    refine_model_id: status === "skipped" ? null : "qwen3.5-0.8b-q4_k_m",
+    refine_model_id: status === "skipped" ? null : "qwen3.5-2b-q4_k_m",
     refine_ms: status === "skipped" ? null : 580,
   };
 }
@@ -418,19 +418,19 @@ const catalog: ModelEntry[] = [
     memory_bytes: 355 * 1024 * 1024,
   },
   {
-    id: "qwen3.5-0.8b-q4_k_m",
-    display_name: "Qwen3.5-0.8B (Q4_K_M)",
+    id: "qwen3.5-2b-q4_k_m",
+    display_name: "Qwen3.5-2B (Q4_K_M)",
     family: "llm",
     role: "refinement",
     tier: "standard",
     languages: ["ja"],
-    repository: "unsloth/Qwen3.5-0.8B-GGUF",
-    revision: "main",
-    file: "Qwen3.5-0.8B-Q4_K_M.gguf",
-    bytes: 532_517_120,
-    sha256: "",
+    repository: "unsloth/Qwen3.5-2B-GGUF",
+    revision: "f6d5376be1edb4d416d56da11e5397a961aca8ae",
+    file: "Qwen3.5-2B-Q4_K_M.gguf",
+    bytes: 1_280_835_840,
+    sha256: "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223",
     license: "Apache-2.0",
-    attribution: "Qwen3.5-0.8B by the Qwen team, Apache-2.0. GGUF by Unsloth.",
+    attribution: "Qwen3.5-2B by the Qwen team, Apache-2.0. GGUF by Unsloth.",
     capabilities: {
       custom_vocabulary: false,
       prompt_vocabulary: false,
@@ -438,12 +438,12 @@ const catalog: ModelEntry[] = [
       language_id: false,
     },
     tasks: ["clean"],
-    memory_bytes: 741 * 1024 * 1024,
+    memory_bytes: 1400 * 1024 * 1024,
   },
 ];
 
 /** `?translate=ready` has both translation models installed; `?translate` alone has none. */
-const TRANSLATION_MODELS = ["lfm2-350m-enjp-mt-q4_k_m", "qwen3.5-0.8b-q4_k_m"];
+const TRANSLATION_MODELS = ["lfm2-350m-enjp-mt-q4_k_m", "qwen3.5-2b-q4_k_m"];
 
 const installed = new Set<string>(
   params.has("empty") || params.has("onboarding")
@@ -456,7 +456,7 @@ const installed = new Set<string>(
           ? TRANSLATION_MODELS
           : []),
         ...(["ready", "startfail"].includes(params.get("refine") ?? "")
-          ? ["qwen3.5-0.8b-q4_k_m"]
+          ? ["qwen3.5-2b-q4_k_m"]
           : []),
       ],
 );

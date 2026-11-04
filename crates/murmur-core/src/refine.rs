@@ -118,9 +118,9 @@ impl RefineStatus {
 /// B1: a cleanup skips the model for texts of this many characters or fewer without a marker.
 /// In the stage 0 eval no such text needed a change, and they were where models answered.
 pub const SHORT_MAX_CHARS: usize = 20;
-/// B6: above this many characters the cleanup is skipped (Qwen3.5-0.8B needs about 9 ms per
-/// character; 200 is about 1.8 s, or 30 s of speech).
-pub const CLEAN_MAX_CHARS: usize = 200;
+/// B6: skip longer texts instead of waiting. Qwen3.5-2B measured about 12 ms per input
+/// character: 150 leaves room below 2 s for ASR/output; 196 already took 2.26 s at p95.
+pub const CLEAN_MAX_CHARS: usize = 150;
 
 /// Fillers and self-correction markers that the text rules leave in. A text that contains one
 /// is worth a cleanup. Substring match: a false hit only costs one model call, which validation
@@ -203,6 +203,8 @@ pub fn warm_steps(kind: RefineKind) -> &'static [RefineKind] {
 
 // --- time budgets and sidecar timings (spec 6.5, 6.8, 6.12; G5) ---
 
+// Qwen3.5-2B measured 1.58 s p95 at 147 characters. The existing 4 s budget at the
+// 150-character gate leaves failure-handling headroom; model loading is bounded separately.
 pub const CLEAN_BUDGET_BASE_MS: Millis = 2_500;
 pub const CLEAN_BUDGET_MAX_MS: Millis = 8_000;
 pub const TRANSLATE_BUDGET_BASE_MS: Millis = 2_000;
@@ -218,7 +220,7 @@ pub const REFINER_START_TIMEOUT_MS: Millis = 5_000;
 /// Loading a model: the same budget as a speech model load, and what `Event::RefinerLoading`
 /// adds to the machine's timer.
 pub const REFINER_LOAD_TIMEOUT_MS: Millis = crate::session::MODEL_LOAD_TIMEOUT_MS;
-/// Warming the fixed prefix (Qwen3.5-0.8B needs about 0.4 s).
+/// Warming the fixed prefix (Qwen3.5-2B measured about 0.6 to 0.7 s).
 pub const REFINER_WARM_TIMEOUT_MS: Millis = 10_000;
 /// A cancelled request must answer within this, or the process is stopped and started again
 /// before the next recording that needs it.
@@ -1376,6 +1378,9 @@ mod tests {
         assert_eq!(clean_gate("了解です。"), CleanGate::SkipShort);
         assert_eq!(clean_gate("あの、すみません。"), CleanGate::Run);
         assert_eq!(clean_gate("3時、いや4時で。"), CleanGate::Run);
+        assert_eq!(CLEAN_MAX_CHARS, 150);
+        assert_eq!(clean_gate(&"長".repeat(150)), CleanGate::Run);
+        assert_eq!(clean_gate(&"長".repeat(151)), CleanGate::SkipLong);
         let twenty = "あ".repeat(SHORT_MAX_CHARS);
         assert_eq!(clean_gate(&twenty), CleanGate::SkipShort);
         let twenty_one = "あ".repeat(SHORT_MAX_CHARS + 1);
@@ -1394,6 +1399,14 @@ mod tests {
             "会議は3時から、いや4時からでお願いします。"
         ));
         assert!(!cleans_before_translation("会議は4時からでお願いします。"));
+        assert!(cleans_before_translation(&format!(
+            "あの{}",
+            "長".repeat(148)
+        )));
+        assert!(!cleans_before_translation(&format!(
+            "あの{}",
+            "長".repeat(149)
+        )));
         let long = format!("えっと{}", "あ".repeat(CLEAN_MAX_CHARS));
         assert!(!cleans_before_translation(&long));
         assert_eq!(
@@ -1415,6 +1428,7 @@ mod tests {
     fn budgets_follow_the_spec_and_cap() {
         assert_eq!(step_budget_ms(RefineKind::Clean, 0), 2_500);
         assert_eq!(step_budget_ms(RefineKind::Clean, 60), 3_100);
+        assert_eq!(step_budget_ms(RefineKind::Clean, CLEAN_MAX_CHARS), 4_000);
         assert_eq!(step_budget_ms(RefineKind::Clean, 10_000), 8_000);
         assert_eq!(step_budget_ms(RefineKind::Translate, 60), 2_600);
         assert_eq!(step_budget_ms(RefineKind::Translate, 10_000), 6_000);
