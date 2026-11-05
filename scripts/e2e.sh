@@ -90,7 +90,11 @@ CLIP_SAVE="$SCRATCH/clipboard.saved"
 pbpaste > "$CLIP_SAVE"
 
 say "== build"
-cargo build -p murmur 2>&1 | tail -3
+# The app build needs the staged sidecar (Tauri externalBin), so build that first. A failed build
+# stops here: an older binary left in target/ would otherwise run as if it were the current code.
+BUILD_LOG="$SCRATCH/build.log" # removed with the scratch dir, so a failure prints its tail
+bash scripts/build-sidecar.sh > "$BUILD_LOG" 2>&1 || { tail -20 "$BUILD_LOG" >&2; die "sidecar build failed"; }
+cargo build -p murmur >> "$BUILD_LOG" 2>&1 || { tail -20 "$BUILD_LOG" >&2; die "build failed"; }
 [ -x "$BIN" ] || die "build failed: $BIN not found"
 
 # ---------------------------------------------------------------------------------------------
@@ -202,6 +206,20 @@ plain_log() { sed $'s/\033\\[[0-9;]*m//g' "$LOG"; }
 
 hotkey() { kill -USR1 "$APP_PID"; }
 esc() { kill -USR2 "$APP_PID"; }
+
+now_ms() { python3 -c 'import time; print(int(time.time() * 1000))'; }
+
+# Epoch milliseconds of the newest log line matching the regex (the app logs UTC timestamps), or
+# nothing when no line matches or its timestamp cannot be read.
+log_time_ms() { # <regex>
+  plain_log | grep -E "$1" | tail -1 | python3 -c '
+import datetime, re, sys
+m = re.match(r"\s*(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?)Z", sys.stdin.read())
+if m:
+    t = datetime.datetime.fromisoformat(m.group(1)).replace(tzinfo=datetime.timezone.utc)
+    print(int(t.timestamp() * 1000))
+'
+}
 
 wav_seconds() {
   python3 -c "import sys, wave; w = wave.open(sys.argv[1]); print(w.getnframes() / w.getframerate())" "$1"
@@ -374,9 +392,12 @@ case_crash() {
   start_app ja "$wav" || return
   begin_recording || { stop_app; return; }
   sleep 2
+  local kill_ms started_ms
+  kill_ms="$(now_ms)"
   kill -9 "$APP_PID" 2> /dev/null
   wait "$APP_PID" 2> /dev/null # reap it, so the shell does not print "Killed: 9"
   APP_PID=""
+  started_ms="$(log_time_ms 'recording started')"
   [ -n "$(ls -A "$DATA/spool" 2> /dev/null)" ] && pass "spool file survived the crash" || fail "no spool file after the crash"
   start_app ja "$wav" || return
   wait_for_rows $((before + 1)) 10 && pass "one new history row after restart" || fail "no recovered row"
@@ -386,12 +407,22 @@ case_crash() {
   IFS='|' read -r status duration path <<< "$row"
   [ "$status" = "recovered" ] && pass "row status recovered" || fail "row status is '$status'"
   [ -n "$path" ] && [ -f "$path" ] && pass "audio_path exists" || fail "audio_path missing: '$path'"
-  if [ -n "$duration" ] && [ "$duration" -ge 1500 ] && [ "$duration" -le 2300 ]; then
-    pass "duration about 2 s"
+  # The WAV microphone runs on a real clock from its open, so the spool holds at most the wall time
+  # from the open to the kill (the log line comes a little after the open: up to 150 ms more), and
+  # at least that minus the flush interval (250 ms) and some scheduling (150 ms). The window follows
+  # the measured time, so a slow machine does not fail it and a missing or extra second still does.
+  local expected
+  if [ -z "$started_ms" ]; then
+    fail "no timestamp on the 'recording started' log line"
   else
-    fail "duration is '$duration' ms"
+    expected=$((kill_ms - started_ms))
+    if [ -n "$duration" ] && [ "$duration" -ge $((expected - 400)) ] && [ "$duration" -le $((expected + 150)) ]; then
+      pass "duration ${duration} ms matches the ${expected} ms from start to kill"
+    else
+      fail "duration is '$duration' ms, expected about ${expected} ms (start to kill)"
+    fi
+    note "recovered audio: ${duration} ms; start to kill ${expected} ms (flush interval loses at most 250 ms)"
   fi
-  note "recovered audio: ${duration} ms (flush interval loses at most 250 ms)"
   stop_app
 }
 
