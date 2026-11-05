@@ -1,8 +1,8 @@
 name: CI
 
+# Pull requests only: the pull request run already tests the merge with main, and a second run on
+# main after each merge doubled the macOS minutes of this private repo (counted at 10x).
 on:
-  push:
-    branches: [main]
   pull_request:
 
 concurrency:
