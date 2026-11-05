@@ -120,6 +120,7 @@ const en = {
     } satisfies Record<FailureKind, string>,
     loadError: "The history could not be loaded.",
     refine: { translate: "Translated", clean: "Cleaned up" } satisfies Record<RefineKind, string>,
+    refineSkipped: "Cleanup skipped",
     refineFailed: {
       translate: "Not translated",
       clean: "Not cleaned up",
@@ -190,7 +191,7 @@ const en = {
     loadError: "The model list could not be loaded.",
     refine: "Cleanup and translation",
     refineHint:
-      "For the experimental translation. A spoken text with fillers or a correction is cleaned up before it is translated.",
+      "Dictation cleanup uses only the model marked Cleanup. Translation needs both models.",
     task: { translate: "Translation", clean: "Cleanup" } satisfies Record<RefineKind, string>,
     memory: (size: string) => `About ${size} of memory in use`,
   },
@@ -303,6 +304,18 @@ const en = {
       folderLabel: "Saved annotations",
       folderHint: "Pictures and notes of each recording.",
       folderMissing: "Nothing is saved yet. The folder appears after your first annotation.",
+      refine: "Cleanup (LLM)",
+      refineHint:
+        "Light cleanup of Japanese dictation before pasting, using a model on this Mac. English dictation is unchanged.",
+      refineModelReady: (name: string) => `${name} is downloaded.`,
+      refineModelMissing: (size: string) => `Download the cleanup model (${size}) first.`,
+      refineLists: "Bullet lists",
+      refineListsHint:
+        "Ask the model to turn spoken lists into bullet points. Changes apply to the next recording; translation is unchanged.",
+      refineStartFailed: (code: string) =>
+        `The cleanup model could not start (${code}). The rule-formatted text is used until it starts.`,
+      refineNote:
+        "Very short, unmarked texts and texts over 150 characters skip cleanup. If cleanup fails, the rule-formatted text is used. The model stops after 5 minutes without use.",
       translate: "Translation (Japanese → English)",
       translateHint:
         "Speak Japanese with its own hotkey, and the English is pasted. Models on this Mac do the translation.",
@@ -369,6 +382,7 @@ const en = {
       target_not_in_front: "Copied, the app is not in front",
       refine_failed: "Could not translate. The Japanese is copied",
     } satisfies Record<CopyReason, string>,
+    cleanupSkipped: "Cleanup skipped",
     unconfirmed: "Probably copied",
     noSpeech: "No speech",
     savedToHistory: "Saved to history",
@@ -526,6 +540,7 @@ const ja: Strings = {
     },
     loadError: "履歴を読み込めませんでした。",
     refine: { translate: "翻訳", clean: "整形" },
+    refineSkipped: "整形を省略",
     refineFailed: { translate: "翻訳できず", clean: "整形できず" },
     showBefore: { translate: "日本語を表示", clean: "整形前の文を表示" },
     hideBefore: { translate: "日本語を隠す", clean: "整形前の文を隠す" },
@@ -583,7 +598,7 @@ const ja: Strings = {
     loadError: "モデルの一覧を読み込めませんでした。",
     refine: "整形と翻訳",
     refineHint:
-      "実験的な機能の翻訳で使います。言いよどみや言い直しのある文は、整形してから訳します。",
+      "音声入力の整形には「整形」のモデルだけを使います。翻訳には両方のモデルが必要です。",
     task: { translate: "翻訳", clean: "整形" },
     memory: (size) => `使用中のメモリ 約 ${size}`,
   },
@@ -697,6 +712,18 @@ const ja: Strings = {
       folderHint: "録画ごとの画像と文が入っています。",
       folderMissing:
         "まだ保存されたものがありません。最初のアノテーションのあとにフォルダができます。",
+      refine: "整形 (LLM)",
+      refineHint:
+        "日本語の音声入力を、この Mac のモデルで控えめに整えてから貼り付けます。英語の音声入力は変わりません。",
+      refineModelReady: (name) => `${name} はダウンロード済みです。`,
+      refineModelMissing: (size) => `先に整形のモデル (${size}) をダウンロードしてください。`,
+      refineLists: "箇条書き",
+      refineListsHint:
+        "順に挙げた項目を箇条書きにするようモデルに指示します。変更は次の録音から適用され、翻訳には影響しません。",
+      refineStartFailed: (code) =>
+        `整形のモデルを起動できませんでした (${code})。起動できるまで、ルールで整えた文を使います。`,
+      refineNote:
+        "短い文は必要なときだけ整えます。150 文字を超える文や整形に失敗したときは、ルールで整えた文を使います。モデルは 5 分使わないと止まります。",
       translate: "翻訳 (日本語 → 英語)",
       translateHint:
         "専用のホットキーで日本語を話すと、英語に訳して貼り付けます。訳すのはこの Mac の中のモデルです。",
@@ -763,6 +790,7 @@ const ja: Strings = {
       target_not_in_front: "コピーしました、元のアプリが前面にありません",
       refine_failed: "翻訳できませんでした。日本語をコピーしました",
     },
+    cleanupSkipped: "整形を省略しました",
     unconfirmed: "たぶんコピーしました",
     noSpeech: "話し声がありません",
     savedToHistory: "履歴に保存しました",

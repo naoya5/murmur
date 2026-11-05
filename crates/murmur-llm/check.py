@@ -4,7 +4,7 @@
 Build with scripts/build-sidecar.sh, then run:
   python3 crates/murmur-llm/check.py checks
   python3 crates/murmur-llm/check.py messages
-  python3 crates/murmur-llm/check.py qwen --model ~/.murmur-dev-models/llm/Qwen3.5-0.8B-Q4_K_M.gguf
+  python3 crates/murmur-llm/check.py qwen --model ~/.murmur-dev-models/llm/Qwen3.5-2B-Q4_K_M.gguf
 
 MURMUR_SIDECAR_BINARY overrides the executable. Models must already exist; no downloads.
 

@@ -60,6 +60,7 @@ export function Settings() {
   const [permissions, setPermissions] = useState<Permissions | null>(null);
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
+  const [modelsError, setModelsError] = useState(false);
   const [refiner, setRefiner] = useState<RefinerStatus | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
   const [folderNote, setFolderNote] = useState(false);
@@ -84,18 +85,21 @@ export function Settings() {
       .catch(() => undefined);
   }, []);
 
-  // The translation models and their last start failure (experimental). Reading never starts them.
-  const refreshTranslation = useCallback(() => {
+  // Refinement models and their last start failures. Reading never starts a sidecar.
+  const refreshRefiner = useCallback(() => {
     commands
       .listModels()
-      .then(setModels)
-      .catch(() => undefined);
+      .then((models) => {
+        setModels(models);
+        setModelsError(false);
+      })
+      .catch(() => setModelsError(true));
     commands
       .getRefinerStatus()
       .then(setRefiner)
       .catch(() => undefined);
   }, []);
-  useEvent("modelsChanged", refreshTranslation);
+  useEvent("modelsChanged", refreshRefiner);
 
   useEffect(() => {
     commands
@@ -106,15 +110,15 @@ export function Settings() {
       .appInfo()
       .then(setInfo)
       .catch(() => undefined);
-    refreshTranslation();
+    refreshRefiner();
     refreshPermissions();
     const onFocus = () => {
       refreshPermissions();
-      refreshTranslation();
+      refreshRefiner();
     };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-  }, [refreshPermissions, refreshTranslation]);
+  }, [refreshPermissions, refreshRefiner]);
 
   const set = useCallback(
     async (field: keyof SettingsType, patch: Partial<SettingsType>) => {
@@ -141,6 +145,11 @@ export function Settings() {
     models.find((m) => m.entry.id === settings.models[language])?.entry.display_name ??
     settings.models[language];
 
+  const cleanupModel = models.find((m) => m.entry.tasks.includes("clean"));
+  const cleanupReady = cleanupModel?.status.installed === true;
+  const cleanupStartFailure = refiner?.clean_error
+    ? t.settings.experimental.refineStartFailed(refiner.clean_error)
+    : null;
   const translationModels = models.filter((m) => m.entry.role === "refinement");
   const missingModels = translationModels.filter((m) => !m.status.installed);
   const translationReady = translationModels.length > 0 && missingModels.length === 0;
@@ -465,6 +474,72 @@ export function Settings() {
         {tab === "recording" && (
           <Group>
             <Row
+              label={t.settings.experimental.refine}
+              hint={t.settings.experimental.refineHint}
+              error={errors.refine_enabled}
+            >
+              <Toggle
+                label={t.settings.experimental.refine}
+                checked={settings.refine_enabled}
+                onChange={async (refine_enabled) => {
+                  await set("refine_enabled", { refine_enabled });
+                  refreshRefiner();
+                }}
+              />
+            </Row>
+            {settings.refine_enabled && (
+              <>
+                <Row
+                  label={
+                    <span className="perm">
+                      <Dot tone={cleanupReady && !cleanupStartFailure ? "ok" : "warn"} />
+                      {t.settings.model}
+                    </span>
+                  }
+                  hint={
+                    !cleanupModel
+                      ? modelsError
+                        ? null
+                        : t.common.loading
+                      : cleanupReady
+                        ? t.settings.experimental.refineModelReady(cleanupModel.entry.display_name)
+                        : t.settings.experimental.refineModelMissing(
+                            formatBytes(cleanupModel.entry.bytes, t.locale),
+                          )
+                  }
+                  error={cleanupStartFailure ?? (modelsError ? t.models.loadError : null)}
+                >
+                  {modelsError && (
+                    <Button size="sm" onClick={refreshRefiner}>
+                      {t.common.retry}
+                    </Button>
+                  )}
+                  {!modelsError && cleanupModel && !cleanupReady && (
+                    <Button size="sm" onClick={() => navigate("models", "refine")}>
+                      {t.settings.experimental.openModels}
+                    </Button>
+                  )}
+                </Row>
+                <Row
+                  label={t.settings.experimental.refineLists}
+                  hint={t.settings.experimental.refineListsHint}
+                  error={errors.refine_lists}
+                >
+                  <Toggle
+                    label={t.settings.experimental.refineLists}
+                    checked={settings.refine_lists}
+                    onChange={(refine_lists) => set("refine_lists", { refine_lists })}
+                  />
+                </Row>
+              </>
+            )}
+            <Row label={<span className="row__note">{t.settings.experimental.refineNote}</span>} />
+          </Group>
+        )}
+
+        {tab === "recording" && (
+          <Group>
+            <Row
               label={t.settings.experimental.translate}
               hint={t.settings.experimental.translateHint}
               error={errors.translate_enabled}
@@ -474,7 +549,7 @@ export function Settings() {
                 checked={settings.translate_enabled}
                 onChange={async (translate_enabled) => {
                   await set("translate_enabled", { translate_enabled });
-                  refreshTranslation();
+                  refreshRefiner();
                 }}
               />
             </Row>

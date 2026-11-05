@@ -85,8 +85,10 @@ function Item({ row, onRetried, onDelete }: ItemProps) {
   const clamp = !expanded && needsClamp(text);
   const refine = row.refine_kind;
   const refined = refine !== null && row.refine_status === "ok";
-  // A failed model step delivered the text from before it: nothing else to show.
-  const before = refined ? row.pre_refine_text : null;
+  // Cleanup offers a different original for any status; translation keeps success-only access.
+  const before = (refine === "clean" ? row.pre_refine_text !== text : refined)
+    ? row.pre_refine_text
+    : null;
   const refineFailed =
     refine !== null && (row.refine_status === "failed" || row.refine_status === "timeout");
 
@@ -109,6 +111,9 @@ function Item({ row, onRetried, onDelete }: ItemProps) {
           <span>{formatWhen(row.created_at_ms, t.locale)}</span>
           {failed && <Badge tone="warn">{t.history.statusFailed}</Badge>}
           {refine && refined && <Badge tone="accent">{t.history.refine[refine]}</Badge>}
+          {refine === "clean" && row.refine_status === "skipped" && (
+            <Badge>{t.history.refineSkipped}</Badge>
+          )}
           {refine && refineFailed && <Badge tone="warn">{t.history.refineFailed[refine]}</Badge>}
           {row.status === "recovered" && <Badge tone="ok">{t.history.statusRecovered}</Badge>}
           {retrying && <span>{t.history.retrying}</span>}

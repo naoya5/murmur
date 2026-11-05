@@ -15,8 +15,8 @@
 //!        the murmur-llm sidecar, one process per model). Models: `catalog::refine_model`.
 //!        Tests at the end of this file.
 //!
-//! Stage 1 ships translation only (spoken Japanese, pasted English). The cleanup step exists
-//! because a translation cleans its input first (E3); cleanup as a feature of its own is stage 2.
+//! Cleanup options are fixed for each recording. Translation always uses the original lists-on
+//! cleanup prompt for its optional pre-clean, independently of the dictation setting.
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -52,6 +52,23 @@ impl RefineKind {
         [RefineKind::Clean, RefineKind::Translate]
             .into_iter()
             .find(|k| k.code() == code)
+    }
+}
+
+/// The model step and options chosen at a hotkey press, fixed for that recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefinePlan {
+    pub kind: RefineKind,
+    pub lists: bool,
+}
+
+impl RefinePlan {
+    pub fn new(kind: RefineKind, lists: bool) -> Self {
+        Self {
+            kind,
+            // Translation keeps its fixed pre-clean, independent of dictation settings.
+            lists: kind == RefineKind::Translate || lists,
+        }
     }
 }
 
@@ -101,9 +118,9 @@ impl RefineStatus {
 /// B1: a cleanup skips the model for texts of this many characters or fewer without a marker.
 /// In the stage 0 eval no such text needed a change, and they were where models answered.
 pub const SHORT_MAX_CHARS: usize = 20;
-/// B6: above this many characters the cleanup is skipped (Qwen3.5-0.8B needs about 9 ms per
-/// character; 200 is about 1.8 s, or 30 s of speech).
-pub const CLEAN_MAX_CHARS: usize = 200;
+/// B6: skip longer texts instead of waiting. Qwen3.5-2B measured about 12 ms per input
+/// character: 150 leaves room below 2 s for ASR/output; 196 already took 2.26 s at p95.
+pub const CLEAN_MAX_CHARS: usize = 150;
 
 /// Fillers and self-correction markers that the text rules leave in. A text that contains one
 /// is worth a cleanup. Substring match: a false hit only costs one model call, which validation
@@ -186,6 +203,8 @@ pub fn warm_steps(kind: RefineKind) -> &'static [RefineKind] {
 
 // --- time budgets and sidecar timings (spec 6.5, 6.8, 6.12; G5) ---
 
+// Qwen3.5-2B measured 1.58 s p95 at 147 characters. The existing 4 s budget at the
+// 150-character gate leaves failure-handling headroom; model loading is bounded separately.
 pub const CLEAN_BUDGET_BASE_MS: Millis = 2_500;
 pub const CLEAN_BUDGET_MAX_MS: Millis = 8_000;
 pub const TRANSLATE_BUDGET_BASE_MS: Millis = 2_000;
@@ -201,7 +220,7 @@ pub const REFINER_START_TIMEOUT_MS: Millis = 5_000;
 /// Loading a model: the same budget as a speech model load, and what `Event::RefinerLoading`
 /// adds to the machine's timer.
 pub const REFINER_LOAD_TIMEOUT_MS: Millis = crate::session::MODEL_LOAD_TIMEOUT_MS;
-/// Warming the fixed prefix (Qwen3.5-0.8B needs about 0.4 s).
+/// Warming the fixed prefix (Qwen3.5-2B measured about 0.6 to 0.7 s).
 pub const REFINER_WARM_TIMEOUT_MS: Millis = 10_000;
 /// A cancelled request must answer within this, or the process is stopped and started again
 /// before the next recording that needs it.
@@ -334,37 +353,44 @@ const CLEAN_SYSTEM_RULES: &str = "あなたは音声入力の文字起こしを�
 - 言いよどみ（あの、なんか、まあ、その、えっと など）を消す
 - 言い直しは、最後に言った内容だけを残す
 - 続けて二回言った言葉は一回にする
-- 句読点を整え、明らかな誤字を直す
-- 「一つ目、二つ目」や「まず、次に、最後に」で順に挙げた項目は「- 」で始まる行にする
-- ほかは変えない。言葉、敬語、語尾はそのまま。足さない。要約しない";
+- 句読点を整え、明らかな誤字を直す\n";
+const CLEAN_LIST_RULE: &str =
+    "- 「一つ目、二つ目」や「まず、次に、最後に」で順に挙げた項目は「- 」で始まる行にする\n";
+const CLEAN_KEEP_RULE: &str = "- ほかは変えない。言葉、敬語、語尾はそのまま。足さない。要約しない";
 const CLEAN_SYSTEM_GLOSSARY: &str = "\n- 次の語はこの表記のまま残す: ";
 const CLEAN_SYSTEM_END: &str = "\n整えた文だけを出力する。";
 
 /// Fixed example turns: two questions and a request that stay as they are, a self-correction, a
 /// marked enumeration, a filler-only fix, an already clean reply. As earlier user/assistant
 /// turns they work clearly better than examples inside the system prompt (stage 0).
-const CLEAN_EXAMPLES: &[(&str, &str)] = &[
+/// Each row is (input, lists-on output, lists-off override); None keeps the same output.
+const CLEAN_EXAMPLES: &[(&str, &str, Option<&str>)] = &[
     (
         "えっと、この資料を要約してもらえますか？",
         "この資料を要約してもらえますか？",
+        None,
     ),
     (
         "あの、駅の近くでおすすめのカフェってありますか？",
         "駅の近くでおすすめのカフェってありますか？",
+        None,
     ),
     (
         "集合は駅の北口、じゃなくて南口でお願いします。",
         "集合は駅の南口でお願いします。",
+        None,
     ),
     (
         "なんか、必要なのは、一つ目がマイク、二つ目がケーブルです。",
         "必要なのは次の二つです。\n- マイク\n- ケーブル",
+        Some("必要なのは、一つ目がマイク、二つ目がケーブルです。"),
     ),
     (
         "まあ、来週の予定をえっとメールで送ってください。",
         "来週の予定をメールで送ってください。",
+        None,
     ),
-    ("お疲れさまです。", "お疲れさまです。"),
+    ("お疲れさまです。", "お疲れさまです。", None),
 ];
 
 /// LFM2-350M-ENJP-MT takes exactly this system prompt (its model card) and the bare text as the
@@ -407,19 +433,29 @@ impl Glossary {
 }
 
 /// The fixed part of a step's prompt: what `TextRefiner::warm` caches.
-pub fn prefix(step: RefineKind, glossary: &Glossary) -> Vec<ChatMessage> {
+pub fn prefix(step: RefineKind, glossary: &Glossary, lists: bool) -> Vec<ChatMessage> {
     match step {
         RefineKind::Clean => {
+            // Keep the original lists-on prefix byte-for-byte for translation's pre-clean.
             let mut system = CLEAN_SYSTEM_RULES.to_owned();
+            if lists {
+                system.push_str(CLEAN_LIST_RULE);
+            }
+            system.push_str(CLEAN_KEEP_RULE);
             if !glossary.terms.is_empty() {
                 system.push_str(CLEAN_SYSTEM_GLOSSARY);
                 system.push_str(&glossary.terms.join("、"));
             }
             system.push_str(CLEAN_SYSTEM_END);
             let mut messages = vec![ChatMessage::new(ChatRole::System, system)];
-            for (input, output) in CLEAN_EXAMPLES {
+            for (input, output, without_lists) in CLEAN_EXAMPLES {
                 messages.push(ChatMessage::new(ChatRole::User, transcript_turn(input)));
-                messages.push(ChatMessage::new(ChatRole::Assistant, *output));
+                let output = if lists {
+                    output
+                } else {
+                    without_lists.unwrap_or(output)
+                };
+                messages.push(ChatMessage::new(ChatRole::Assistant, output));
             }
             messages
         }
@@ -428,8 +464,13 @@ pub fn prefix(step: RefineKind, glossary: &Glossary) -> Vec<ChatMessage> {
 }
 
 /// The whole conversation of a step: the prefix and the text as the last user turn.
-pub fn messages(step: RefineKind, glossary: &Glossary, text: &str) -> Vec<ChatMessage> {
-    let mut messages = prefix(step, glossary);
+pub fn messages(
+    step: RefineKind,
+    glossary: &Glossary,
+    text: &str,
+    lists: bool,
+) -> Vec<ChatMessage> {
+    let mut messages = prefix(step, glossary, lists);
     let user = match step {
         RefineKind::Clean => transcript_turn(text),
         RefineKind::Translate => text.to_owned(),
@@ -563,6 +604,8 @@ pub enum Rejection {
     QuestionMark,
     /// S3: the sentence ending changed without a list (an answer or a statement).
     Ending,
+    /// A replaced clause survived after its self-correction marker was removed.
+    UnmarkedSelfCorrection,
     Kana,
 }
 
@@ -669,9 +712,100 @@ fn has_list_line(text: &str) -> bool {
     text.lines().any(|line| line.trim_start().starts_with("- "))
 }
 
-/// Rules for a cleanup output: length ratio, no preface, bigram overlap, glossary kept, and the
-/// rules S1 to S3 that stage 0 found necessary (without them answers passed).
-pub fn validate_clean(out: &str, source: &str, glossary: &[String]) -> Vec<Rejection> {
+// Unlike the gate's broad substring markers, these phrases must start a clause. The apology
+// form counts only with its interjection between clauses; ordinary apologies stay untouched.
+const CORRECTION_PHRASES: &[&str] = &[
+    "あ、すみません",
+    "いや",
+    "じゃなくて",
+    "ではなく",
+    "違う",
+    "間違えた",
+    "間違えました",
+    "訂正します",
+    "訂正",
+];
+const CORRECTION_INTERJECTIONS: &[&str] = &["あ", "あっ", "え", "えっ"];
+
+fn correction_delimiter(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '、' | ',' | '。' | '？' | '?' | '！' | '!' | '；' | ';')
+}
+
+fn replaced_clause(before: &str) -> Option<&str> {
+    before
+        .rsplit(correction_delimiter)
+        .find(|part| !part.is_empty() && !CORRECTION_INTERJECTIONS.contains(part))
+}
+
+fn correction_in_context(before: &str, phrase: &str, after: &str) -> bool {
+    if !before.chars().next_back().is_some_and(correction_delimiter) {
+        return false;
+    }
+    // These words can introduce disagreement or enthusiasm, rather than replace a value.
+    let next = after.trim_start_matches(correction_delimiter);
+    if next.is_empty()
+        || next.starts_with(['ー', '〜', '～'])
+        || next.starts_with("そうじゃなく")
+        || next.starts_with("そうではなく")
+    {
+        return false;
+    }
+    // Bare correction nouns/verbs must end here, not be part of "訂正印" or "違うので".
+    if matches!(phrase, "訂正" | "違う" | "間違えた" | "間違えました")
+        && !after.chars().next().is_some_and(correction_delimiter)
+    {
+        return false;
+    }
+    true
+}
+
+fn unmarked_copies(text: &str, clause: &str, markers: &[String]) -> usize {
+    text.match_indices(clause)
+        .filter(|(start, _)| {
+            let rest = &text[start + clause.len()..];
+            let marked = |rest: &str| markers.iter().any(|marker| rest.starts_with(marker));
+            !marked(rest)
+                && !CORRECTION_INTERJECTIONS
+                    .iter()
+                    .any(|interjection| rest.strip_prefix(interjection).is_some_and(marked))
+        })
+        .count()
+}
+
+fn has_unmarked_self_correction(out: &str, source: &str) -> bool {
+    let src_content: String = content_chars(source).into_iter().collect();
+    let out_content: String = content_chars(out).into_iter().collect();
+    if src_content == out_content {
+        return false;
+    }
+    let markers: Vec<String> = CORRECTION_PHRASES
+        .iter()
+        .map(|phrase| content_chars(phrase).into_iter().collect())
+        .collect();
+    // The replaced span is the previous punctuation-delimited, non-interjection clause.
+    // Reject only newly unmarked copies of that literal span. Copies already elsewhere in
+    // the input remain allowed, including a corrected value containing it ("3時" -> "13時").
+    CORRECTION_PHRASES.iter().any(|phrase| {
+        source.match_indices(phrase).any(|(start, _)| {
+            let before = &source[..start];
+            let after = &source[start + phrase.len()..];
+            if !correction_in_context(before, phrase, after) {
+                return false;
+            }
+            let Some(clause) = replaced_clause(before) else {
+                return false;
+            };
+            let clause: String = content_chars(clause).into_iter().collect();
+            !clause.is_empty()
+                && unmarked_copies(&out_content, &clause, &markers)
+                    > unmarked_copies(&src_content, &clause, &markers)
+        })
+    })
+}
+
+/// Rules for a cleanup output: length ratio, no preface, bigram overlap, glossary kept,
+/// self-correction preservation, and S1 to S3 (without them answers passed in stage 0).
+pub fn validate_clean(out: &str, source: &str, glossary: &[String], lists: bool) -> Vec<Rejection> {
     if out.trim().is_empty() {
         return vec![Rejection::Empty];
     }
@@ -712,8 +846,11 @@ pub fn validate_clean(out: &str, source: &str, glossary: &[String]) -> Vec<Rejec
     }
     // S3: a light cleanup keeps the sentence ending ("です", "さい", "すか") unless it made a list.
     let tail = |chars: &[char]| chars[chars.len().saturating_sub(2)..].to_vec();
-    if !has_list_line(out) && tail(&out_chars) != tail(&src_chars) {
+    if (!lists || !has_list_line(out)) && tail(&out_chars) != tail(&src_chars) {
         fails.push(Rejection::Ending);
+    }
+    if has_unmarked_self_correction(out, source) {
+        fails.push(Rejection::UnmarkedSelfCorrection);
     }
     fails
 }
@@ -756,12 +893,13 @@ pub fn finish(
     truncated: bool,
     source: &str,
     glossary: &Glossary,
+    lists: bool,
 ) -> Result<String, Vec<Rejection>> {
     let mut out = postprocess(raw, source);
     let mut fails = match step {
         RefineKind::Clean => {
             out = text::replace_dictionary(&out, TRANSLATE_FROM, &glossary.entries);
-            validate_clean(&out, source, &glossary.terms)
+            validate_clean(&out, source, &glossary.terms, lists)
         }
         RefineKind::Translate => validate_translate(&out, source),
     };
@@ -825,6 +963,7 @@ pub struct Run {
     text: TranscriptText,
     chars: usize,
     glossary: Glossary,
+    lists: bool,
     /// The step whose answer is awaited and the text it was given; `None` once done.
     pending: Option<(RefineKind, TranscriptText)>,
     pre_clean: PreClean,
@@ -833,12 +972,14 @@ pub struct Run {
 
 impl Run {
     /// Starts a session on the rule-formatted `text` and returns its first call.
-    pub fn start(kind: RefineKind, text: &str, glossary: Glossary) -> (Run, Call) {
+    pub fn start(kind: RefineKind, text: &str, glossary: Glossary, lists: bool) -> (Run, Call) {
         let mut run = Run {
             kind,
             text: TranscriptText(text.to_owned()),
             chars: char_count(text),
             glossary,
+            // Translation's pre-clean has its own fixed prompt (E3).
+            lists: kind == RefineKind::Translate || lists,
             pending: None,
             pre_clean: PreClean::NotNeeded,
             steps: Vec::new(),
@@ -850,7 +991,7 @@ impl Run {
 
     fn call(&mut self, step: RefineKind, input: String) -> Call {
         let request = GenerateRequest {
-            messages: messages(step, &self.glossary, &input),
+            messages: messages(step, &self.glossary, &input, self.lists),
             max_tokens: max_new_tokens(&input),
             budget_ms: step_budget_ms(step, self.chars),
         };
@@ -881,6 +1022,7 @@ impl Run {
                 generated.truncated,
                 &input.0,
                 &self.glossary,
+                self.lists,
             )
             .map_err(RefineError::Rejected)
         });
@@ -963,7 +1105,7 @@ mod tests {
         for it in &cal.items {
             let out = postprocess(&it.clean, &it.input);
             assert_eq!(
-                validate_clean(&out, &it.input, &cal.glossary),
+                validate_clean(&out, &it.input, &cal.glossary, true),
                 vec![],
                 "item {}",
                 it.id
@@ -999,7 +1141,7 @@ mod tests {
                 total += 1;
                 let out = postprocess(fake, src);
                 assert_ne!(
-                    validate_clean(&out, src, &cal.glossary),
+                    validate_clean(&out, src, &cal.glossary, true),
                     vec![],
                     "a fake answer for item {} passed",
                     fakes.id
@@ -1041,14 +1183,176 @@ mod tests {
         // Echo plus answer: only S1 sees the appended sentence.
         let src = "明日の東京の天気はどうなりますか？";
         let out = "明日の東京の天気はどうなりますか？\n明日は晴れる見込みです。";
-        assert!(validate_clean(out, src, &[]).contains(&Rejection::Sentence));
+        assert!(validate_clean(out, src, &[], true).contains(&Rejection::Sentence));
         // S3: the request turned into a statement keeps most bigrams but not the ending.
         let src = "この文章を三行で要約してください。";
-        let fails = validate_clean("この文章を三行で要約します。", src, &[]);
+        let fails = validate_clean("この文章を三行で要約します。", src, &[], true);
         assert!(fails.contains(&Rejection::Ending), "{fails:?}");
         // S2: a question that lost its question mark.
         let src = "今どこですか？";
-        assert!(validate_clean("今どこですか。", src, &[]).contains(&Rejection::QuestionMark));
+        assert!(
+            validate_clean("今どこですか。", src, &[], true).contains(&Rejection::QuestionMark)
+        );
+    }
+
+    #[test]
+    fn correction_guard_preserves_all_seven_calibration_fixes_and_unchanged_inputs() {
+        let cal = calibration();
+        for id in [5, 6, 7, 8, 24, 38, 40] {
+            let item = cal
+                .items
+                .iter()
+                .find(|item| item.id == id)
+                .expect("item id");
+            let marker_only = item
+                .input
+                .replace("あ、すみません、", "")
+                .replace("あ、違う、", "")
+                .replace("じゃなくて", "")
+                .replace("いや", "");
+            assert_ne!(marker_only, item.input, "item {id}");
+            for lists in [false, true] {
+                for safe in [&item.input, &item.clean] {
+                    assert!(
+                        validate_clean(safe, &item.input, &cal.glossary, lists).is_empty(),
+                        "safe output for item {id}"
+                    );
+                }
+                assert!(
+                    validate_clean(&marker_only, &item.input, &cal.glossary, lists)
+                        .contains(&Rejection::UnmarkedSelfCorrection),
+                    "marker-only removal for item {id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn correction_guard_ignores_obvious_non_correction_contexts() {
+        for (source, out) in [
+            ("いやー、今日はよく歩きました。", "今日はよく歩きました。"),
+            (
+                "疲れましたね、いやー、今日はよく歩きました。",
+                "疲れましたね、今日はよく歩きました。",
+            ),
+            (
+                "いや、そうじゃなくて、別の話です。",
+                "そうじゃなくて、別の話です。",
+            ),
+            (
+                "同じ話ですか、いや、そうじゃなくて、別の話です。",
+                "同じ話ですか、そうじゃなくて、別の話です。",
+            ),
+            (
+                "これは誤りではなく表記の違いです。",
+                "これは誤りではなく表記の違いです。",
+            ),
+            (
+                "古い訂正印ですが、訂正印としてまだ使えます。",
+                "古い訂正印ですが、印としてまだ使えます。",
+            ),
+            (
+                "種類が違うので、別々に数えます。",
+                "種類が違うので、別々に数えます。",
+            ),
+            (
+                "この道です、間違えたので戻ります。",
+                "この道です、戻ります。",
+            ),
+            (
+                "お待たせしてすみません、準備できました。",
+                "お待たせしてすみません、準備できました。",
+            ),
+            ("台詞は「いや」です。", "台詞は「いや」です。"),
+        ] {
+            assert!(!has_unmarked_self_correction(out, source));
+            assert!(!has_unmarked_self_correction(source, source));
+        }
+    }
+
+    #[test]
+    fn correction_guard_counts_each_replaced_clause_without_rejecting_shared_text() {
+        for (source, out, rejected) in [
+            ("3時、いや13時で。", "13時で。", false),
+            ("3時、いや13時で。", "3時、13時で。", true),
+            ("東京、いや東京都内です。", "東京都内です。", false),
+            ("東京、いや東京都内です。", "東京、東京都内です。", true),
+            ("3時、いや3時で。", "3時で。", false),
+            (
+                "3時、いや4時で。別の受付は3時です。",
+                "4時で。別の受付は3時です。",
+                false,
+            ),
+            (
+                "3時、いや4時で。別の受付は3時です。",
+                "3時、4時で。別の受付は3時です。",
+                true,
+            ),
+            (
+                "集合は1時、いや2時、解散は3時、いや4時です。",
+                "集合は1時、2時、解散は3時、いや4時です。",
+                true,
+            ),
+            (
+                "集合は1時、いや2時、解散は3時、いや4時です。",
+                "集合は2時、解散は4時です。",
+                false,
+            ),
+            (
+                "会議は3時から、あ、違う、4時からでお願いします。",
+                "会議は3時から、違う、4時からでお願いします。",
+                false,
+            ),
+            (
+                "会議は3時から、いや4時からでお願いします。",
+                "会議は3時から、ではなく4時からでお願いします。",
+                false,
+            ),
+            (
+                "会議は3時から、いや4時からでお願いします。",
+                "会議は3時から、または4時からでお願いします。",
+                true,
+            ),
+            (
+                "会議は3時から、いや4時からでお願いします。",
+                "会議は3時から、いや、4時からでお願いします。",
+                false,
+            ),
+        ] {
+            assert_eq!(has_unmarked_self_correction(out, source), rejected);
+        }
+    }
+
+    #[test]
+    fn a_marker_only_cleanup_fails_and_translation_uses_the_rule_text() {
+        let source = "会議は3時から、いや4時からでお願いします。";
+        let harmful = "会議は3時から、4時からでお願いします。";
+        let (report, _) = drive(RefineKind::Clean, source, vec![ok(harmful)]);
+        assert_eq!(
+            report.result,
+            Err(RefineError::Rejected(vec![
+                Rejection::UnmarkedSelfCorrection
+            ]))
+        );
+        let (report, calls) = drive(
+            RefineKind::Translate,
+            source,
+            vec![ok(harmful), ok("Please make the meeting at four.")],
+        );
+        assert_eq!(
+            report.pre_clean,
+            PreClean::Failed(RefineError::Rejected(vec![
+                Rejection::UnmarkedSelfCorrection
+            ]))
+        );
+        assert_eq!(
+            calls[1]
+                .request
+                .messages
+                .last()
+                .map(|message| message.content.as_str()),
+            Some(source)
+        );
     }
 
     #[test]
@@ -1074,6 +1378,9 @@ mod tests {
         assert_eq!(clean_gate("了解です。"), CleanGate::SkipShort);
         assert_eq!(clean_gate("あの、すみません。"), CleanGate::Run);
         assert_eq!(clean_gate("3時、いや4時で。"), CleanGate::Run);
+        assert_eq!(CLEAN_MAX_CHARS, 150);
+        assert_eq!(clean_gate(&"長".repeat(150)), CleanGate::Run);
+        assert_eq!(clean_gate(&"長".repeat(151)), CleanGate::SkipLong);
         let twenty = "あ".repeat(SHORT_MAX_CHARS);
         assert_eq!(clean_gate(&twenty), CleanGate::SkipShort);
         let twenty_one = "あ".repeat(SHORT_MAX_CHARS + 1);
@@ -1092,6 +1399,14 @@ mod tests {
             "会議は3時から、いや4時からでお願いします。"
         ));
         assert!(!cleans_before_translation("会議は4時からでお願いします。"));
+        assert!(cleans_before_translation(&format!(
+            "あの{}",
+            "長".repeat(148)
+        )));
+        assert!(!cleans_before_translation(&format!(
+            "あの{}",
+            "長".repeat(149)
+        )));
         let long = format!("えっと{}", "あ".repeat(CLEAN_MAX_CHARS));
         assert!(!cleans_before_translation(&long));
         assert_eq!(
@@ -1113,6 +1428,7 @@ mod tests {
     fn budgets_follow_the_spec_and_cap() {
         assert_eq!(step_budget_ms(RefineKind::Clean, 0), 2_500);
         assert_eq!(step_budget_ms(RefineKind::Clean, 60), 3_100);
+        assert_eq!(step_budget_ms(RefineKind::Clean, CLEAN_MAX_CHARS), 4_000);
         assert_eq!(step_budget_ms(RefineKind::Clean, 10_000), 8_000);
         assert_eq!(step_budget_ms(RefineKind::Translate, 60), 2_600);
         assert_eq!(step_budget_ms(RefineKind::Translate, 10_000), 6_000);
@@ -1212,7 +1528,7 @@ mod tests {
             entry("森川", &[], DictionaryScope::Both),
         ]);
         assert_eq!(glossary.terms(), &["Claude Code", "森川"]);
-        let prefix = prefix(RefineKind::Clean, &glossary);
+        let prefix = prefix(RefineKind::Clean, &glossary, true);
         assert_eq!(prefix.len(), 1 + 2 * CLEAN_EXAMPLES.len());
         assert_eq!(prefix[0].role, ChatRole::System);
         assert!(
@@ -1234,23 +1550,23 @@ mod tests {
     }
 
     fn prefix_of_empty() -> Vec<ChatMessage> {
-        prefix(RefineKind::Clean, &Glossary::default())
+        prefix(RefineKind::Clean, &Glossary::default(), true)
     }
 
     #[test]
     fn generate_messages_extend_the_warm_prefix_exactly() {
         let glossary = Glossary::new(&[entry("Murmur", &[], DictionaryScope::Both)]);
         for step in [RefineKind::Clean, RefineKind::Translate] {
-            let warm = prefix(step, &glossary);
-            let full = messages(step, &glossary, "明日は休みます。");
+            let warm = prefix(step, &glossary, true);
+            let full = messages(step, &glossary, "明日は休みます。", true);
             assert_eq!(&full[..warm.len()], &warm[..], "{step:?}");
             assert_eq!(full.len(), warm.len() + 1);
             assert_eq!(full[warm.len()].role, ChatRole::User);
         }
-        let translate = messages(RefineKind::Translate, &glossary, "明日は休みます。");
+        let translate = messages(RefineKind::Translate, &glossary, "明日は休みます。", true);
         assert_eq!(translate[0].content, "Translate to English.");
         assert_eq!(translate[1].content, "明日は休みます。");
-        let clean = messages(RefineKind::Clean, &glossary, "明日は休みます。");
+        let clean = messages(RefineKind::Clean, &glossary, "明日は休みます。", true);
         assert_eq!(
             clean.last().map(|m| m.content.as_str()),
             Some("<transcript>明日は休みます。</transcript>")
@@ -1261,6 +1577,125 @@ mod tests {
     fn debug_hides_prompt_text() {
         let m = ChatMessage::new(ChatRole::User, "秘密の文");
         assert_eq!(format!("{m:?}"), "user: <redacted 4 chars>");
+    }
+
+    #[test]
+    fn lists_off_removes_the_rule_and_uses_a_non_list_example() {
+        let glossary = Glossary::default();
+        let on = prefix(RefineKind::Clean, &glossary, true);
+        let off = prefix(RefineKind::Clean, &glossary, false);
+        assert_eq!(on.len(), off.len());
+        assert_eq!(
+            on[0].content,
+            format!("{CLEAN_SYSTEM_RULES}{CLEAN_LIST_RULE}{CLEAN_KEEP_RULE}{CLEAN_SYSTEM_END}")
+        );
+        assert_eq!(
+            off[0].content,
+            format!("{CLEAN_SYSTEM_RULES}{CLEAN_KEEP_RULE}{CLEAN_SYSTEM_END}")
+        );
+        let changed: Vec<_> = on
+            .iter()
+            .zip(&off)
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(changed, vec![0, 8]);
+        assert_eq!(
+            off[8].content,
+            "必要なのは、一つ目がマイク、二つ目がケーブルです。"
+        );
+        assert!(
+            off.iter()
+                .filter(|m| m.role == ChatRole::Assistant)
+                .all(|m| !has_list_line(&m.content))
+        );
+        assert!(validate_clean(&off[8].content, CLEAN_EXAMPLES[3].0, &[], false).is_empty());
+        for lists in [false, true] {
+            let warm = prefix(RefineKind::Clean, &glossary, lists);
+            let full = messages(
+                RefineKind::Clean,
+                &glossary,
+                "まず、資料を確認します。",
+                lists,
+            );
+            assert_eq!(full[..warm.len()], warm);
+        }
+        assert_eq!(
+            prefix(RefineKind::Translate, &glossary, false),
+            prefix(RefineKind::Translate, &glossary, true)
+        );
+    }
+
+    #[test]
+    fn lists_off_keeps_s3_even_when_a_model_emits_a_bullet() {
+        let src = "この文章を三行で要約してください。";
+        let answer = "- この文章を三行で要約します。";
+        assert!(!validate_clean(answer, src, &[], true).contains(&Rejection::Ending));
+        assert!(validate_clean(answer, src, &[], false).contains(&Rejection::Ending));
+        let cal = calibration();
+        for fakes in &cal.fake_clean_answers {
+            for fake in &fakes.outputs {
+                let src = input_of(&cal, fakes.id);
+                assert!(
+                    !validate_clean(&postprocess(fake, src), src, &cal.glossary, false).is_empty(),
+                    "item {}",
+                    fakes.id
+                );
+            }
+        }
+        for item in &cal.items {
+            if !has_list_line(&item.clean) {
+                assert!(
+                    validate_clean(&item.clean, &item.input, &cal.glossary, false).is_empty(),
+                    "item {}",
+                    item.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn run_uses_the_recorded_lists_choice_but_translation_always_uses_lists() {
+        let cal = calibration();
+        let item = cal
+            .items
+            .iter()
+            .find(|item| item.id == 9)
+            .expect("list item");
+        let src = item.input.as_str();
+        for kind in [RefineKind::Clean, RefineKind::Translate] {
+            for lists in [false, true] {
+                let (mut run, call) = Run::start(kind, src, Glossary::default(), lists);
+                let effective = kind == RefineKind::Translate || lists;
+                assert_eq!(
+                    call.request.messages,
+                    messages(RefineKind::Clean, &Glossary::default(), src, effective)
+                );
+                // This answer changes the ending. Only lists-on may exempt it from S3.
+                let next = run.advance(ok(&item.clean));
+                if kind == RefineKind::Translate {
+                    assert!(matches!(
+                        next,
+                        Next::Call(Call {
+                            step: RefineKind::Translate,
+                            ..
+                        })
+                    ));
+                    assert_eq!(run.pre_clean, PreClean::Used);
+                } else if lists {
+                    assert!(matches!(next, Next::Done(RunReport { result: Ok(_), .. })));
+                } else {
+                    assert!(matches!(
+                        next,
+                        Next::Done(RunReport {
+                            result: Err(RefineError::Rejected(_)),
+                            ..
+                        })
+                    ));
+                }
+            }
+        }
     }
 
     // --- post-processing ---
@@ -1348,9 +1783,13 @@ mod tests {
                 .contains(&Rejection::Preface)
         );
         assert!(
-            validate_clean("以下が清書です。了解です。", src, &[]).contains(&Rejection::Preface)
+            validate_clean("以下が清書です。了解です。", src, &[], true)
+                .contains(&Rejection::Preface)
         );
-        assert!(validate_clean("了解しました。以下です。", src, &[]).contains(&Rejection::Preface));
+        assert!(
+            validate_clean("了解しました。以下です。", src, &[], true)
+                .contains(&Rejection::Preface)
+        );
         // "了解しました" alone is a normal reply, and a source that starts with "はい、" may keep it.
         assert!(!has_preface(
             "了解しました。明日伺います。",
@@ -1365,18 +1804,21 @@ mod tests {
         let src = "えっと、Murmurの設定を開きます。";
         let glossary = vec!["Murmur".to_owned()];
         assert_eq!(
-            validate_clean("Murmurの設定を開きます。", src, &glossary),
+            validate_clean("Murmurの設定を開きます。", src, &glossary, true),
             vec![]
         );
         assert!(
-            validate_clean("マーマーの設定を開きます。", src, &glossary)
+            validate_clean("マーマーの設定を開きます。", src, &glossary, true)
                 .contains(&Rejection::Glossary)
         );
     }
 
     #[test]
     fn empty_and_kana_outputs_fail() {
-        assert_eq!(validate_clean("  ", "あの。", &[]), vec![Rejection::Empty]);
+        assert_eq!(
+            validate_clean("  ", "あの。", &[], true),
+            vec![Rejection::Empty]
+        );
         assert_eq!(validate_translate("", "あの。",), vec![Rejection::Empty]);
         assert_eq!(
             validate_translate("明日は休みます。", "明日は休みます。"),
@@ -1402,7 +1844,8 @@ mod tests {
                 "クロードコードで作ります。",
                 false,
                 src,
-                &glossary
+                &glossary,
+                true
             ),
             Ok("Claude Codeで作ります。".to_owned())
         );
@@ -1412,7 +1855,8 @@ mod tests {
                 "I'll make it with Claude Code.",
                 true,
                 src,
-                &glossary
+                &glossary,
+                true
             ),
             Err(vec![Rejection::Truncated])
         );
@@ -1434,7 +1878,7 @@ mod tests {
         answers: Vec<Result<Generated, RefineError>>,
     ) -> (RunReport, Vec<Call>) {
         let mut answers = std::collections::VecDeque::from(answers);
-        let (mut run, mut call) = Run::start(kind, text, Glossary::default());
+        let (mut run, mut call) = Run::start(kind, text, Glossary::default(), true);
         let mut calls = Vec::new();
         loop {
             calls.push(call);
@@ -1598,7 +2042,7 @@ mod tests {
     #[test]
     fn an_answer_after_the_end_fails_and_the_debug_output_hides_the_text() {
         let src = "会議は4時からです。";
-        let (mut run, _) = Run::start(RefineKind::Translate, src, Glossary::default());
+        let (mut run, _) = Run::start(RefineKind::Translate, src, Glossary::default(), true);
         assert!(matches!(
             run.advance(ok("The meeting is at four.")),
             Next::Done(RunReport { result: Ok(_), .. })

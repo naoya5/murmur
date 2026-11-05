@@ -55,7 +55,7 @@ export MURMUR_SIDECAR_BINARY="$PWD/src-tauri/binaries/murmur-llm-$(rustc --print
 python3 crates/murmur-llm/check.py checks
 python3 crates/murmur-llm/check.py messages
 python3 crates/murmur-llm/check.py qwen \
-  --model "$HOME/.murmur-dev-models/llm/Qwen3.5-0.8B-Q4_K_M.gguf"
+  --model "$HOME/.murmur-dev-models/llm/Qwen3.5-2B-Q4_K_M.gguf"
 ```
 
 The default translation model is
@@ -76,4 +76,7 @@ CLI comparison, declined native-runtime experiment and the later precompiled-Met
 `benchmark.py` repeats the fixed-prefix 10-item x 10-run method against an explicit read-only
 request-set JSON. `metallib_bench.py` measures four simultaneous residents, three solo loads per
 model, and first prefill using synthetic text and the current core cleanup prompt. Both persist
-numeric measurements only.
+numeric measurements only. The metallib benchmark obtains its cleanup prefix from the production
+Rust builder through `cargo run -p murmur --example cleanup-prefix`, before starting measurements.
+Use the app's Cargo build environment (`SPEECH_CPP_DIR` if needed); `--lists-off` selects the other
+cleanup variant. Model-free coverage: `python3 -m unittest discover -s crates/murmur-llm -p 'test_*.py'`.

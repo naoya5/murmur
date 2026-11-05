@@ -8,8 +8,8 @@
 //!        (the LLMs of the refine step, run by the murmur-llm sidecar). Speech values are copied
 //!        from speech.cpp v0.10.0 `tools/catalog/catalog.json` and the Hugging Face API (HANDOFF
 //!        7.2). Raise the speech.cpp version and these revisions together, then run the engine
-//!        tests. The LLM rows were chosen in the stage 0 eval (spec 6.7); to switch a model, add
-//!        its row, point `DEFAULT_*_MODEL` at it and rerun that eval set.
+//!        tests. The LLM rows are evaluated before selection; replace the cleanup row and its
+//!        default id together, then rerun the original and held-out evaluation sets.
 
 use serde::Serialize;
 use specta::Type;
@@ -23,7 +23,7 @@ pub const VAD_MODEL: &str = "silero-vad-v6.2";
 /// The translation model (A3: a translation-only model never answered in stage 0).
 pub const DEFAULT_TRANSLATE_MODEL: &str = "lfm2-350m-enjp-mt-q4_k_m";
 /// The cleanup model, used before a translation when the text has a marker (E1, E3).
-pub const DEFAULT_CLEAN_MODEL: &str = "qwen3.5-0.8b-q4_k_m";
+pub const DEFAULT_CLEAN_MODEL: &str = "qwen3.5-2b-q4_k_m";
 
 /// The model family decides how the engine adapter drives the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
@@ -93,8 +93,8 @@ pub struct ModelEntry {
     pub capabilities: Capabilities,
     /// What a `Role::Refinement` model does. Empty for every other role.
     pub tasks: &'static [RefineKind],
-    /// About how much memory the model takes while it runs (the peak resident size of its sidecar
-    /// in the stage 0 / M2 measurements, the mapped file included). Shown for the refine models;
+    /// About how much memory the model takes while it runs (measured resident size of its
+    /// sidecar, the mapped file included). Shown for the refine models;
     /// `None` where it was not measured.
     #[specta(type = Option<f64>)]
     pub memory_bytes: Option<u64>,
@@ -249,22 +249,22 @@ pub static CATALOG: &[ModelEntry] = &[
     },
     ModelEntry {
         id: DEFAULT_CLEAN_MODEL,
-        display_name: "Qwen3.5-0.8B (Q4_K_M)",
+        display_name: "Qwen3.5-2B (Q4_K_M)",
         family: Family::Llm,
         role: Role::Refinement,
         tier: Tier::Standard,
         languages: &[Language::Ja],
-        repository: "unsloth/Qwen3.5-0.8B-GGUF",
-        revision: "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
-        file: "Qwen3.5-0.8B-Q4_K_M.gguf",
-        bytes: 532_517_120,
-        sha256: "bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517",
+        repository: "unsloth/Qwen3.5-2B-GGUF",
+        revision: "f6d5376be1edb4d416d56da11e5397a961aca8ae",
+        file: "Qwen3.5-2B-Q4_K_M.gguf",
+        bytes: 1_280_835_840,
+        sha256: "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223",
         license: "Apache-2.0",
-        attribution: "Qwen3.5-0.8B by the Qwen team, Apache-2.0. GGUF by Unsloth.",
+        attribution: "Qwen3.5-2B by the Qwen team, Apache-2.0. GGUF by Unsloth.",
         capabilities: NO_SPEECH_CAPABILITIES,
         tasks: &[RefineKind::Clean],
-        // crates/murmur-llm/PERFORMANCE.md: 701 to 741 MiB.
-        memory_bytes: Some(741 * 1024 * 1024),
+        // M3b: 1395 MiB after a warm request; rounded up for the Models screen.
+        memory_bytes: Some(1400 * 1024 * 1024),
     },
 ];
 
@@ -445,9 +445,14 @@ mod tests {
         assert_eq!(refine_model_ids(&[]), "");
         let ids: Vec<&str> = refinement_models().map(|m| m.id).collect();
         assert_eq!(ids, vec![DEFAULT_TRANSLATE_MODEL, DEFAULT_CLEAN_MODEL]);
-        // D2: both together stay under 1 GB of files.
+        // The user accepted the larger cleanup model; keep exactly one model per task.
         let total: u64 = refinement_models().map(|m| m.bytes).sum();
-        assert!(total < 1_000_000_000, "{total}");
+        assert_eq!(total, 1_510_146_080);
+        let clean = refine_model(RefineKind::Clean);
+        assert_eq!(clean.file, "Qwen3.5-2B-Q4_K_M.gguf");
+        assert_eq!(clean.languages, &[Language::Ja]);
+        assert_eq!(clean.tasks, &[RefineKind::Clean]);
+        assert!(find("qwen3.5-0.8b-q4_k_m").is_none());
         // Neither is a speech model for any language.
         for lang in Language::ALL {
             assert!(for_language(lang).all(|m| m.role == Role::Recognition));

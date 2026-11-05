@@ -182,7 +182,7 @@ function annotationDelivered(
   return { icon: wordsOnly ? "warn" : "ok", text, sub };
 }
 
-function noticeContent(
+export function noticeContent(
   notice: Notice,
   t: Strings,
 ): { icon: "ok" | "warn" | "info"; text: string; sub?: string } {
@@ -201,6 +201,14 @@ function noticeContent(
           return { icon: "info", text: t.pill.unconfirmed };
       }
       break;
+    case "cleanup_skipped": {
+      const delivered = noticeContent({ kind: "delivered", outcome: notice.outcome }, t);
+      return {
+        icon: "warn",
+        text: t.pill.cleanupSkipped,
+        sub: delivered.text,
+      };
+    }
     case "no_speech":
       return { icon: "info", text: t.pill.noSpeech };
     case "failed":

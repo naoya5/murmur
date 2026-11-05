@@ -9,6 +9,9 @@
 //             shot-textonly|shot-textonly-copied|shot-empty|shot-denied|shot-mic
 //   overlay.html (draw with the mouse; ?shown=0 starts hidden)
 //   index.html?view=settings#recording&annotations=1|nofolder|nopermission|hotkeyclash
+//   index.html?view=settings&refine=missing|ready|startfail&lists=off&savefail=1&modelerror=1&slowmodels=1
+//   index.html?view=history&refine=ready&history=clean
+//   pill.html?state=clean|cleaning|clean-skipped|clean-copied&lang=ja|en
 //   window.__murmurMock.pill("copied"), .cycle(), .failDownloads(true)
 import { emit } from "@tauri-apps/api/event";
 import { mockIPC } from "@tauri-apps/api/mocks";
@@ -87,6 +90,8 @@ let settings: Settings = {
   annotations_retention_days: 7,
   translate_enabled: params.has("translate"),
   translate_hotkey: "Alt+Shift+KeyE",
+  refine_enabled: params.has("refine"),
+  refine_lists: params.get("lists") !== "off",
 };
 
 /** A history row without a model step. */
@@ -142,8 +147,34 @@ function translationRow(i: number): Partial<TranscriptRow> | null {
     refine_status: failed ? "timeout" : "ok",
     pre_refine_text: japanese,
     refine_model_id:
-      i === 4 ? "qwen3.5-0.8b-q4_k_m+lfm2-350m-enjp-mt-q4_k_m" : "lfm2-350m-enjp-mt-q4_k_m",
+      i === 4 ? "qwen3.5-2b-q4_k_m+lfm2-350m-enjp-mt-q4_k_m" : "lfm2-350m-enjp-mt-q4_k_m",
     refine_ms: failed ? 4_100 : 420,
+  };
+}
+
+/** Cleanup fixtures cover success, skip and both fallback statuses without losing the original. */
+function cleanupRow(i: number): Partial<TranscriptRow> | null {
+  const statuses = { 0: "ok", 3: "skipped", 6: "failed", 8: "timeout" } as const;
+  if (!params.has("refine") || !(i in statuses)) {
+    return null;
+  }
+  const status = statuses[i as keyof typeof statuses];
+  const original =
+    status === "skipped"
+      ? "了解です。"
+      : "あの、資料はSlackのチャンネルに共有しておきました。確認をお願いします。";
+  return {
+    language: "ja",
+    text:
+      status === "ok"
+        ? "資料はSlackのチャンネルに共有しておきました。確認をお願いします。"
+        : original,
+    raw_text: original,
+    refine_kind: "clean",
+    refine_status: status,
+    pre_refine_text: original,
+    refine_model_id: status === "skipped" ? null : "qwen3.5-2b-q4_k_m",
+    refine_ms: status === "skipped" ? null : 580,
   };
 }
 
@@ -173,9 +204,12 @@ function makeHistory(): TranscriptRow[] {
       error: failed ? (i === 2 ? "timeout" : "model_missing") : null,
       ...NO_REFINE,
       ...translationRow(i),
+      ...cleanupRow(i),
     });
   }
-  return rows;
+  return params.get("history") === "clean"
+    ? rows.filter((row) => row.refine_kind === "clean")
+    : rows;
 }
 
 let history: TranscriptRow[] = params.has("empty") ? [] : makeHistory();
@@ -384,19 +418,19 @@ const catalog: ModelEntry[] = [
     memory_bytes: 355 * 1024 * 1024,
   },
   {
-    id: "qwen3.5-0.8b-q4_k_m",
-    display_name: "Qwen3.5-0.8B (Q4_K_M)",
+    id: "qwen3.5-2b-q4_k_m",
+    display_name: "Qwen3.5-2B (Q4_K_M)",
     family: "llm",
     role: "refinement",
     tier: "standard",
     languages: ["ja"],
-    repository: "unsloth/Qwen3.5-0.8B-GGUF",
-    revision: "main",
-    file: "Qwen3.5-0.8B-Q4_K_M.gguf",
-    bytes: 532_517_120,
-    sha256: "",
+    repository: "unsloth/Qwen3.5-2B-GGUF",
+    revision: "f6d5376be1edb4d416d56da11e5397a961aca8ae",
+    file: "Qwen3.5-2B-Q4_K_M.gguf",
+    bytes: 1_280_835_840,
+    sha256: "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223",
     license: "Apache-2.0",
-    attribution: "Qwen3.5-0.8B by the Qwen team, Apache-2.0. GGUF by Unsloth.",
+    attribution: "Qwen3.5-2B by the Qwen team, Apache-2.0. GGUF by Unsloth.",
     capabilities: {
       custom_vocabulary: false,
       prompt_vocabulary: false,
@@ -404,12 +438,12 @@ const catalog: ModelEntry[] = [
       language_id: false,
     },
     tasks: ["clean"],
-    memory_bytes: 741 * 1024 * 1024,
+    memory_bytes: 1400 * 1024 * 1024,
   },
 ];
 
 /** `?translate=ready` has both translation models installed; `?translate` alone has none. */
-const TRANSLATION_MODELS = ["lfm2-350m-enjp-mt-q4_k_m", "qwen3.5-0.8b-q4_k_m"];
+const TRANSLATION_MODELS = ["lfm2-350m-enjp-mt-q4_k_m", "qwen3.5-2b-q4_k_m"];
 
 const installed = new Set<string>(
   params.has("empty") || params.has("onboarding")
@@ -420,6 +454,9 @@ const installed = new Set<string>(
         "silero-vad-v6.2",
         ...(["ready", "startfail"].includes(params.get("translate") ?? "")
           ? TRANSLATION_MODELS
+          : []),
+        ...(["ready", "startfail"].includes(params.get("refine") ?? "")
+          ? ["qwen3.5-2b-q4_k_m"]
           : []),
       ],
 );
@@ -505,6 +542,17 @@ function pillViewFor(name: string): PillView {
       return { kind: "transcribing" };
     case "translating":
       return { kind: "refining", task: "translate" };
+    case "clean":
+      return { kind: "recording", elapsed_ms: 6_200, mode: "toggle" };
+    case "cleaning":
+      return { kind: "refining", task: "clean" };
+    case "clean-skipped":
+      return { kind: "notice", notice: { kind: "cleanup_skipped", outcome: { kind: "pasted" } } };
+    case "clean-copied":
+      return {
+        kind: "notice",
+        notice: { kind: "cleanup_skipped", outcome: { kind: "copied", reason: "auto_paste_off" } },
+      };
     case "translate-pasted":
       return { kind: "notice", notice: { kind: "delivered", outcome: { kind: "pasted" } } };
     case "translate-failed":
@@ -570,7 +618,7 @@ function showPill(name: string): void {
 }
 
 function refineFor(name: string): RefineKind | null {
-  return name.startsWith("translat") ? "translate" : null;
+  return name.startsWith("translat") ? "translate" : name.startsWith("clean") ? "clean" : null;
 }
 
 function annotationNotice(outcome: DeliveryOutcome, images: number): PillView {
@@ -713,7 +761,11 @@ function simulateDictation(): void {
 
 function filteredHistory(query: string): TranscriptRow[] {
   const q = query.trim().toLowerCase();
-  return q ? history.filter((r) => (r.text ?? "").toLowerCase().includes(q)) : history;
+  return q
+    ? history.filter((r) =>
+        [r.text, r.pre_refine_text].some((text) => text?.toLowerCase().includes(q)),
+      )
+    : history;
 }
 
 mockIPC(
@@ -727,6 +779,9 @@ mockIPC(
         return settings;
       case "update_settings": {
         const next = args.settings as Settings;
+        if (params.has("savefail")) {
+          throw { kind: "save", message: "The settings file could not be replaced" };
+        }
         if (next.hotkey === "Cmd+Space") {
           throw { kind: "hotkey", message: "Cmd+Space is taken by Spotlight" };
         }
@@ -788,6 +843,12 @@ mockIPC(
       case "copy_text":
         return null;
       case "list_models":
+        if (params.has("modelerror")) {
+          throw { kind: "store", message: "Model status is temporarily unavailable" };
+        }
+        if (params.has("slowmodels")) {
+          await new Promise((resolve) => window.setTimeout(resolve, 3_000));
+        }
         return modelInfos();
       case "download_model":
         if (params.has("diskfull")) {
@@ -827,7 +888,7 @@ mockIPC(
       case "get_refiner_status":
         return {
           translate_error: params.get("translate") === "startfail" ? "model_load_failed" : null,
-          clean_error: null,
+          clean_error: params.get("refine") === "startfail" ? "model_load_failed" : null,
         };
       case "open_annotations_folder":
         if (params.get("annotations") === "nofolder") {

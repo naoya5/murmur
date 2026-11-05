@@ -227,7 +227,108 @@ mod tests {
         }
     }
 
+    const FRONTMOST_PROBE_ENV: &str = "MURMUR_FRONTMOST_PROBE";
+    const FRONTMOST_PROBE_TEST: &str = "adapters::frontmost::tests::active_pid_probe";
+    const FRONTMOST_PROBE_PREFIX: &str = "murmur-frontmost-pid=";
+    const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Both commands below have tiny output. Bound their exit first; collecting their piped
+    /// output after try_wait has reaped them cannot block on process termination.
+    fn read_command(
+        command: &mut std::process::Command,
+        timeout: Duration,
+    ) -> std::io::Result<std::process::Output> {
+        use std::process::Stdio;
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if child.try_wait()?.is_some() {
+                return child.wait_with_output();
+            }
+            if Instant::now() >= deadline {
+                child.kill()?;
+                let reap_deadline = Instant::now() + Duration::from_secs(1);
+                while child.try_wait()?.is_none() && Instant::now() < reap_deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "read-only frontmost command timed out",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Only this test runs in the child, so NSWorkspace is initialized there for the first read.
+    /// It never activates an app or inherits a stale workspace from the parent test suite.
+    #[test]
+    #[ignore = "read-only subprocess probe for front_app_agrees_with_system_events"]
+    fn active_pid_probe() {
+        if std::env::var(FRONTMOST_PROBE_ENV).as_deref() != Ok("1") {
+            return;
+        }
+        let pid = active_pid().map_or_else(|| "none".to_owned(), |pid| pid.to_string());
+        println!("{FRONTMOST_PROBE_PREFIX}{pid}");
+    }
+
+    fn fresh_active_pid() -> Option<i32> {
+        let output = read_command(
+            std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--ignored",
+                    "--exact",
+                    FRONTMOST_PROBE_TEST,
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(FRONTMOST_PROBE_ENV, "1"),
+            READ_TIMEOUT,
+        )
+        .expect("fresh NSWorkspace probe must finish");
+        assert!(
+            output.status.success(),
+            "fresh NSWorkspace probe failed: {:?}",
+            output.status
+        );
+        let stdout = String::from_utf8(output.stdout).expect("probe output is UTF-8");
+        // libtest may put its test-name prefix on the same line as println's first output.
+        let values: Vec<_> = stdout
+            .lines()
+            .filter_map(|line| {
+                line.split_once(FRONTMOST_PROBE_PREFIX)
+                    .map(|(_, value)| value.trim())
+            })
+            .collect();
+        assert_eq!(
+            values.len(),
+            1,
+            "the child must emit exactly one frontmost result"
+        );
+        match values[0] {
+            "none" => None,
+            value => Some(value.parse().expect("probe pid is an integer")),
+        }
+    }
+
+    #[test]
+    fn read_only_commands_have_a_deadline() {
+        let started = Instant::now();
+        let error = read_command(
+            std::process::Command::new("/bin/sleep").arg("2"),
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
     /// The active app is the one System Events names (read only: nothing is activated).
+    /// Use a fresh process for NSWorkspace because this test harness has no main run loop, so
+    /// workspace state initialized by another test can lag even before the first truth read.
     /// Skipped where System Events does not answer (no session, no automation permission), on CI
     /// (`CI` is set: nobody uses a hosted runner's desktop, and there NSWorkspace and System
     /// Events name two different processes), while the screen is locked (NSWorkspace then names
@@ -239,11 +340,14 @@ mod tests {
             return;
         }
         let truth = || {
-            std::process::Command::new("osascript")
-                .args(["-e", r#"tell application "System Events" to get unix id of first process whose frontmost is true"#])
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<i32>().ok())
+            read_command(
+                std::process::Command::new("osascript")
+                    .args(["-e", r#"tell application "System Events" to get unix id of first process whose frontmost is true"#]),
+                READ_TIMEOUT,
+            )
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8_lossy(&output.stdout).trim().parse::<i32>().ok())
         };
         let is_login_window = |pid: i32| {
             NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
@@ -253,11 +357,12 @@ mod tests {
         let Some(before) = truth() else {
             return;
         };
-        let active = active_pid();
+        let active = fresh_active_pid();
         if active.is_some_and(is_login_window) || truth() != Some(before) {
             return;
         }
         assert_eq!(active, Some(before));
+        eprintln!("fresh NSWorkspace and System Events agree on pid {before}");
     }
 
     /// Needs the screen: TextEdit comes back although Safari was brought in front, with the

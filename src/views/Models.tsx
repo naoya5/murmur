@@ -224,21 +224,22 @@ export function Models() {
       (m) => m.entry.role === "recognition" && m.entry.languages.includes(language),
     );
   const helpers = (models ?? []).filter((m) => m.entry.role === "voice_detection");
-  // The translation models (experimental): shown while translation is on, or while one is on
-  // this Mac (to delete it after switching off).
+  // Refinement models appear while either feature is on, or while any model remains on this
+  // Mac (to delete it after switching off).
   const refiners = (models ?? []).filter((m) => m.entry.role === "refinement");
   const showRefiners =
     refiners.length > 0 &&
     (settings?.translate_enabled === true ||
+      settings?.refine_enabled === true ||
       refiners.some((m) => m.status.installed || m.status.downloading !== null));
 
-  // "models#refine" (the translation settings) brings that section into view once it is there.
+  // "models#refine" from either feature's settings brings the section into view once it exists.
   // biome-ignore lint/correctness/useExhaustiveDependencies: models arriving is what makes the section exist
   useEffect(() => {
     if (target.anchor === "refine") {
       document.getElementById("models-refine")?.scrollIntoView({ block: "start" });
     }
-  }, [target, models !== null]);
+  }, [target, models !== null, showRefiners]);
 
   const renderRows = (list: ModelInfo[], language: Language | null) =>
     list.map((info) => (

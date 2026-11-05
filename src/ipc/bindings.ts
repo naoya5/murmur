@@ -455,8 +455,8 @@ attribution: string; capabilities: Capabilities;
  */
 tasks: RefineKind[]; 
 /**
- * About how much memory the model takes while it runs (the peak resident size of its sidecar
- * in the stage 0 / M2 measurements, the mapped file included). Shown for the refine models;
+ * About how much memory the model takes while it runs (measured resident size of its
+ * sidecar, the mapped file included). Shown for the refine models;
  * `None` where it was not measured.
  */
 memory_bytes: number | null }
@@ -488,7 +488,11 @@ export type Navigate = { view: string }
 /**
  * Short feedback the pill shows before it hides.
  */
-export type Notice = { kind: "delivered"; outcome: DeliveryOutcome } | { kind: "no_speech" } | 
+export type Notice = { kind: "delivered"; outcome: DeliveryOutcome } | 
+/**
+ * Cleanup failed, timed out, or was too long; the rule text was delivered instead.
+ */
+{ kind: "cleanup_skipped"; outcome: DeliveryOutcome } | { kind: "no_speech" } | 
 /**
  * The audio is saved in the history and can be retried.
  */
@@ -650,7 +654,15 @@ translate_enabled: boolean;
  * Hotkey that records Japanese for translation (accelerator string), same record modes as
  * the main hotkey. Registered only while translation is on.
  */
-translate_hotkey: string }
+translate_hotkey: string; 
+/**
+ * Experimental: light cleanup of Japanese dictation by a local model.
+ */
+refine_enabled: boolean; 
+/**
+ * Convert spoken enumerations into bullet lists. Snapshotted at recording start.
+ */
+refine_lists: boolean }
 /**
  * Settings were saved; every window re-reads what it shows.
  */
