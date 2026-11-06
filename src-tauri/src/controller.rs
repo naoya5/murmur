@@ -1970,7 +1970,8 @@ impl Controller {
             annotation,
         };
         self.services.set_pill_state(state.clone());
-        if let Err(error) = state.emit(&self.app) {
+        // Only the pill page listens; the main window does not pay for the event.
+        if let Err(error) = state.emit_to(&self.app, crate::windows::PILL_LABEL) {
             tracing::warn!(%error, "pill state emit failed");
         }
         let visible = !matches!(view, PillView::Hidden);

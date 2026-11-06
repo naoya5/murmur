@@ -406,6 +406,8 @@ struct Stream {
     ahead_ms: u64,
     /// Streaming failed; `finish` runs the offline path.
     dead: bool,
+    /// A drained buffer kept for the next poll, so the tap does not allocate every time.
+    scratch: Vec<f32>,
 }
 
 struct Worker {
@@ -790,6 +792,7 @@ impl Worker {
             languages: Vec::new(),
             ahead_ms: 0,
             dead: false,
+            scratch: Vec::new(),
         });
     }
 
@@ -801,25 +804,33 @@ impl Worker {
             self.stream = Some(stream);
             return;
         }
-        let pending = match stream.buffer.lock() {
-            Ok(mut buffer) if !buffer.abandoned => Some(std::mem::take(&mut buffer.pcm)),
-            _ => None,
+        // Swap the tap's buffer with the scratch Vec: the tap keeps a buffer with capacity, and
+        // the drained samples are reused instead of dropped.
+        let mut pending = std::mem::take(&mut stream.scratch);
+        let abandoned = match stream.buffer.lock() {
+            Ok(mut buffer) if !buffer.abandoned => {
+                std::mem::swap(&mut buffer.pcm, &mut pending);
+                false
+            }
+            _ => true,
         };
-        match pending {
-            None => {
-                stream.dead = true;
-                stream.pcm = Vec::new();
-                stream.texts.clear();
-                stream.languages.clear();
+        if abandoned {
+            stream.dead = true;
+            stream.pcm = Vec::new();
+            stream.texts.clear();
+            stream.languages.clear();
+            self.drop_stream_detector();
+        } else if !pending.is_empty() {
+            let alive = self.push_into(&mut stream, &pending);
+            // Keep the capacity, not the samples: the next swap must hand the tap an empty buffer.
+            pending.clear();
+            stream.scratch = pending;
+            if !alive {
                 self.drop_stream_detector();
+                return;
             }
-            Some(pcm) if !pcm.is_empty() => {
-                if !self.push_into(&mut stream, &pcm) {
-                    self.drop_stream_detector();
-                    return;
-                }
-            }
-            Some(_) => {}
+        } else {
+            stream.scratch = pending;
         }
         self.stream = Some(stream);
     }

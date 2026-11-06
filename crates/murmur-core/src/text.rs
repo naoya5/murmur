@@ -6,6 +6,8 @@
 //!      without the latency of an LLM (IDEATION 9).
 //! Where: the controller calls `format` between the engine and the clipboard. Tests at the end.
 
+use std::collections::HashMap;
+
 use crate::Language;
 use crate::settings::DictionaryEntry;
 
@@ -236,16 +238,30 @@ fn apply_dictionary(chars: &[char], lang: Language, dictionary: &[DictionaryEntr
     }
     patterns.sort_by_key(|(pattern, _)| std::cmp::Reverse(pattern.len()));
 
+    // Index the patterns by their first character (ASCII case-folded, the only case the match
+    // ignores). A position then only tries the patterns that can start there, so the scan is
+    // linear in the text instead of text length times dictionary size. Indices stay in the
+    // longest-first order of `patterns`, so the longest reading still wins.
+    let mut by_first: HashMap<char, Vec<usize>> = HashMap::with_capacity(patterns.len());
+    for (index, (pattern, _)) in patterns.iter().enumerate() {
+        if let Some(&first) = pattern.first() {
+            by_first.entry(fold_ascii(first)).or_default().push(index);
+        }
+    }
+
     let mut out = Vec::with_capacity(chars.len());
     let mut i = 0;
     while i < chars.len() {
-        match patterns
-            .iter()
-            .find(|(pattern, _)| matches_at(chars, i, pattern))
-        {
-            Some((pattern, written)) => {
+        let hit = by_first.get(&fold_ascii(chars[i])).and_then(|indices| {
+            indices.iter().find_map(|&index| {
+                let (pattern, written) = &patterns[index];
+                matches_at(chars, i, pattern).then_some((pattern.len(), *written))
+            })
+        });
+        match hit {
+            Some((len, written)) => {
                 out.extend(written.chars());
-                i += pattern.len();
+                i += len;
             }
             None => {
                 out.push(chars[i]);
@@ -254,6 +270,16 @@ fn apply_dictionary(chars: &[char], lang: Language, dictionary: &[DictionaryEntr
         }
     }
     out
+}
+
+/// The case the dictionary match ignores: ASCII letters fold to lower case, everything else is
+/// itself. Used for the first-character index, so it must agree with `eq_ignore_ascii_case`.
+fn fold_ascii(c: char) -> char {
+    if c.is_ascii_uppercase() {
+        c.to_ascii_lowercase()
+    } else {
+        c
+    }
 }
 
 /// Case-insensitive match of `pattern` at `i`, at word boundaries where the pattern edge is a
@@ -941,6 +967,37 @@ mod tests {
             raw.push_str(unit);
         }
         let dictionary = dict();
+        let mut times = Vec::new();
+        for _ in 0..21 {
+            let start = std::time::Instant::now();
+            let out = format(&raw, Language::Ja, &ALL, &dictionary);
+            times.push(start.elapsed());
+            assert!(!out.is_empty());
+        }
+        times.sort();
+        let median = times[times.len() / 2];
+        assert!(median.as_micros() < 2_000, "median {median:?}");
+    }
+
+    /// A large user dictionary must not push the rules over their budget. The first-character
+    /// index keeps the scan linear in the text, so 500 entries cost about the same as 4.
+    /// Run with `cargo test -p murmur-core --release -- --ignored`.
+    #[test]
+    #[ignore = "timing; run in release"]
+    fn format_2000_chars_with_500_entries_under_2ms() {
+        let unit = "えーと、今日 は Claude Code で 新しい 機能 を 実装しました 。 um, the the tests pass, uh. ";
+        let mut raw = String::new();
+        while raw.chars().count() < 2_000 {
+            raw.push_str(unit);
+        }
+        let mut dictionary = Vec::new();
+        for i in 0..500 {
+            dictionary.push(entry(
+                &format!("Term{i}"),
+                &[&format!("term{i}"), &format!("ターム{i}")],
+                DictionaryScope::Both,
+            ));
+        }
         let mut times = Vec::new();
         for _ in 0..21 {
             let start = std::time::Instant::now();

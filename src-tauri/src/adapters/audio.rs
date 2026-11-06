@@ -16,7 +16,7 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -121,6 +121,10 @@ struct Shared {
     failed: AtomicBool,
     /// Microseconds from `start` to the first callback; `u64::MAX` until it happens.
     first_callback_us: AtomicU64,
+    /// Held only while the converter waits, so that setting `stop_converter` under it wakes the
+    /// converter without a lost wake-up (a stop then costs no poll interval).
+    converter_wake: Mutex<()>,
+    converter_wake_cv: Condvar,
 }
 
 impl Shared {
@@ -132,6 +136,8 @@ impl Shared {
             stop_converter: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             first_callback_us: AtomicU64::new(u64::MAX),
+            converter_wake: Mutex::new(()),
+            converter_wake_cv: Condvar::new(),
         }
     }
 
@@ -259,7 +265,9 @@ impl Recorder {
             }
         }
         // Everything the stream produced is in the ring now; the converter drains it and finishes.
-        self.shared.stop_converter.store(true, Ordering::Release);
+        // Wake it at once: its poll interval would otherwise add up to `CONVERTER_POLL` to the
+        // stop-to-paste latency.
+        self.stop_converter();
         let pcm = finish_converter(&self.shared, &self.converter_done, CLOSE_TIMEOUT)?;
         let duration_ms = pcm.len() as u64 * 1000 / u64::from(TARGET_RATE);
         Ok(CapturedAudio {
@@ -267,6 +275,20 @@ impl Recorder {
             spool_path: self.spool_path.clone(),
             duration_ms,
         })
+    }
+
+    /// Sets the converter's stop flag under its wake lock and notifies it. The lock closes the
+    /// window between the converter's check and its wait, so a stop never waits a poll interval.
+    fn stop_converter(&self) {
+        {
+            let _wake = self
+                .shared
+                .converter_wake
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.shared.stop_converter.store(true, Ordering::Release);
+        }
+        self.shared.converter_wake_cv.notify_all();
     }
 }
 
@@ -298,7 +320,7 @@ impl Drop for Recorder {
     fn drop(&mut self) {
         // Dropped without `stop`: let both threads wind down by themselves.
         self.shared.stop_owner.store(true, Ordering::Release);
-        self.shared.stop_converter.store(true, Ordering::Release);
+        self.stop_converter();
         if let Some(owner) = &self.owner {
             owner.thread().unpark();
         }
@@ -601,6 +623,8 @@ fn converter_main(
     let mut spool = BufWriter::new(spool);
     let mut raw = vec![0.0_f32; 8192 - 8192 % channels];
     let mut converted: Vec<f32> = Vec::with_capacity(4096);
+    // Reused for the s16le spool bytes, so a chunk does not allocate.
+    let mut spool_bytes: Vec<u8> = Vec::with_capacity(8192);
     let mut last_flush = Instant::now();
     let mut disconnected_sent = false;
     let mut first_error: Option<AudioError> = None;
@@ -636,6 +660,7 @@ fn converter_main(
                 on_event,
                 tap,
                 &mut first_error,
+                &mut spool_bytes,
             );
         }
         if shared.failed.load(Ordering::Acquire)
@@ -658,7 +683,15 @@ fn converter_main(
         if stopping {
             break;
         }
-        thread::sleep(CONVERTER_POLL);
+        // Wait for the next poll, but wake at once when the recorder stops. The stop flag is set
+        // under this lock, so the check and the wait cannot miss it.
+        let wake = shared
+            .converter_wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !shared.stop_converter.load(Ordering::Acquire) {
+            let _ = shared.converter_wake_cv.wait_timeout(wake, CONVERTER_POLL);
+        }
     }
 
     converted.clear();
@@ -673,6 +706,7 @@ fn converter_main(
         on_event,
         tap,
         &mut first_error,
+        &mut spool_bytes,
     );
     if let Err(e) = spool.flush() {
         first_error.get_or_insert(AudioError::Io(e.to_string()));
@@ -699,6 +733,7 @@ fn append(
     on_event: &(dyn Fn(AudioEvent) + Send + Sync),
     tap: TapRef<'_>,
     first_error: &mut Option<AudioError>,
+    bytes: &mut Vec<u8>,
 ) {
     if converted.is_empty() {
         return;
@@ -716,11 +751,12 @@ fn append(
     if let Some(tap) = tap {
         tap(converted);
     }
-    let bytes: Vec<u8> = converted
-        .iter()
-        .flat_map(|&s| to_s16(s).to_le_bytes())
-        .collect();
-    if let Err(e) = spool.write_all(&bytes) {
+    bytes.clear();
+    bytes.reserve(converted.len() * 2);
+    for &sample in converted {
+        bytes.extend_from_slice(&to_s16(sample).to_le_bytes());
+    }
+    if let Err(e) = spool.write_all(bytes) {
         first_error.get_or_insert(AudioError::Io(e.to_string()));
     }
     if shared
@@ -996,6 +1032,7 @@ mod tests {
         let worker = thread::spawn(move || {
             let mut meter = LevelMeter::new();
             let mut error = None;
+            let mut bytes = Vec::new();
             append(
                 &[0.25; 1600],
                 &worker_shared,
@@ -1004,6 +1041,7 @@ mod tests {
                 &|_| late_tx.send(()).unwrap(),
                 None,
                 &mut error,
+                &mut bytes,
             );
             append(
                 &[0.5; 1600],
@@ -1013,6 +1051,7 @@ mod tests {
                 &|_| late_tx.send(()).unwrap(),
                 Some(&|_| panic!("late tap")),
                 &mut error,
+                &mut bytes,
             );
             spool.flush().unwrap();
             done_tx.send(Ok(())).unwrap();
