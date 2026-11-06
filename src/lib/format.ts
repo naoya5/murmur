@@ -44,8 +44,33 @@ export function formatClock(ms: number): string {
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
+// Intl formatters are expensive to build (tens of microseconds each) and are built per cell by
+// the heatmap and per row by the history. Cache them by their options; both windows live long.
+const numberFormats = new Map<string, Intl.NumberFormat>();
+const dateFormats = new Map<string, Intl.DateTimeFormat>();
+
+function numberFormat(locale: Locale, options: Intl.NumberFormatOptions): Intl.NumberFormat {
+  const key = `${locale}|${JSON.stringify(options)}`;
+  let format = numberFormats.get(key);
+  if (!format) {
+    format = new Intl.NumberFormat(locale, options);
+    numberFormats.set(key, format);
+  }
+  return format;
+}
+
+function dateFormat(locale: Locale, options: Intl.DateTimeFormatOptions): Intl.DateTimeFormat {
+  const key = `${locale}|${JSON.stringify(options)}`;
+  let format = dateFormats.get(key);
+  if (!format) {
+    format = new Intl.DateTimeFormat(locale, options);
+    dateFormats.set(key, format);
+  }
+  return format;
+}
+
 export function formatNumber(n: number, locale: Locale, maxFractionDigits = 0): string {
-  return new Intl.NumberFormat(locale, { maximumFractionDigits: maxFractionDigits }).format(n);
+  return numberFormat(locale, { maximumFractionDigits: maxFractionDigits }).format(n);
 }
 
 /** Decimal units, as macOS shows file sizes. */
@@ -86,11 +111,11 @@ function sameDay(a: Date, b: Date): boolean {
 /** Time only for today, date and time otherwise; the year only when it differs. */
 export function formatWhen(ms: number, locale: Locale, now = new Date()): string {
   const date = new Date(ms);
-  const time = new Intl.DateTimeFormat(locale, { hour: "2-digit", minute: "2-digit" }).format(date);
+  const time = dateFormat(locale, { hour: "2-digit", minute: "2-digit" }).format(date);
   if (sameDay(date, now)) {
     return time;
   }
-  const day = new Intl.DateTimeFormat(locale, {
+  const day = dateFormat(locale, {
     month: "short",
     day: "numeric",
     ...(date.getFullYear() === now.getFullYear() ? {} : { year: "numeric" }),
@@ -99,15 +124,15 @@ export function formatWhen(ms: number, locale: Locale, now = new Date()): string
 }
 
 export function formatShortDay(date: Date, locale: Locale): string {
-  return new Intl.DateTimeFormat(locale, { month: "numeric", day: "numeric" }).format(date);
+  return dateFormat(locale, { month: "numeric", day: "numeric" }).format(date);
 }
 
 export function formatMonth(date: Date, locale: Locale): string {
-  return new Intl.DateTimeFormat(locale, { month: "short" }).format(date);
+  return dateFormat(locale, { month: "short" }).format(date);
 }
 
 export function formatPercent(fraction: number, locale: Locale): string {
-  return new Intl.NumberFormat(locale, { style: "percent", maximumFractionDigits: 0 }).format(
+  return numberFormat(locale, { style: "percent", maximumFractionDigits: 0 }).format(
     Math.min(1, Math.max(0, fraction)),
   );
 }

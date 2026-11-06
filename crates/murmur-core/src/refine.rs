@@ -18,6 +18,8 @@
 //! Cleanup options are fixed for each recording. Translation always uses the original lists-on
 //! cleanup prompt for its optional pre-clean, independently of the dictation setting.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
@@ -417,10 +419,13 @@ impl Glossary {
             .filter(|e| e.scope.includes(TRANSLATE_FROM))
             .cloned()
             .collect();
-        let mut terms: Vec<String> = Vec::new();
+        // Keep the first spelling of each term in dictionary order (the prompt's bytes decide
+        // whether the sidecar's warm prefix still matches); the set only makes the check O(1).
+        let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
+        let mut terms: Vec<String> = Vec::with_capacity(entries.len());
         for entry in &entries {
             let written = entry.written.trim();
-            if !written.is_empty() && !terms.iter().any(|t| t == written) {
+            if !written.is_empty() && seen.insert(written) {
                 terms.push(written.to_owned());
             }
         }

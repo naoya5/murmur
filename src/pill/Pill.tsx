@@ -1,5 +1,13 @@
 import { AlertTriangle, Camera, Check, MicOff } from "lucide-react";
-import { type CSSProperties, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  memo,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { I18nContext, resolveLocale, type Strings, strings } from "../i18n";
 import {
   type AnnotationPill,
@@ -86,6 +94,15 @@ function useWaveform(active: boolean, reducedMotion: boolean): number[] {
 
   return bars;
 }
+
+const NO_BARS: number[] = [];
+
+/** The recording waveform. It owns the level state, so a level re-renders only the bars, not the
+ *  whole pill (the parent also re-renders for the clock). */
+const LiveWaveform = memo(function LiveWaveform({ reducedMotion }: { reducedMotion: boolean }) {
+  const bars = useWaveform(true, reducedMotion);
+  return <Waveform bars={bars} breathe={false} />;
+});
 
 /** Recording: the live levels. Transcribing: every bar breathes, one step behind its left neighbour
  *  (the bar index `--i` sets the phase in styles.css). */
@@ -271,7 +288,6 @@ export default function Pill() {
   const recording = view.kind === "recording";
   const busy =
     view.kind === "transcribing" || view.kind === "refining" || view.kind === "delivering";
-  const bars = useWaveform(recording, reducedMotion);
 
   // Elapsed time: resynced on every recording event, ticked locally. Synced before paint, so a new
   // recording never shows the last one's time for a frame.
@@ -392,7 +408,11 @@ export default function Pill() {
               <>
                 <span className="pill__well">
                   {recording && <span className="pill__dot" />}
-                  <Waveform bars={bars} breathe={busy} />
+                  {recording ? (
+                    <LiveWaveform reducedMotion={reducedMotion} />
+                  ) : (
+                    <Waveform bars={NO_BARS} breathe={busy} />
+                  )}
                 </span>
                 {annotation && <ScreenMark annotation={annotation} t={t} />}
                 {recording && <span className="pill__time">{formatClock(elapsedMs)}</span>}
