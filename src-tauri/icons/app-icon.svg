@@ -1,0 +1,60 @@
+<!--
+  SOT: app-icon
+  What:  the master of the Murmur app icon, "Ember wave" (proposal A, chosen 2026-11-06). Five amber
+         bars, lit like the one ember light of the UI, on a dark warm rounded square.
+  Why:   every app icon file in this folder is generated from it, so the icon changes in one place.
+         The rounded square is 824 px, centered on the 1024 px canvas, with a transparent margin and
+         a soft shadow (the macOS icon grid). macOS 26 shows it as is from 64 px up; at 16 and
+         32 px it puts this .icns (and the old blue icon) on a gray plate; an Icon Composer icon
+         is the expected way to avoid that. The rim light and the glow are part of the art, because the
+         OS adds no Liquid Glass effects to a plain .icns.
+  Where: regenerate in three steps.
+         1. `pnpm tauri icon src-tauri/icons/app-icon.svg -o <tmp>`, then copy only the files that
+            already exist in src-tauri/icons (the bundle does not use the android/ and ios/ output).
+         2. At 16 x 16 px the five bars blur into one shape, so icon.icns takes its 16 px image
+            from app-icon-16.svg, drawn on the pixel grid: `iconutil -c iconset <tmp>/icon.icns`,
+            `rsvg-convert -w 16 -h 16 app-icon-16.svg -o <iconset>/icon_16x16.png`,
+            `iconutil -c icns <iconset> -o src-tauri/icons/icon.icns`.
+         3. The menu bar glyph (tray.png, tray@2x.png) is a separate one-color drawing of the same
+            five bars; it does not change with this file.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <path id="shape" d="M924 512L923.9 624.8L923.5 660.9L922.9 687L922 708.2L920.8 726.3L919.4 742.2L917.7 756.5L915.8 769.6L913.6 781.5L911.2 792.6L908.4 802.8L905.4 812.4L902.1 821.4L898.5 829.8L894.7 837.7L890.5 845.1L886 852.1L881.2 858.7L876.1 864.9L870.7 870.7L864.9 876.1L858.7 881.2L852.1 886L845.1 890.5L837.7 894.7L829.8 898.5L821.4 902.1L812.4 905.4L802.8 908.4L792.6 911.2L781.5 913.6L769.6 915.8L756.5 917.7L742.2 919.4L726.3 920.8L708.2 922L687 922.9L660.9 923.5L624.8 923.9L512 924L399.2 923.9L363.1 923.5L337 922.9L315.8 922L297.7 920.8L281.8 919.4L267.5 917.7L254.4 915.8L242.5 913.6L231.4 911.2L221.2 908.4L211.6 905.4L202.6 902.1L194.2 898.5L186.3 894.7L178.9 890.5L171.9 886L165.3 881.2L159.1 876.1L153.3 870.7L147.9 864.9L142.8 858.7L138 852.1L133.5 845.1L129.3 837.7L125.5 829.8L121.9 821.4L118.6 812.4L115.6 802.8L112.8 792.6L110.4 781.5L108.2 769.6L106.3 756.5L104.6 742.2L103.2 726.3L102 708.2L101.1 687L100.5 660.9L100.1 624.8L100 512L100.1 399.2L100.5 363.1L101.1 337L102 315.8L103.2 297.7L104.6 281.8L106.3 267.5L108.2 254.4L110.4 242.5L112.8 231.4L115.6 221.2L118.6 211.6L121.9 202.6L125.5 194.2L129.3 186.3L133.5 178.9L138 171.9L142.8 165.3L147.9 159.1L153.3 153.3L159.1 147.9L165.3 142.8L171.9 138L178.9 133.5L186.3 129.3L194.2 125.5L202.6 121.9L211.6 118.6L221.2 115.6L231.4 112.8L242.5 110.4L254.4 108.2L267.5 106.3L281.8 104.6L297.7 103.2L315.8 102L337 101.1L363.1 100.5L399.2 100.1L512 100L624.8 100.1L660.9 100.5L687 101.1L708.2 102L726.3 103.2L742.2 104.6L756.5 106.3L769.6 108.2L781.5 110.4L792.6 112.8L802.8 115.6L812.4 118.6L821.4 121.9L829.8 125.5L837.7 129.3L845.1 133.5L852.1 138L858.7 142.8L864.9 147.9L870.7 153.3L876.1 159.1L881.2 165.3L886 171.9L890.5 178.9L894.7 186.3L898.5 194.2L902.1 202.6L905.4 211.6L908.4 221.2L911.2 231.4L913.6 242.5L915.8 254.4L917.7 267.5L919.4 281.8L920.8 297.7L922 315.8L922.9 337L923.5 363.1L923.9 399.2Z"/>
+    <clipPath id="clip"><use href="#shape"/></clipPath>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%"><feGaussianBlur stdDeviation="14"/></filter>
+    <filter id="glow" filterUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1024"><feGaussianBlur stdDeviation="30"/></filter>
+    <linearGradient id="ground" x1="0" y1="100" x2="0" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3d251a"/>
+      <stop offset="1" stop-color="#120b08"/>
+    </linearGradient>
+    <radialGradient id="light" cx="512" cy="40" r="700" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ff8c38" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#ff8c38" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="rim" x1="0" y1="100" x2="0" y2="560" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffe6cc" stop-opacity="0.5"/>
+      <stop offset="1" stop-color="#ffe6cc" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="ember" x1="0" y1="200" x2="0" y2="830" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffc48a"/>
+      <stop offset="0.5" stop-color="#ff9d4d"/>
+      <stop offset="1" stop-color="#ff7d2e"/>
+    </linearGradient>
+    <g id="bars">
+    <rect x="210" y="407" width="84" height="210" rx="42"/>
+    <rect x="340" y="312" width="84" height="400" rx="42"/>
+    <rect x="470" y="232" width="84" height="560" rx="42"/>
+    <rect x="600" y="322" width="84" height="380" rx="42"/>
+    <rect x="730" y="402" width="84" height="220" rx="42"/>
+    </g>
+  </defs>
+  <use href="#shape" transform="translate(0 12)" fill="#000" opacity="0.3" filter="url(#shadow)"/>
+  <use href="#shape" fill="url(#ground)"/>
+  <use href="#shape" fill="url(#light)"/>
+  <g clip-path="url(#clip)">
+    <use href="#bars" fill="#ff8028" opacity="0.55" filter="url(#glow)"/>
+    <use href="#bars" fill="url(#ember)"/>
+  </g>
+  <use href="#shape" fill="none" stroke="url(#rim)" stroke-width="10" clip-path="url(#clip)"/>
+</svg>
