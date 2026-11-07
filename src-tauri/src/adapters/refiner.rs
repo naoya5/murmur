@@ -2240,6 +2240,123 @@ done
         );
     }
 
+    /// Regression coverage through the production gate, model, validator and delivery decision.
+    /// Synthetic text is kept in memory; assertion messages never include model output.
+    #[test]
+    #[ignore = "needs the staged sidecar and the LLM models"]
+    fn cleanup_quality_with_the_real_sidecar() {
+        use crate::refine_session;
+        use murmur_core::refine::RefinePlan;
+        use murmur_core::session::{
+            Effect, Event, Machine, RefineOutcome, TranscribeOutcome, TranscriptText,
+        };
+        use murmur_core::settings::RecordMode;
+
+        let r = real_refiner();
+        let mut h = r.handle();
+        for lists in [true, false] {
+            let plan = RefinePlan::new(RefineKind::Clean, lists);
+            refine_session::warm(plan, &Glossary::default(), &mut h);
+            for (id, source, required, forbidden) in [
+                (
+                    1,
+                    "月曜にしよう、いややっぱり木曜日にしよう。",
+                    &["木曜", "しよう"][..],
+                    &["月曜", "いや"][..],
+                ),
+                (
+                    2,
+                    "月曜にしよう。やっぱり木曜日にしよう。",
+                    &["木曜", "しよう"][..],
+                    &["月曜", "やっぱり"][..],
+                ),
+                (
+                    3,
+                    "資料は月曜、いや火曜、やっぱり木曜に送ります。",
+                    &["資料", "木曜", "送ります"][..],
+                    &["月曜", "火曜"][..],
+                ),
+                (
+                    4,
+                    "1つ目は資料、2つ目は見積書です。",
+                    &["資料", "見積書"][..],
+                    &[][..],
+                ),
+                (
+                    5,
+                    "えっと、予算は30万円で、締め切りは来週の木曜です。担当は田中さんで、確認は佐藤さんにお願いします。",
+                    &["30万円", "来週", "木曜", "田中", "佐藤", "お願いします"][..],
+                    &[][..],
+                ),
+                (
+                    6,
+                    "月曜は無理ですが、木曜なら大丈夫です。",
+                    &["月曜は無理", "木曜なら大丈夫"][..],
+                    &[][..],
+                ),
+            ] {
+                let mut machine = Machine::new();
+                let press = Event::HotkeyDown {
+                    mode: RecordMode::Toggle,
+                    refine: Some(plan),
+                };
+                machine.step(press.clone(), 0);
+                let session = machine.active_session().expect("session");
+                machine.step(press, 50);
+                let mut effects = machine.step(
+                    Event::Transcribed {
+                        session,
+                        outcome: TranscribeOutcome::Text(TranscriptText(source.into())),
+                    },
+                    100,
+                );
+                if effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::Refine { .. }))
+                {
+                    let report = refine_session::drive(
+                        plan,
+                        source,
+                        Glossary::default(),
+                        &mut h,
+                        &CancelToken::new(),
+                        &mut || {},
+                    );
+                    let outcome = match report.result {
+                        Ok(text) => RefineOutcome::Text(text),
+                        Err(_) => RefineOutcome::Failed,
+                    };
+                    effects = machine.step(Event::Refined { session, outcome }, 200);
+                }
+                let delivered = effects
+                    .iter()
+                    .find_map(|effect| match effect {
+                        Effect::Deliver { text, .. } => Some(text.0.as_str()),
+                        _ => None,
+                    })
+                    .expect("delivery decision");
+                assert!(
+                    required.iter().all(|term| delivered.contains(term)),
+                    "case {id}: missing detail, lists={lists}"
+                );
+                assert!(
+                    forbidden.iter().all(|term| !delivered.contains(term)),
+                    "case {id}: obsolete choice, lists={lists}"
+                );
+                if id == 4 {
+                    assert_eq!(
+                        delivered
+                            .lines()
+                            .filter(|line| line.starts_with("- "))
+                            .count(),
+                        if lists { 2 } else { 0 }
+                    );
+                }
+            }
+        }
+        r.stop_all();
+    }
+
     /// The real sidecar and models: the staged binary (`scripts/build-sidecar.sh`, or
     /// `MURMUR_LLM_BIN`) and the GGUF files in `$MURMUR_TEST_MODELS/llm` (default
     /// `~/.murmur-dev-models/llm`). Run: `cargo test -p murmur refiner -- --ignored`.
@@ -2262,6 +2379,7 @@ done
         for (text, cleaned_first) in [
             ("明日の会議は午後4時からです。", false),
             ("会議は3時から、いや4時からでお願いします。", true),
+            ("月曜にしよう、いややっぱり木曜日にしよう。", true),
         ] {
             let started = Instant::now();
             let report = refine_session::drive(
@@ -2279,6 +2397,15 @@ done
                 english.0.len()
             );
             assert_eq!(report.pre_clean != PreClean::NotNeeded, cleaned_first);
+            if text.starts_with("月曜") {
+                assert_eq!(report.pre_clean, PreClean::Used);
+                let normalized = english.0.to_ascii_lowercase();
+                assert!(normalized.contains("thursday"), "final weekday missing");
+                assert!(
+                    !normalized.contains("monday"),
+                    "obsolete weekday translated"
+                );
+            }
             eprintln!(
                 "{} chars, steps {:?}, {} ms",
                 text.chars().count(),
