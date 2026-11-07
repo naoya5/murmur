@@ -1,0 +1,39 @@
+name: Feature request
+description: Suggest an idea or an improvement.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for the idea. English or Japanese is fine.
+        Murmur stays local, private and fast: no account, no cloud, nothing slow before the paste.
+        New features ship as opt-in experiments, off by default. Please wait for a reply before you write code.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should Murmur do? Describe it from the point of view of someone using the app.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Other ways to solve it, or how you work around it now.
+
+  - type: checkboxes
+    id: principles
+    attributes:
+      label: Fit
+      options:
+        - label: The idea works without sending audio or text off the Mac.

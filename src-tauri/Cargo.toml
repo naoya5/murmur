@@ -46,7 +46,7 @@ rusqlite = { version = "0.41", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tracing = "0.1"
 
-# Assembly (orchestrator): logging, autostart, ids, locale.
+# Assembly: logging, autostart, ids, locale.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 tauri-plugin-autostart = "2.7"

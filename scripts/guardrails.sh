@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# Guardrail checks that clippy and the compiler cannot do (PLAN 2.15, RULES.md).
+# Guardrail checks that clippy and the compiler cannot do (G1 to G13 in AGENTS.md).
 # Runs from any directory. Exits non-zero if any check fails and reports all failures.
 # Works on macOS bash 3.2 (no mapfile, no associative arrays).
 set -u
 cd "$(dirname "$0")/.." || exit 1
 
-# R10 / G10: every source of truth that must exist now.
-# Later tickets append their ids here (db-schema, ui-strings, design-tokens).
+# G10: every source of truth that must exist. Add the id here when you create a new one.
 REQUIRED_SOT_IDS=(
   session-state-machine
   settings
@@ -69,7 +68,7 @@ hits=$(code_files | grep '\.toml$' | grep -v -x 'src-tauri/Cargo.toml' | xargs g
 [ -z "$hits" ] || fail "HTTP client dependency declared outside src-tauri/Cargo.toml:
 $hits"
 
-echo "== R2: no em dash (U+2014) in text files"
+echo "== Style: no em dash (U+2014) in text files"
 # LC_ALL=C makes grep match the raw UTF-8 bytes; -I skips binary files.
 hits=$(all_files | while IFS= read -r f; do
   [ -f "$f" ] && LC_ALL=C grep -I -n -H $'\xe2\x80\x94' "$f"
@@ -77,13 +76,13 @@ done || true)
 [ -z "$hits" ] || fail "em dash found (use '-'):
 $hits"
 
-echo "== R10: required SOT ids are declared"
+echo "== G10: required SOT ids are declared"
 sot_hits=$(all_files | grep -E '\.(rs|toml|ts|tsx|md|css)$' | grep -v -E '^(docs/|scripts/)' | xargs grep -n -E 'SOT: [a-z0-9-]+' 2>/dev/null || true)
 for id in "${REQUIRED_SOT_IDS[@]}"; do
   printf '%s\n' "$sot_hits" | grep -q -E "SOT: ${id}([^a-z0-9-]|\$)" || fail "missing SOT declaration: $id"
 done
 
-echo "== R14: src/ipc/bindings.ts matches the Rust types"
+echo "== G4: src/ipc/bindings.ts matches the Rust types"
 bindings=src/ipc/bindings.ts
 before=$(mktemp)
 if [ -f "$bindings" ]; then cp "$bindings" "$before"; else : >"$before"; fi

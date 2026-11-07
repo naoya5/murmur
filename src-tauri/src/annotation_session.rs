@@ -47,7 +47,7 @@ pub struct AnnotationCtx {
     pub kept: BTreeSet<usize>,
     pub shift_held: bool,
     pub screen_failed: bool,
-    /// The app in front at the hotkey: where the bundle is pasted (R1). Taken at delivery.
+    /// The app in front at the hotkey: where the bundle is pasted. Taken at delivery.
     pub front: Option<FrontApp>,
     /// Its bundle id, kept for the paste target rule and `annotation.json`.
     pub target_bundle_id: Option<String>,

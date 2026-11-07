@@ -1,7 +1,7 @@
 //! SOT: session-state-machine
 //! What: the state of one dictation (record -> transcribe -> deliver) and every transition.
 //! Why: Esc, timeouts, stale results and stale timers are decided in one pure place that
-//!      unit tests cover completely (PLAN 2.4, guardrails G5 and G9).
+//!      unit tests cover completely (guardrails G5 and G9).
 //! Where: `src-tauri/src/controller.rs` feeds events into `Machine::step` and executes the
 //!        returned effects. Tests live at the end of this file.
 //!

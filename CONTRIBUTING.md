@@ -1,0 +1,147 @@
+# Contributing to Murmur
+
+Thank you for helping. This guide covers how to report problems, set up a development machine, run
+the checks, and send a pull request. The rules that every change keeps are in
+[AGENTS.md](AGENTS.md); coding agents and people follow the same file.
+
+## Before you start
+
+| You want to | Do this |
+|---|---|
+| Report a bug | Open an issue with the [bug report form](https://github.com/naoya5/murmur/issues/new/choose). |
+| Suggest a feature | Open a feature request first and wait for a reply before you write code. New features ship as opt-in experiments, off by default, and the maintainer decides what goes in. |
+| Report a security problem | Do not open a public issue. Follow [SECURITY.md](SECURITY.md). |
+| Fix a typo or a small bug | Send a pull request directly. |
+
+Issues and pull requests can be written in English or Japanese.
+
+Never post transcripts, recordings or screen pictures that you do not want to make public. Murmur's
+logs contain no transcript text, but read them before you attach them.
+
+## Development setup
+
+### Requirements
+
+| Tool | Version | Notes |
+|---|---|---|
+| macOS | 14 or later, on Apple silicon | |
+| Xcode | 26 or later, with the Metal Toolchain | The sidecar's tensor shaders need the macOS 26 SDK. |
+| Rust | 1.90 or later | `rust-toolchain.toml` selects stable with rustfmt and clippy. |
+| Node.js | 24 | |
+| pnpm | 10 | |
+| CMake | any recent | speech.cpp builds with CMake. |
+
+### First run
+
+```sh
+git clone --recurse-submodules https://github.com/naoya5/murmur.git
+cd murmur
+brew install cmake
+xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
+pnpm install
+pnpm tauri dev
+```
+
+The first build compiles speech.cpp and llama.cpp and takes several minutes. `pnpm tauri dev`
+builds the language-model sidecar (`scripts/build-sidecar.sh`) before it starts the app.
+
+In development, macOS attaches the microphone and accessibility permissions to the terminal that
+runs `pnpm tauri dev`, not to Murmur. Grant them to that terminal.
+
+If you cloned without `--recurse-submodules`, run `git submodule update --init --recursive`.
+
+## Checks
+
+```sh
+pnpm check
+```
+
+`pnpm check` is the gate for every change. It runs, in order and stopping at the first failure:
+
+1. `scripts/build-sidecar.sh` (builds and stages the sidecar)
+2. `cargo fmt --all --check`
+3. `cargo clippy --workspace --all-targets -- -D warnings`
+4. `cargo test --workspace`
+5. `scripts/guardrails.sh` (architecture rules, no em dash, sources of truth, IPC bindings)
+6. `pnpm typecheck`, `pnpm lint` (Biome), `pnpm test` (Vitest), `pnpm build`
+7. fmt, clippy and tests of the sidecar crate
+
+If a check fails, fix it, even if your change did not cause it.
+
+## Tests
+
+Unit tests run without models as part of `pnpm check`. Tests that need models are opt-in and never
+download anything. Put the model files in `~/.murmur-dev-models` (or point `MURMUR_TEST_MODELS`
+somewhere else):
+
+```text
+~/.murmur-dev-models/
+  Haas-616M-ja-v1.0-Q8_0.gguf
+  parakeet-tdt-0.6B-v3-Q8_0.gguf
+  silero-vad-309K-v6.2-F32.gguf
+  llm/                              # only for the sidecar's real-model checks
+    Qwen3.5-2B-Q4_K_M.gguf
+    LFM2-350M-ENJP-MT-Q4_K_M.gguf
+```
+
+The easiest way to get them is to download the models in the app, then copy the `.gguf` files from
+`~/Library/Application Support/io.github.naoya5.murmur/models/`.
+
+| Test | Command |
+|---|---|
+| Engine tests | `MURMUR_TEST_MODELS=~/.murmur-dev-models cargo test -p murmur with_models -- --ignored --test-threads=1` |
+| End to end (dictation, `Esc`, undo, crash recovery, long audio) | `MURMUR_TEST_MODELS=~/.murmur-dev-models bash scripts/e2e.sh` |
+| End to end, screen annotations | `MURMUR_TEST_MODELS=~/.murmur-dev-models bash scripts/e2e.sh annotations` |
+| Sidecar with real models | See [crates/murmur-llm/README.md](crates/murmur-llm/README.md). |
+
+The end-to-end script drives the real debug app. A WAV file plays as the microphone and Unix
+signals act as the hotkey, so no voice or key presses are needed. The app runs on a scratch data
+folder with automatic paste off. The script saves and restores your text clipboard. The header
+of `scripts/e2e.sh` lists every case and option.
+
+A change to a feature is done only when it works end to end in the app. In your pull request, say
+what you verified in the app and what you did not.
+
+## Code style
+
+- Rust: rustfmt and the workspace clippy lints. Production code never panics: no `unwrap`,
+  `expect`, `panic!`, `todo!` or `unimplemented!`.
+- TypeScript: Biome and strict `tsc`. The UI talks to the backend only through `src/ipc/`.
+- UI text goes in `src/i18n.ts`, in English and Japanese. Colors, sizes and motion come from the
+  tokens in `src/styles.css`.
+- Code, comments, docs and commit messages are in English.
+- Never use the em dash (U+2014). `scripts/guardrails.sh` rejects it.
+- Never edit generated files: `src/ipc/bindings.ts` (run `pnpm bindings`),
+  `src-tauri/permissions/autogenerated/` and lockfiles.
+- Never log transcript text.
+
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains where each kind of change goes ("How to
+extend").
+
+## Commits and pull requests
+
+- Branch from `main` and keep one topic per pull request.
+- Write commit messages in the [Conventional Commits](https://www.conventionalcommits.org/) form:
+  `feat(scope): ...`, `fix(scope): ...`, `perf`, `refactor`, `test`, `docs`, `chore`, `ci`.
+- Fill in the pull request template: what changed and why, how you verified it, and screenshots
+  for UI changes.
+- CI runs `pnpm check` on every pull request on a macOS 26 runner. Run it locally first.
+
+## Signing and release builds
+
+`CI=true pnpm tauri build` makes a release `.app` and `.dmg`. Without more setup, the bundle is
+signed ad hoc with the hardened runtime.
+
+- macOS keeps the microphone and accessibility permissions across updates only when every build is
+  signed with the same identity. Set `APPLE_SIGNING_IDENTITY` to a stable identity, for example
+  the one that `scripts/make-signing-cert.sh` creates.
+- Updater artifacts are signed when `TAURI_SIGNING_PRIVATE_KEY` and
+  `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` are set. The public key is in `src-tauri/tauri.conf.json`.
+
+Releases are cut by the maintainer with the runbook in
+[.agents/skills/murmur-release/SKILL.md](.agents/skills/murmur-release/SKILL.md). Merging a pull
+request never updates anyone; only a published release does.
+
+## License
+
+By contributing, you agree that your contributions are licensed under the [MIT License](LICENSE).

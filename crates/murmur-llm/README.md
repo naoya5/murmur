@@ -32,8 +32,8 @@ place each metallib at its Resources-root filename: dev copies them next to the 
 `Contents/MacOS`. Both files are required even when the current GPU does not use tensor kernels.
 Missing/unreadable libraries cause `metal_library_missing`; a failed GPU backend initialization
 (including a corrupt default library) causes `metal_library_load_failed`. There is no CPU or
-source-compile fallback. ggml can still disable tensor kernels if a present tensor library cannot
-load on a tensor-capable GPU; see the performance report for this known limit.
+source-compile fallback. Known limit: ggml can still disable tensor kernels if a present tensor
+library cannot load on a tensor-capable GPU.
 
 Bundling/signing is owned by the app build. The sidecar does not need microphone or accessibility
 permissions. Only changed staged files are replaced, so an unchanged build does not trigger the
@@ -69,11 +69,14 @@ Prompts, output and stderr stay in memory. `--output` persists only numeric chec
 put local results under `target/`, not in tracked files. Production task validation and idle-stop
 policy belong to the app/core, not this transport executable.
 
-## Performance investigation
+## Performance
 
-See [PERFORMANCE.md](PERFORMANCE.md) for the 100-sample baseline, rejected tuning candidates,
-CLI comparison, declined native-runtime experiment and the later precompiled-Metal change.
-`benchmark.py` repeats the fixed-prefix 10-item x 10-run method against an explicit read-only
+The Metal shaders are compiled when the sidecar is built, not when it starts. On an Apple M4 this
+cut a cold model load from about 10 s (shaders compiled at load time) to between 0.1 and 1.2 s.
+The first generation after a load still prepares GPU pipelines, so the app warms each model when a
+recording starts.
+
+Two scripts reproduce the measurements. `benchmark.py` repeats the fixed-prefix 10-item x 10-run method against an explicit read-only
 request-set JSON. `metallib_bench.py` measures four simultaneous residents, three solo loads per
 model, and first prefill using synthetic text and the current core cleanup prompt. Both persist
 numeric measurements only. The metallib benchmark obtains its cleanup prefix from the production

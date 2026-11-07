@@ -1,7 +1,7 @@
 //! Applies settings changes. Guardrail G3: `apply` matches `SettingKey` exhaustively with no `_`,
 //! so a new setting does not compile until this file says how it takes effect.
 //!
-//! Most settings are read right before use (PLAN 2.9) and need no action here; their arm says
+//! Most settings are read right before use and need no action here; their arm says
 //! where they are read. Settings with side effects (hotkeys, model, autostart, retention) act now.
 
 use std::sync::Arc;

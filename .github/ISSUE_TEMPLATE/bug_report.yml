@@ -1,0 +1,95 @@
+name: Bug report
+description: Something does not work as described.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for the report. English or Japanese is fine.
+        Do not paste transcripts, recordings or screen pictures that you do not want to make public.
+        For a security problem, use the private form in SECURITY.md instead.
+
+  - type: input
+    id: version
+    attributes:
+      label: Murmur version
+      description: Settings > About.
+      placeholder: "0.1.1"
+    validations:
+      required: true
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: "macOS 26.1"
+    validations:
+      required: true
+
+  - type: input
+    id: mac
+    attributes:
+      label: Mac
+      placeholder: "MacBook Air, M2, 16 GB"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Dictation (recording, transcription, paste)
+        - Models (download, loading)
+        - History, dictionary or dashboard
+        - Settings or onboarding
+        - Updates
+        - "Experimental: cleanup"
+        - "Experimental: translation"
+        - "Experimental: screen annotations"
+        - Building from source
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Language and model
+      description: Settings > Recording, and the Models window.
+      placeholder: "Japanese, Haas-ja-v1.0 (Q8_0)"
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open ...
+        2. Press Option + Space and speak for about 10 seconds
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        From ~/Library/Logs/io.github.naoya5.murmur/ (one file per day). Logs contain no transcript text, but read them before you paste.
+      render: text
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy
+      options:
+        - label: This report contains no transcript text, recording or screen picture that I do not want to make public.
+          required: true

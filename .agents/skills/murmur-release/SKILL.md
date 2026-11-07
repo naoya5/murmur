@@ -8,7 +8,7 @@ description: Cut and publish a new Murmur version from the PRs merged since the 
 Turn the work merged into `main` since the last tag into one versioned, signed release that the
 in-app updater can deliver. A release is a deliberate event: merging a PR never updates anyone.
 
-Read `CLAUDE.md` first. The version root is `[workspace.package].version` in `Cargo.toml`;
+Read `AGENTS.md` first. The version root is `[workspace.package].version` in `Cargo.toml`;
 `package.json` mirrors it.
 
 Fast path: collect PRs -> choose the version -> write notes -> bump -> `pnpm check` and E2E ->
@@ -75,8 +75,8 @@ Group by user-visible outcome, not by commit type:
 Rules:
 
 - One line per PR, plain language, no internal ticket numbers.
-- Never paste transcript text, private docs (`docs/PLAN.md`, `docs/PROGRESS.md`,
-  `docs/features/`) or secrets.
+- Never paste transcript text, local-only docs (the private section of `.gitignore`) or
+  secrets.
 - No em dash (U+2014); use a plain dash.
 - Write the notes to a temp file such as `/tmp/murmur-notes.md`, not into the repo.
 
@@ -96,7 +96,7 @@ MURMUR_TEST_MODELS=~/.murmur-dev-models bash scripts/e2e.sh
 MURMUR_TEST_MODELS=~/.murmur-dev-models bash scripts/e2e.sh annotations
 ```
 
-- `pnpm check` is the gate. When GitHub Actions is unavailable (billing lock), it is the only gate.
+- `pnpm check` is the gate. When GitHub Actions cannot run, it is the only gate.
 - `Cargo.lock` may change with the version; commit it.
 - Optional smoke test of the real bundle: `CI=true APPLE_SIGNING_IDENTITY="Murmur Self-Signed"
   pnpm tauri build`, then quit the installed app and open
@@ -130,7 +130,7 @@ The draft must hold `Murmur_X.Y.Z_aarch64.dmg`, `Murmur_X.Y.Z_aarch64.app.tar.gz
 gh release edit "vX.Y.Z" --draft=false
 ```
 
-### When Actions cannot run (billing lock)
+### When Actions cannot run
 
 Build locally and create the release by hand. The tag already exists.
 
@@ -188,8 +188,7 @@ curl -sL https://github.com/naoya5/murmur/releases/latest/download/latest.json |
 
 ## Never
 
-- Commit private docs (`docs/HANDOFF.md`, `docs/IDEATION.md`, `docs/PLAN.md`, `docs/PROGRESS.md`,
-  `docs/features/`).
+- Commit local-only docs (the private section of `.gitignore`).
 - Commit keys, `.p12` files, or `TAURI_SIGNING_PRIVATE_KEY`.
 - Change the signing identity or the updater public key.
 - Bump the version without running `pnpm check` and the E2E.

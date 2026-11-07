@@ -1,8 +1,8 @@
 //! SOT: recognition-plan
 //! What: how recorded audio is cut before it reaches the model: no speech, the whole buffer,
 //!       or chunks along the silences that VAD found.
-//! Why: Haas and Parakeet work on up to about 30 s at once; longer audio is split at silences
-//!      (PLAN 2.7). Audio without speech never reaches the model, which removes most
+//! Why: Haas and Parakeet work on up to about 30 s at once; longer audio is split at silences.
+//!      Audio without speech never reaches the model, which removes most
 //!      hallucinations.
 //! Where: the engine adapter calls `plan` after `VoiceDetector::regions` and transcribes each
 //!        range. While recording (S1), `IncrementalPlan` yields the same chunks one at a time from

@@ -1,7 +1,8 @@
 # Murmur architecture
 
-This is the map of the code. The full rationale is in `PLAN.md` (Japanese, kept local and not in the public repository). Rules for changes are in
-`/CLAUDE.md` and `docs/tickets/RULES.md`.
+This is the map of the code: where each part lives, how the parts talk, and the decisions behind
+them. The rules for changes (guardrails G1 to G13) are in [`AGENTS.md`](../AGENTS.md); the user-facing
+overview is in [`README.md`](../README.md).
 
 ## One path through the code
 
@@ -64,7 +65,7 @@ Each session records `latency_ms` (stop -> clipboard) and `asr_ms` (engine time)
 ## Data on disk
 
 `~/Library/Application Support/io.github.naoya5.murmur/`: `murmur.db` (SQLite, WAL), `settings.json`,
-`models/`, `spool/` (raw 16 kHz mono s16le, headerless, survives crashes). Logs: `~/Library/Logs/Murmur/`
+`models/`, `spool/` (raw 16 kHz mono s16le, headerless, survives crashes). Logs: `~/Library/Logs/io.github.naoya5.murmur/`
 (no transcript text).
 
 Annotations (experimental) add an `annotations` table in `murmur.db` (counts and times, no words) and the folder
@@ -194,7 +195,7 @@ pasted anywhere: the text goes to the clipboard and the pill says why.
 | Add an IPC command | `ipc.rs`; bindings regenerate |
 | Add a screen | `src/views/*.tsx` + the sidebar entry |
 
-## Deviations from PLAN.md (recorded decisions)
+## Recorded decisions
 
 - `daily_stats` is keyed by (day, language) and does not store saved time; saved time is derived when read so
   that a typing-speed change applies to the whole history.

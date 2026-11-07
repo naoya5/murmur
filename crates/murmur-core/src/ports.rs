@@ -7,8 +7,8 @@
 //!        speech.cpp. To add an engine: implement the traits in a new adapter, add its models to
 //!        `catalog.rs`, add one arm to the engine factory. `src-tauri/src/inference.rs` drives
 //!        the streaming detection (S1) while recording; the dictionary is read once when the
-//!        stream starts, so every chunk of one recording uses the same vocabulary (a PLAN 2.9
-//!        deviation: a dictionary edit applies from the next recording).
+//!        stream starts, so every chunk of one recording uses the same vocabulary (so a
+//!        dictionary edit applies from the next recording).
 //!        `src-tauri/src/adapters/refiner.rs` implements `TextRefiner` with the murmur-llm
 //!        sidecar; `src-tauri/src/refine_session.rs` makes the calls that `refine::Run` asks for.
 

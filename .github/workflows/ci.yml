@@ -1,7 +1,7 @@
 name: CI
 
-# Pull requests only: the pull request run already tests the merge with main, and a second run on
-# main after each merge doubled the macOS minutes of this private repo (counted at 10x).
+# Pull requests only: the pull request run already tests the merge with main, so a second run on
+# main after each merge would only repeat it.
 on:
   pull_request:
 
@@ -44,6 +44,5 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      # Engine tests must run on the CPU in CI (no Metal on hosted runners). The device
-      # switch arrives with the engine adapter (T1-5 and Phase 2); set it here then.
+      # Tests that need the speech models are #[ignore]d, so `pnpm check` runs without them.
       - run: pnpm check
