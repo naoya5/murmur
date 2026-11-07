@@ -852,6 +852,18 @@ fn has_enumeration(source: &str) -> bool {
         || (source.contains("まず") && (source.contains("次に") || source.contains("最後に")))
 }
 
+/// Only standalone hesitation words may disappear as a whole sentence. Exact clause
+/// matching keeps meaningful uses such as "その条件" and "あの資料" under coverage checks.
+fn filler_only_sentence(sentence: &str) -> bool {
+    sentence
+        .split(correction_delimiter)
+        .filter(|part| !part.is_empty())
+        .all(|part| {
+            text::FILLERS_JA.contains(&part)
+                || ["あの", "その", "なんか", "まあ", "ええと", "あー"].contains(&part)
+        })
+}
+
 /// A correction can legitimately remove most of a short utterance. Discount only a
 /// punctuation-delimited replaced clause that is absent from the output, retaining the
 /// correction words themselves in the denominator as a conservative margin. Unmarked
@@ -949,6 +961,7 @@ pub fn validate_clean(out: &str, source: &str, glossary: &[String], lists: bool)
         let out_bigrams: HashSet<_> = bigrams(&out_chars).into_iter().collect();
         if source
             .split(['。', '？', '！', '?', '!', '\n'])
+            .filter(|sentence| !filler_only_sentence(sentence))
             .map(|sentence| bigrams(&content_chars(sentence)))
             .any(|b| b.len() >= 8 && bigram_share(&b, &out_bigrams) < CLEAN_RATIO.0)
         {
@@ -1306,6 +1319,31 @@ mod tests {
             let rejected = validate_clean(expected, source, &[], lists);
             assert!(rejected.is_empty(), "{rejected:?}");
         }
+    }
+
+    #[test]
+    fn filler_only_sentences_are_not_missing_content() {
+        let source = "えっと、あの、その、なんか。会議は明日の午後3時からです。";
+        let cleaned = "会議は明日の午後3時からです。";
+        for lists in [false, true] {
+            assert!(validate_clean(cleaned, source, &[], lists).is_empty());
+        }
+        let (mut run, _) = Run::start(RefineKind::Translate, source, Glossary::default(), true);
+        let Next::Call(call) = run.advance(Ok(Generated {
+            text: cleaned.into(),
+            truncated: false,
+        })) else {
+            panic!("translation must follow cleanup");
+        };
+        assert_eq!(call.step, RefineKind::Translate);
+        assert_eq!(
+            call.request.messages.last().map(|m| m.content.as_str()),
+            Some(cleaned)
+        );
+        let meaningful = "あの資料の件、その条件は変更できません。会議は明日の午後3時からです。";
+        assert!(
+            validate_clean(cleaned, meaningful, &[], true).contains(&Rejection::MissingContent)
+        );
     }
 
     #[test]
