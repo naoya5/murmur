@@ -3,7 +3,7 @@
 //!       phrases, duplicate words, capitalization, CJK spacing, final punctuation, and dictionary
 //!       replacements for languages whose model has no custom vocabulary.
 //! Why: the models already punctuate; these cheap rules (< 1 ms, budget 2 ms) fix the rest
-//!      without the latency of an LLM (IDEATION 9).
+//!      without the latency of an LLM.
 //! Where: the controller calls `format` between the engine and the clipboard. Tests at the end.
 
 use std::collections::HashMap;
@@ -174,7 +174,7 @@ pub fn is_hallucination(text: &str) -> bool {
 /// - Fillers of both languages are removed from any text, because one text can mix languages.
 ///   An English filler written in capitals ("ER", "MM") or after a number ("5 mm") is kept.
 /// - Duplicate removal keeps the first word and the punctuation of the last one ("the the." ->
-///   "the."). It also removes legitimate repeats such as "had had"; IDEATION 9 accepts that.
+///   "the."). It also removes legitimate repeats such as "had had"; that trade-off is accepted.
 /// - Capitalization applies to English text only, after ". ! ?" followed by a space, and leaves
 ///   words that already contain a capital ("iPhone") alone.
 /// - The spaces that Haas writes between Latin and Japanese ("Claude Code で") are kept.

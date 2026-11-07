@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Create the self-signed code-signing identity "Murmur Self-Signed" in the login keychain.
 # macOS (TCC) recognizes the app by this certificate, so every release must be signed with the
-# SAME identity or users lose their microphone and accessibility grants (PLAN 4.2).
+# SAME identity or users lose their microphone and accessibility grants.
 # Idempotent: if the identity already exists, nothing changes.
 set -euo pipefail
 

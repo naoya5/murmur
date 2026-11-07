@@ -2,7 +2,7 @@
 # End-to-end test: a REAL dictation in the debug app, without a real voice or real keys.
 #
 # How: the debug build accepts a microphone named "wav:<path>" (plays a WAV file as the microphone) and
-# SIGUSR1 / SIGUSR2 as the hotkey / Esc (ARCHITECTURE, deviations). The script builds the app once, runs it on a
+# SIGUSR1 / SIGUSR2 as the hotkey / Esc (docs/ARCHITECTURE.md, "Recorded decisions"). The script builds the app once, runs it on a
 # scratch data dir (MURMUR_DATA_DIR) with auto_paste off (nothing is typed anywhere; the result is only copied),
 # and checks the clipboard (pbpaste) and the history database (sqlite3).
 #
@@ -1181,7 +1181,7 @@ print(f"{prev[-1] / len(a):.3f}", "yes" if first and first in b else "no", len(a
 PY
 }
 
-# R5: no spoken word may be lost on the annotations path. Two recordings. (1) ja.wav, then
+# No spoken word may be lost on the annotations path. Two recordings. (1) ja.wav, then
 # silence, the only stroke at 10 s: the words all come before the first picture. (2) ja60.wav
 # through dictation and through annotations with the stroke at 10 s: the annotation words must
 # cover the dictation words (character coverage, LCS) and start with the same first sentence.
@@ -1244,7 +1244,7 @@ case_annot_words() {
   annot_unenv
 }
 
-# R1: the paste goes to the app that was in front when the recording started, not to the app in
+# The paste goes to the app that was in front when the recording started, not to the app in
 # front at stop. TextEdit is in front at the hotkey; two seconds into the recording Finder comes
 # to the front (Cmd+V does nothing there); after the stop the TextEdit document must hold the
 # words. Pastes for real (auto_paste on), so a person must be at the Mac and nothing else may

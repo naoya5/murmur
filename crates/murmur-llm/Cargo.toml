@@ -5,8 +5,8 @@ edition = "2024"
 publish = false
 description = "LLM sidecar for Murmur: llama.cpp behind a JSON Lines protocol on stdin and stdout"
 
-# Standalone on purpose: llama.cpp carries its own ggml, and PLAN 6 allows only one ggml per
-# process. Keeping this crate out of the app workspace means the app can never link it.
+# Standalone on purpose: llama.cpp carries its own ggml, and a process may link only one
+# ggml. Keeping this crate out of the app workspace means the app can never link it.
 [workspace]
 
 [[bin]]

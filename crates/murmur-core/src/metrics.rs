@@ -1,8 +1,8 @@
 //! SOT: metrics
 //! What: how words and characters are counted, and how the dashboard numbers are derived:
 //!       time saved, speaking rate, latency median, streak, activity heatmap.
-//! Why: Japanese has no word boundaries, so English counts words and Japanese counts characters
-//!      (IDEATION 8). Saved time is derived when read, so a change of typing speed applies to the
+//! Why: Japanese has no word boundaries, so English counts words and Japanese counts characters.
+//!      Saved time is derived when read, so a change of typing speed applies to the
 //!      whole history at once.
 //! Where: the store adapter calls `count` when it saves a transcript and keeps per-day totals;
 //!        the `get_dashboard` command calls `dashboard`. Tests at the end of this file.

@@ -46,7 +46,7 @@ jobs:
 
       # Import the self-signed identity into a temporary keychain and trust it for code
       # signing, so tauri's bundler can sign by name. The same certificate every release keeps
-      # the macOS permission grants (PLAN 4.2).
+      # the macOS permission grants.
       - name: Import signing certificate
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}

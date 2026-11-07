@@ -18,13 +18,19 @@ dist-ssr
 .DS_Store
 *.sw?
 
-# Private docs: the owner's requests, requirements, local paths and work notes.
-# They stay on this Mac only and are removed from the git history. Never `git add -f` them.
+# Local-only docs: the maintainer's planning notes, work tickets, internal reviews and
+# investigation logs. They stay on the maintainer's machine. Never `git add -f` them.
 /docs/HANDOFF.md
 /docs/IDEATION.md
 /docs/PLAN.md
 /docs/PROGRESS.md
 /docs/features/
+/docs/tickets/
+/docs/reviews/
+/crates/murmur-llm/PERFORMANCE.md
+
+# The landing page is developed and deployed separately from the app.
+/marketing/
 
 # Sidecar binaries staged by scripts/build-sidecar.sh for Tauri externalBin
 /src-tauri/binaries/

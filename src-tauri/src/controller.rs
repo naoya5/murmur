@@ -429,7 +429,7 @@ impl Controller {
         if self.machine.active_session().is_some() {
             return Some(Event::AnnotationsHotkey);
         }
-        // The app in front now receives the bundle, whatever is in front at the stop (R1).
+        // The app in front now receives the bundle, whatever is in front at the stop.
         self.front_at_hotkey = frontmost::capture();
         if !macos::screen_recording_granted() && !macos::request_screen_recording() {
             return Some(Event::AnnotationsRefused {

@@ -594,7 +594,7 @@ fn mark_places(s: &Summary<'_>) -> Vec<Option<(usize, usize)>> {
 }
 
 /// The text pasted after the pictures (and written to `summary.md`): the spoken words in
-/// order, with the token of each ink group at the place it was drawn (R10, R11). A terminal
+/// order, with the token of each ink group at the place it was drawn. A terminal
 /// gets the picture path in the first token of each picture. Without ink: the words alone, as
 /// a dictation. A failed transcription: a note, then the tokens.
 pub fn summary_text(s: &Summary<'_>) -> String {

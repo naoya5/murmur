@@ -2,7 +2,7 @@
 //! What: every model Murmur can download and run: id, family, languages, the pinned Hugging Face
 //!       revision, file, size, SHA-256, license, attribution and capabilities.
 //! Why: one table drives downloads, verification, the Models screen, the licenses screen and the
-//!      engine. Adding a model is a change to this file only (PLAN 2.16).
+//!      engine. Adding a model is a change to this file only.
 //! Where: download and verify in `src-tauri/src/adapters/models.rs`; load in
 //!        `src-tauri/src/adapters/engine.rs` (speech) and `src-tauri/src/adapters/refiner.rs`
 //!        (the LLMs of the refine step, run by the murmur-llm sidecar). Speech values are copied
@@ -244,7 +244,7 @@ pub static CATALOG: &[ModelEntry] = &[
         attribution: "LFM2-350M-ENJP-MT by Liquid AI, LFM Open License v1.0",
         capabilities: NO_SPEECH_CAPABILITIES,
         tasks: &[RefineKind::Translate],
-        // crates/murmur-llm/PERFORMANCE.md: 352 to 355 MiB.
+        // Measured peak resident memory: 352 to 355 MiB.
         memory_bytes: Some(355 * 1024 * 1024),
     },
     ModelEntry {
