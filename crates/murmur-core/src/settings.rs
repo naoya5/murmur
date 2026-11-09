@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 use thiserror::Error;
 
-use crate::Language;
+use crate::{Language, Millis};
 
 /// Current schema version of `settings.json`. Raise it and add a step to `migrate` when a
 /// change is not backward compatible (renames, meaning changes). Added fields only need
@@ -237,6 +237,13 @@ impl Settings {
             crate::refine::RefineKind::Clean,
             self.refine_lists,
         ))
+    }
+
+    /// Whether a model that has gone unused for `unused_ms` is unloaded now. The time counts from
+    /// the model's last use, so every dictation restarts it, however short.
+    pub fn model_unload_due(&self, unused_ms: Millis) -> bool {
+        self.unload_model_after_min
+            .is_some_and(|minutes| unused_ms >= Millis::from(minutes) * 60_000)
     }
 
     /// The keys whose values differ between `self` (old) and `new`.
@@ -545,6 +552,24 @@ mod tests {
 
     /// A change to apply to default settings, and the key it must be reported under.
     type Case = (Box<dyn Fn(&mut Settings)>, SettingKey);
+
+    // --- model unloading ---
+
+    #[test]
+    fn model_unload_counts_from_the_last_use() {
+        let keep = Settings::default();
+        assert_eq!(keep.unload_model_after_min, None);
+        assert!(!keep.model_unload_due(Millis::MAX));
+
+        let ten = Settings {
+            unload_model_after_min: Some(10),
+            ..Settings::default()
+        };
+        assert!(!ten.model_unload_due(0));
+        assert!(!ten.model_unload_due(10 * 60_000 - 1));
+        assert!(ten.model_unload_due(10 * 60_000));
+        assert!(ten.model_unload_due(Millis::MAX));
+    }
 
     // --- defaults and validation ---
 

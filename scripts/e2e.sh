@@ -19,6 +19,7 @@
 #
 # Usage: scripts/e2e.sh [case ...]     cases: ja en silence cancel undo crash long   (default: all of these)
 #        opt-in: mic (makes sound: real microphone + afplay through the speakers), tenmin (about 12 minutes),
+#                idle (the model unloads N idle minutes after its last use, about 6 minutes),
 #                annotations (the annotation group, about 3 minutes; or one of annot annot-marks
 #                annot-nospeech-marks annot-nospeech-nomarks annot-cancel annot-undo annot-disable annot-screenfail
 #                annot-compose-timeout annot-nomodel annot-words), and annot-target (pastes into TextEdit on the
@@ -148,6 +149,8 @@ settings = {
     "restore_clipboard": False,
     "annotations_enabled": os.environ.get("E2E_ANNOTATIONS") == "1",
 }
+if os.environ.get("E2E_UNLOAD_MIN"):
+    settings["unload_model_after_min"] = int(os.environ["E2E_UNLOAD_MIN"])
 with open(path, "w", encoding="utf-8") as f:
     json.dump(settings, f)
 PY
@@ -1295,6 +1298,56 @@ case_annot_target() {
   annot_unenv
 }
 
+# "Unload the model after N minutes" counts from the model's last use. A dictation that falls
+# between two of the once-a-minute idle checks must restart the count too.
+case_idle() {
+  say "== idle (unload 2 idle minutes after the last use; about 6 minutes)"
+  fresh_data
+  local wav="$FIXTURES/ja.wav" length unload='unloading the model after idle time'
+  length="$(wav_seconds "$wav")"
+  E2E_UNLOAD_MIN=2 start_app ja "$wav" || return
+  if wait_for_log "$unload" 240; then
+    pass "the preloaded model is unloaded when idle"
+  else
+    fail "no idle unload within 240 s of the start"
+    stop_app
+    return
+  fi
+  # Speak right after an idle check, so that the whole dictation falls before the next one.
+  sleep 3
+  begin_recording || { stop_app; return; }
+  sleep "$(python3 -c "print($length + 0.5)")"
+  hotkey
+  if ! wait_for_log 'session saved' "$RESULT_TIMEOUT"; then
+    fail "no 'session saved' within ${RESULT_TIMEOUT}s"
+    failure_lines | sed 's/^/    log: /'
+    stop_app
+    return
+  fi
+  if [ "$(grep -c 'speech model loaded' "$LOG")" -ge 2 ]; then
+    pass "the dictation loaded the model again"
+  else
+    fail "the dictation did not load the model again"
+  fi
+  if ! wait_for_log "$unload" 240 2; then
+    fail "no second idle unload within 240 s of the dictation"
+    stop_app
+    return
+  fi
+  local saved_ms unloaded_ms gap_s
+  saved_ms="$(log_time_ms 'session saved')"
+  unloaded_ms="$(log_time_ms "$unload")"
+  gap_s="$(python3 -c "print(round(($unloaded_ms - $saved_ms) / 1000))")"
+  note "dictation saved -> model unloaded: ${gap_s} s (limit 2 min, idle checks once a minute)"
+  if [ "$gap_s" -ge 115 ] && [ "$gap_s" -le 185 ]; then
+    pass "the model stayed loaded for the 2 idle minutes after the dictation"
+  else
+    fail "the model was unloaded ${gap_s} s after the dictation, expected 120 to 180 s"
+  fi
+  no_panic
+  stop_app
+}
+
 run_annotations() {
   for c in annot annot-marks annot-nospeech-marks annot-nospeech-nomarks annot-cancel annot-undo annot-disable \
     annot-screenfail annot-compose-timeout annot-nomodel annot-words; do
@@ -1331,7 +1384,8 @@ run_case() {
     esc-mash) case_escmash ;;
     readonly) case_readonly ;;
     tenmin) case_tenmin ;;
-    *) die "unknown case: $1 (ja en silence cancel undo crash long mic nomodel corrupt mash esc-mash readonly tenmin annotations annot ...)" ;;
+    idle) case_idle ;;
+    *) die "unknown case: $1 (ja en silence cancel undo crash long mic nomodel corrupt mash esc-mash readonly tenmin idle annotations annot ...)" ;;
   esac
 }
 
