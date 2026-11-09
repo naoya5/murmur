@@ -963,8 +963,26 @@ sys.exit(0 if all(re.search(p, text) for p in sys.argv[2].split(",")) else 1)
 PY
     [ "$rmarks" -ge 1 ] 2> /dev/null && pass "$label: $rmarks mark(s) in the row" || fail "$label: no marks in the row"
   fi
-  [ "$(pbpaste)" = "$summary" ] && pass "$label: clipboard holds the summary" || fail "$label: clipboard does not hold the summary"
-  case "$(pbpaste)" in *"/frames/"*) fail "$label: a picture path in the text for a GUI app" ;; *) pass "$label: no picture path in the text" ;; esac
+  # The paste target is the app in front at the hotkey, a terminal when the script runs in one in front. A terminal
+  # gets the picture paths inside the marks; any other app gets the summary as it is.
+  local target
+  target="$(python3 - "$dir/annotation.json" "$ROOT/crates/murmur-core/src/annotations.rs" <<'PY'
+import json, re, sys
+bundle = (json.load(open(sys.argv[1], encoding="utf-8")).get("target_bundle_id") or "").lower()
+ids = re.search(r"TERMINAL_BUNDLE_IDS: \[&str; \d+\] = \[(.*?)\];", open(sys.argv[2], encoding="utf-8").read(), re.S)
+if not ids:
+    sys.exit("TERMINAL_BUNDLE_IDS not found in annotations.rs")
+print("terminal" if bundle in {i.lower() for i in re.findall(r'"([^"]+)"', ids.group(1))} else "app")
+PY
+)"
+  if [ "$target" = terminal ] && [ "$pictures" = yes ]; then
+    case "$(pbpaste)" in *"/frames/"*) pass "$label: picture paths in the text for a terminal" ;; *) fail "$label: no picture path in the text for a terminal" ;; esac
+  elif [ -n "$target" ]; then
+    [ "$(pbpaste)" = "$summary" ] && pass "$label: clipboard holds the summary" || fail "$label: clipboard does not hold the summary"
+    case "$(pbpaste)" in *"/frames/"*) fail "$label: a picture path in the text for a GUI app" ;; *) pass "$label: no picture path in the text" ;; esac
+  else
+    fail "$label: the paste target could not be read"
+  fi
   if [ "$status" = failed ]; then
     [ "$(spool_count)" -ge 1 ] && pass "$label: audio kept for a retry" || fail "$label: audio was deleted after a failure"
   else
