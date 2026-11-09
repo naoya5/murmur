@@ -303,11 +303,11 @@ fn copy_text_now(text: &str) {
     }
 }
 
-/// Frees the model after the configured idle time. Off by default (speed first). The refine
-/// sidecars stop after their own fixed idle time (D3).
+/// Frees the model after the configured idle time. Off by default (speed first). The time counts
+/// from the model's last use, which the inference thread records, so a dictation between two
+/// checks restarts it as well. The refine sidecars stop after their own fixed idle time (D3).
 fn spawn_idle_unload(services: Arc<App>) {
     tauri::async_runtime::spawn(async move {
-        let mut idle_minutes = 0u32;
         loop {
             tokio::time::sleep(IDLE_CHECK).await;
             let refiner = services.refiner().clone();
@@ -316,16 +316,16 @@ fn spawn_idle_unload(services: Arc<App>) {
                 services.pill_state().view,
                 PillView::Hidden | PillView::Notice { .. }
             );
-            idle_minutes = if busy {
-                0
-            } else {
-                idle_minutes.saturating_add(1)
-            };
-            if let Some(limit) = services.settings().unload_model_after_min
-                && idle_minutes >= limit
+            let unused = services.inference().unused_for();
+            let unused_ms = u64::try_from(unused.as_millis()).unwrap_or(u64::MAX);
+            if !busy
+                && services.settings().model_unload_due(unused_ms)
                 && services.inference().loaded_model().is_some()
             {
-                tracing::info!(idle_minutes, "unloading the model after idle time");
+                tracing::info!(
+                    unused_s = unused.as_secs(),
+                    "unloading the model after idle time"
+                );
                 services.inference().unload();
             }
         }

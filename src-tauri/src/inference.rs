@@ -197,6 +197,8 @@ pub struct Inference {
     tx: std::sync::mpsc::Sender<Job>,
     warm_pending: Arc<AtomicBool>,
     loaded: Arc<Mutex<Option<&'static str>>>,
+    /// When the worker last finished a job: the end of the model's latest use (S5).
+    last_used: Arc<Mutex<Instant>>,
     stream_buffer: Arc<Mutex<Option<(StreamId, SharedStreamBuffer)>>>,
 }
 
@@ -207,6 +209,8 @@ impl Inference {
         let worker_loaded = loaded.clone();
         let warm_pending = Arc::new(AtomicBool::new(false));
         let worker_warm_pending = warm_pending.clone();
+        let last_used = Arc::new(Mutex::new(Instant::now()));
+        let worker_last_used = last_used.clone();
         let spawned = thread::Builder::new()
             .name("inference".into())
             .spawn(move || {
@@ -240,6 +244,9 @@ impl Inference {
                     }
                     worker.handle(job);
                     worker.poll_stream();
+                    if let Ok(mut at) = worker_last_used.lock() {
+                        *at = Instant::now();
+                    }
                 }
                 worker.unload_all();
             });
@@ -251,6 +258,7 @@ impl Inference {
             tx,
             warm_pending,
             loaded,
+            last_used,
             stream_buffer: Arc::new(Mutex::new(None)),
         }
     }
@@ -377,6 +385,15 @@ impl Inference {
 
     pub fn loaded_model(&self) -> Option<&'static str> {
         self.loaded.lock().ok().and_then(|guard| *guard)
+    }
+
+    /// How long the model has gone unused: since the worker finished its latest job, such as a
+    /// warm-up, a stream's tail or a transcription. Zero when the clock cannot be read.
+    pub fn unused_for(&self) -> Duration {
+        self.last_used
+            .lock()
+            .map(|at| at.elapsed())
+            .unwrap_or_default()
     }
 }
 
@@ -1225,6 +1242,22 @@ mod tests {
             assert_eq!(CALLS.load(Ordering::SeqCst) - calls, 2);
             inference.shutdown(Duration::from_secs(10));
         }
+    }
+
+    #[test]
+    fn every_job_restarts_the_unused_time() {
+        let _serial = serial();
+        let inference = Inference::spawn(engines, vads);
+        inference.warm(spec(catalog::DEFAULT_JA_MODEL), spec(catalog::VAD_MODEL));
+        assert!(inference.wait_idle(Duration::from_secs(10)));
+        thread::sleep(Duration::from_millis(300));
+        assert!(inference.unused_for() >= Duration::from_millis(300));
+        // A short dictation counts as a use, whenever the app's idle check runs.
+        let text = rt()
+            .block_on(inference.transcribe(request(vec![0.0; 16_000], catalog::DEFAULT_JA_MODEL)));
+        assert!(text.is_ok());
+        assert!(inference.unused_for() < Duration::from_millis(300));
+        inference.shutdown(Duration::from_secs(10));
     }
 
     #[test]
