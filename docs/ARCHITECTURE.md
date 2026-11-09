@@ -29,7 +29,7 @@ Read in this order. Each step names where to go next.
 | Layer | Where | May depend on | Must not |
 |---|---|---|---|
 | Core | `crates/murmur-core` | std, serde, specta, unicode-segmentation | Tauri, files, network, OS APIs, SDKs |
-| Speech FFI | `crates/speech-sys` | speech.cpp (git submodule, pinned tag) | anything else |
+| Speech FFI | `crates/speech-sys` | speech.cpp (git submodule, pinned commit) | anything else |
 | LLM sidecar | `crates/murmur-llm` (its own executable, bundled as `externalBin`; its precompiled `default.metallib` and `ggml-tensor.metallib` are bundle resources) | llama.cpp | the app's code; it only speaks JSON Lines |
 | Adapters | `src-tauri/src/adapters`, `src-tauri/src/platform` | core, one SDK each | other adapters' internals |
 | Assembly | `src-tauri/src/{lib,controller,inference,ipc,windows,tray,settings_apply,annotation_session,bundles,refine_session}.rs` | core, adapters | business rules |
@@ -206,6 +206,12 @@ pasted anywhere: the text goes to the clipboard and the pill says why.
   plays Shift presses and strokes from a script instead of the real keys;
   `MURMUR_DEBUG_COMPOSE_DELAY_MS=<n>` delays the compose step to hit its timeout; SIGINFO flips the
   `annotations_enabled` setting. Release builds ignore all of them.
+- speech.cpp comes from the fork [naoya5/speech.cpp](https://github.com/naoya5/speech.cpp), branch
+  `murmur/mapped-weights-0.10.0`: release 0.10.0 plus one commit that keeps a loaded model's weights in the model
+  file's mapped pages on Metal and the CPU instead of copying them. The copy was 641 MB of the app's 744 MB footprint
+  with Haas loaded; with the map it stays under 200 MB with the model loaded (`scripts/e2e.sh memory`). Once a release
+  of nyosegawa/speech.cpp carries the same change, the submodule returns to that tag. The model files are replaced by
+  renaming over them, which a mapped file allows.
 - S1 (stream transcription): for recordings over 30 s, closed speech regions are transcribed while recording;
   at stop only the tail is processed. Recordings up to 30 s keep the whole-buffer path. Any streaming error
   falls back to the offline path. The dictionary is read once at the start of a recording, so an edit applies

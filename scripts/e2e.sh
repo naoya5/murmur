@@ -7,7 +7,8 @@
 # and checks the clipboard (pbpaste) and the history database (sqlite3).
 #
 # Cases: ja, en, silence (no row, clipboard untouched), cancel (Esc), undo (Esc twice), crash (kill -9, spool
-# recovery at the next start), long (77 s Japanese file through the chunk path).
+# recovery at the next start), long (77 s Japanese file through the chunk path), memory (the app's footprint with the
+# model loaded stays under MEMORY_LIMIT_MB).
 # Annotations (experimental, opt-in group `annotations`): the screen is a folder of generated PNGs
 # (MURMUR_DEBUG_SCREEN=png-dir:), Shift and the strokes come from a JSON script (MURMUR_DEBUG_POINTER=), and
 # SIGUSR1 is the annotations hotkey (MURMUR_DEBUG_HOTKEY=annotations). Set E2E_KEEP_DIR to keep the normal and the
@@ -17,7 +18,7 @@
 # Needs: the speech models in $MURMUR_TEST_MODELS (default ~/.murmur-dev-models), macOS tools pbcopy/pbpaste,
 #        sqlite3, python3. The user's text clipboard is saved and restored (images and other types are lost).
 #
-# Usage: scripts/e2e.sh [case ...]     cases: ja en silence cancel undo crash long   (default: all of these)
+# Usage: scripts/e2e.sh [case ...]     cases: ja en silence cancel undo crash long memory   (default: all of these)
 #        opt-in: mic (makes sound: real microphone + afplay through the speakers), tenmin (about 12 minutes),
 #                idle (the model unloads N idle minutes after its last use, about 6 minutes),
 #                annotations (the annotation group, about 3 minutes; or one of annot annot-marks
@@ -37,6 +38,7 @@ FIXTURES="${E2E_FIXTURES:-$ROOT/src-tauri/tests/fixtures}"
 START_TIMEOUT=90     # seconds: app start (the model is preloaded in the background)
 RESULT_TIMEOUT=30    # seconds: stop -> "session saved"
 SILENCE_WAIT=8       # seconds to wait before declaring "nothing happened"
+MEMORY_LIMIT_MB=200  # the app's footprint (Activity Monitor's "Memory") with the model loaded
 
 SCRATCH=""
 DATA=""
@@ -1298,6 +1300,45 @@ case_annot_target() {
   annot_unenv
 }
 
+# The weights of a loaded model stay in the model file's mapped pages (speech.cpp), so they do not count in the app's
+# footprint, which is what Activity Monitor shows as "Memory".
+case_memory() {
+  say "== memory (footprint with the model loaded, after a dictation)"
+  fresh_data
+  local wav="$FIXTURES/ja.wav" length mb
+  length="$(wav_seconds "$wav")"
+  start_app ja "$wav" || return
+  begin_recording || { stop_app; return; }
+  sleep "$(python3 -c "print($length + 0.5)")"
+  hotkey
+  if ! wait_for_log 'session saved' "$RESULT_TIMEOUT"; then
+    fail "no 'session saved' within ${RESULT_TIMEOUT}s"
+    failure_lines | sed 's/^/    log: /'
+    stop_app
+    return
+  fi
+  if grep -q 'speech model loaded' "$LOG"; then
+    pass "the model is loaded"
+  else
+    fail "the model was not loaded"
+  fi
+  mb="$(footprint "$APP_PID" 2> /dev/null | python3 -c '
+import re, sys
+m = re.search(r"Footprint: ([0-9.]+) (KB|MB|GB)", sys.stdin.read())
+if m:
+    print(round(float(m.group(1)) * {"KB": 1 / 1024, "MB": 1, "GB": 1024}[m.group(2)]))
+')"
+  if [ -z "$mb" ]; then
+    fail "footprint could not read the app's memory"
+  elif [ "$mb" -le "$MEMORY_LIMIT_MB" ]; then
+    pass "footprint ${mb} MB, at most ${MEMORY_LIMIT_MB} MB"
+  else
+    fail "footprint ${mb} MB, over ${MEMORY_LIMIT_MB} MB"
+  fi
+  no_panic
+  stop_app
+}
+
 # "Unload the model after N minutes" counts from the model's last use. A dictation that falls
 # between two of the once-a-minute idle checks must restart the count too.
 case_idle() {
@@ -1385,14 +1426,15 @@ run_case() {
     readonly) case_readonly ;;
     tenmin) case_tenmin ;;
     idle) case_idle ;;
-    *) die "unknown case: $1 (ja en silence cancel undo crash long mic nomodel corrupt mash esc-mash readonly tenmin idle annotations annot ...)" ;;
+    memory) case_memory ;;
+    *) die "unknown case: $1 (ja en silence cancel undo crash long mic nomodel corrupt mash esc-mash readonly tenmin idle memory annotations annot ...)" ;;
   esac
 }
 
 if [ "$#" -gt 0 ]; then
   CASES=("$@")
 else
-  CASES=(ja en silence cancel undo crash long nomodel corrupt mash esc-mash readonly)
+  CASES=(ja en silence cancel undo crash long nomodel corrupt mash esc-mash readonly memory)
 fi
 for c in "${CASES[@]}"; do
   run_case "$c"

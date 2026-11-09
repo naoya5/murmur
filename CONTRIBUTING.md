@@ -48,7 +48,9 @@ builds the language-model sidecar (`scripts/build-sidecar.sh`) before it starts 
 In development, macOS attaches the microphone and accessibility permissions to the terminal that
 runs `pnpm tauri dev`, not to Murmur. Grant them to that terminal.
 
-If you cloned without `--recurse-submodules`, run `git submodule update --init --recursive`.
+If you cloned without `--recurse-submodules`, run `git submodule update --init --recursive`. A clone from before
+speech.cpp moved to the fork [naoya5/speech.cpp](https://github.com/naoya5/speech.cpp) runs
+`git submodule sync --recursive` first, so that the submodule fetches from the fork.
 
 ## Checks
 

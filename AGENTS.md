@@ -19,7 +19,7 @@ a pure core crate holds the rules, and one adapter per SDK or OS API does the I/
 | Path | What |
 |---|---|
 | `crates/murmur-core` | The pure core: session state machine, settings, model catalog, text rules, metrics, refine and annotation rules. |
-| `crates/speech-sys` | FFI to [speech.cpp](https://github.com/nyosegawa/speech.cpp) (git submodule, pinned tag). |
+| `crates/speech-sys` | FFI to [speech.cpp](https://github.com/nyosegawa/speech.cpp) (git submodule, pinned to a commit of the fork [naoya5/speech.cpp](https://github.com/naoya5/speech.cpp); `docs/ARCHITECTURE.md` says why). |
 | `crates/murmur-llm` | The LLM sidecar: llama.cpp behind JSON Lines on stdin and stdout. A separate Cargo workspace. |
 | `src-tauri/` | The app: adapters, controller, inference thread, IPC, windows, tray, updater. |
 | `src/` | The React UI: main window (`index.html`), recording pill (`pill.html`), annotation overlay (`overlay.html`). |
