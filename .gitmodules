@@ -1,3 +1,4 @@
 [submodule "crates/speech-sys/speech.cpp"]
 	path = crates/speech-sys/speech.cpp
-	url = https://github.com/nyosegawa/speech.cpp
+	url = https://github.com/naoya5/speech.cpp
+	branch = murmur/mapped-weights-0.10.0

@@ -208,7 +208,7 @@ Murmur is [MIT licensed](LICENSE). It bundles or downloads:
 
 | Component | License |
 |---|---|
-| [speech.cpp](https://github.com/nyosegawa/speech.cpp) and its ggml fork | MIT |
+| [speech.cpp](https://github.com/nyosegawa/speech.cpp) and its ggml fork, built from the fork [naoya5/speech.cpp](https://github.com/naoya5/speech.cpp) | MIT |
 | [llama.cpp](https://github.com/ggml-org/llama.cpp), through the [llama-cpp-2](https://crates.io/crates/llama-cpp-2) crate | MIT |
 | [Haas-ja-v1.0](https://huggingface.co/third-intelligence/Haas-ja-v1.0) by Third Intelligence | Apache-2.0 |
 | [parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) by NVIDIA | CC-BY-4.0 |

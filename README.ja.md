@@ -202,7 +202,7 @@ Murmur は [MIT ライセンス](LICENSE) です。次のものを同梱、ま�
 
 | コンポーネント | ライセンス |
 |---|---|
-| [speech.cpp](https://github.com/nyosegawa/speech.cpp) とその ggml のフォーク | MIT |
+| [speech.cpp](https://github.com/nyosegawa/speech.cpp) とその ggml のフォーク ([naoya5/speech.cpp](https://github.com/naoya5/speech.cpp) のフォークからビルド) | MIT |
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) ([llama-cpp-2](https://crates.io/crates/llama-cpp-2) クレート経由) | MIT |
 | [Haas-ja-v1.0](https://huggingface.co/third-intelligence/Haas-ja-v1.0) (Third Intelligence) | Apache-2.0 |
 | [parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) (NVIDIA) | CC-BY-4.0 |
