@@ -75,7 +75,8 @@ export default function Overlay() {
       ctx.stroke();
     }
     ctx.globalAlpha = 1;
-    if (strokes.current.length > 0) {
+    // Only a fading stroke changes on its own; a stroke being drawn redraws on pointer moves.
+    if (strokes.current.some((s) => s.endedAt !== null)) {
       frame.current = window.requestAnimationFrame(draw);
     }
   }, []);
