@@ -18,7 +18,7 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::Path;
 use std::ptr::{self, NonNull};
-use std::sync::Once;
+use std::sync::{Arc, Once};
 use std::time::Instant;
 
 use murmur_core::catalog::{Family, Role};
@@ -94,6 +94,44 @@ struct LoadedModel {
     id: &'static str,
     model: Model,
     takes: Takes,
+    vocab_cache: Option<VocabularyCache>,
+}
+
+struct VocabularyCache {
+    vocabulary: Arc<[DictionaryEntry]>,
+    language: Language,
+    text: String,
+}
+
+impl VocabularyCache {
+    fn get_or_compute<'a>(
+        slot: &'a mut Option<Self>,
+        takes: Takes,
+        vocabulary: &Arc<[DictionaryEntry]>,
+        language: Language,
+    ) -> &'a str {
+        if vocabulary.is_empty() || (!takes.keywords && !takes.prompt) {
+            return "";
+        }
+        let reusable = slot.as_ref().is_some_and(|cached| {
+            (takes.keywords || cached.language == language)
+                && (Arc::ptr_eq(&cached.vocabulary, vocabulary)
+                    || *cached.vocabulary == **vocabulary)
+        });
+        if !reusable {
+            let text = if takes.keywords {
+                keywords_text(vocabulary)
+            } else {
+                prompt_text(vocabulary, language)
+            };
+            *slot = Some(Self {
+                vocabulary: Arc::clone(vocabulary),
+                language,
+                text,
+            });
+        }
+        slot.as_ref().map_or("", |cached| cached.text.as_str())
+    }
 }
 
 /// The request options the loaded model declares, read from its file once.
@@ -156,6 +194,7 @@ impl SpeechEngine for SpeechCppEngine {
             id: spec.entry.id,
             model,
             takes,
+            vocab_cache: None,
         });
         Ok(())
     }
@@ -169,7 +208,7 @@ impl SpeechEngine for SpeechCppEngine {
         pcm: &[f32],
         opts: &TranscribeOptions,
     ) -> Result<RawTranscript, EngineError> {
-        let loaded = self.loaded.as_ref().ok_or(EngineError::NotLoaded)?;
+        let loaded = self.loaded.as_mut().ok_or(EngineError::NotLoaded)?;
         if opts.cancel.is_cancelled() {
             return Err(EngineError::Cancelled);
         }
@@ -188,16 +227,19 @@ impl SpeechEngine for SpeechCppEngine {
                 tracing::warn!(%error, language = opts.language.code(), "language refused; using auto");
             }
         }
-        if loaded.takes.keywords {
-            let keywords = keywords_text(&opts.vocabulary);
-            if !keywords.is_empty() {
-                request.set_string(ffi::SPEECH_OPT_KEYWORDS, &keywords)?;
-            }
-        } else if loaded.takes.prompt {
-            let prompt = prompt_text(&opts.vocabulary, opts.language);
-            if !prompt.is_empty() {
-                request.set_string(ffi::SPEECH_OPT_PROMPT, &prompt)?;
-            }
+        let vocab = VocabularyCache::get_or_compute(
+            &mut loaded.vocab_cache,
+            loaded.takes,
+            &opts.vocabulary,
+            opts.language,
+        );
+        if !vocab.is_empty() {
+            let key = if loaded.takes.keywords {
+                ffi::SPEECH_OPT_KEYWORDS
+            } else {
+                ffi::SPEECH_OPT_PROMPT
+            };
+            request.set_string(key, vocab)?;
         }
         request.set_cancel(&opts.cancel)?;
         // SAFETY: a valid request owned by this thread; the cancel token outlives the call.
@@ -778,6 +820,67 @@ mod tests {
     }
 
     #[test]
+    fn vocabulary_cache_reuses_arc_and_invalidates_on_change() {
+        let mut slot = None;
+        let keywords_takes = Takes {
+            language: true,
+            keywords: true,
+            prompt: false,
+        };
+        let empty: Arc<[DictionaryEntry]> = Arc::from([]);
+        assert_eq!(
+            VocabularyCache::get_or_compute(&mut slot, keywords_takes, &empty, Language::Ja),
+            ""
+        );
+        assert!(slot.is_none());
+
+        let first: Arc<[DictionaryEntry]> = Arc::from(vec![
+            entry("Claude Code", &["クロードコード"]),
+            entry("Murmur", &["マーマー"]),
+        ]);
+        let same_arc = Arc::clone(&first);
+        let t1 = VocabularyCache::get_or_compute(&mut slot, keywords_takes, &first, Language::Ja)
+            .to_owned();
+        assert_eq!(t1, "Claude Code=クロードコード\nMurmur=マーマー");
+        let ptr_after_first = slot.as_ref().unwrap().text.as_ptr();
+
+        // Same Arc (e.g. multiple ranges/chunks) reuses the cached string buffer in place.
+        let t2 =
+            VocabularyCache::get_or_compute(&mut slot, keywords_takes, &same_arc, Language::En)
+                .to_owned();
+        assert_eq!(t2, t1);
+        assert_eq!(slot.as_ref().unwrap().text.as_ptr(), ptr_after_first);
+
+        // Distinct Arc with identical contents also reuses the cached string buffer.
+        let equal_copy: Arc<[DictionaryEntry]> = Arc::from(first.to_vec());
+        assert!(!Arc::ptr_eq(&first, &equal_copy));
+        let _ =
+            VocabularyCache::get_or_compute(&mut slot, keywords_takes, &equal_copy, Language::Ja);
+        assert_eq!(slot.as_ref().unwrap().text.as_ptr(), ptr_after_first);
+
+        // Changed vocabulary invalidates the cache.
+        let changed: Arc<[DictionaryEntry]> = Arc::from(vec![entry("Murmur", &["マーマー"])]);
+        let t3 = VocabularyCache::get_or_compute(&mut slot, keywords_takes, &changed, Language::Ja);
+        assert_eq!(t3, "Murmur=マーマー");
+
+        // Prompt mode keys on language as well as vocabulary.
+        let prompt_takes = Takes {
+            language: true,
+            keywords: false,
+            prompt: true,
+        };
+        let mut prompt_slot = None;
+        assert_eq!(
+            VocabularyCache::get_or_compute(&mut prompt_slot, prompt_takes, &first, Language::Ja),
+            "Claude Code、Murmur"
+        );
+        assert_eq!(
+            VocabularyCache::get_or_compute(&mut prompt_slot, prompt_takes, &first, Language::En),
+            "Claude Code, Murmur"
+        );
+    }
+
+    #[test]
     fn api_version_matches_the_bindings() {
         assert_eq!(check_api_version(), Ok(()));
         // A submodule bump must also update ENGINE_NAME, which app_info shows.
@@ -842,7 +945,7 @@ mod tests {
                 language,
                 model: spec(model),
                 vad: spec(catalog::VAD_MODEL),
-                vocabulary,
+                vocabulary: Arc::from(vocabulary),
                 cancel: CancelToken::new(),
             }
         }
@@ -1013,7 +1116,7 @@ mod tests {
                         language: Language::Ja,
                         model: spec(catalog::DEFAULT_JA_MODEL),
                         vad: spec(catalog::VAD_MODEL),
-                        vocabulary: vec![],
+                        vocabulary: Arc::from([]),
                         cancel: CancelToken::new(),
                     },
                 );

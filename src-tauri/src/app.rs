@@ -65,7 +65,7 @@ impl Paths {
 
 pub struct App {
     paths: Paths,
-    settings: RwLock<Settings>,
+    settings: RwLock<Arc<Settings>>,
     pub(crate) settings_update: Mutex<()>,
     store: Arc<Store>,
     models: ModelStore,
@@ -100,7 +100,7 @@ impl App {
         };
         App {
             paths,
-            settings: RwLock::new(settings),
+            settings: RwLock::new(Arc::new(settings)),
             settings_update: Mutex::new(()),
             store: Arc::new(store),
             models,
@@ -114,15 +114,16 @@ impl App {
     }
 
     /// A snapshot of the settings. Read right before use, so changes apply at once.
-    pub fn settings(&self) -> Settings {
+    pub fn settings(&self) -> Arc<Settings> {
         match self.settings.read() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
+            Ok(guard) => Arc::clone(&guard),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
         }
     }
 
     /// Replaces the settings. Only `settings_apply` calls this.
     pub fn replace_settings(&self, settings: Settings) {
+        let settings = Arc::new(settings);
         match self.settings.write() {
             Ok(mut guard) => *guard = settings,
             Err(poisoned) => *poisoned.into_inner() = settings,

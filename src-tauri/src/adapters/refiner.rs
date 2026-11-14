@@ -35,7 +35,8 @@ use std::time::{Duration, Instant};
 use murmur_core::Millis;
 use murmur_core::ports::{CancelToken, GenerateRequest, Generated, RefineError, TextRefiner};
 use murmur_core::refine::{self, ChatMessage, RefineKind, RestartBudget};
-use serde_json::{Map, Value, json};
+use serde::Serialize;
+use serde_json::{Map, Value};
 
 /// The sidecar's file name next to the app executable (Tauri `bundle.externalBin`).
 pub const SIDECAR_NAME: &str = "murmur-llm";
@@ -409,9 +410,10 @@ impl Process {
     }
 
     /// Hands one request line to the writer thread. Never blocks.
-    fn send(&mut self, body: &Value) -> Result<(), CallError> {
+    fn send<T: Serialize>(&mut self, body: &T) -> Result<(), CallError> {
         let writer = self.writer.as_ref().ok_or(CallError::Exited)?;
-        let mut line = body.to_string().into_bytes();
+        let mut line = Vec::with_capacity(256);
+        serde_json::to_writer(&mut line, body).map_err(|_| CallError::Exited)?;
         line.push(b'\n');
         writer.send(line).map_err(|_| CallError::Exited)
     }
@@ -429,21 +431,17 @@ impl Process {
         }
     }
 
-    /// Sends `op` with `fields` and waits for its response until `deadline`, the session's cancel
+    /// Sends `request` and waits for its response until `deadline`, the session's cancel
     /// or the end of the lifecycle. Each of those cancels the request on the sidecar.
     fn call(
         &mut self,
-        op: &str,
-        fields: Map<String, Value>,
+        request: Request<'_>,
         deadline: Instant,
         session: Option<&CancelToken>,
         lifecycle: &CancelToken,
     ) -> Result<Map<String, Value>, CallError> {
         let id = self.take_id();
-        let mut body = fields;
-        body.insert("id".to_owned(), json!(id));
-        body.insert("op".to_owned(), json!(op));
-        self.send(&Value::Object(body))?;
+        self.send(&request.into_body(id))?;
         loop {
             let now = Instant::now();
             let why = if session.is_some_and(CancelToken::is_cancelled) {
@@ -476,7 +474,10 @@ impl Process {
         let until = Instant::now() + ms(refine::REFINER_CANCEL_REPLY_MS);
         let cancel_id = self.take_id();
         let answered = self
-            .send(&json!({"id": cancel_id, "op": "cancel", "target": id}))
+            .send(&RequestBody::Cancel {
+                id: cancel_id,
+                target: CancelTarget::Id(id),
+            })
             .is_ok()
             && loop {
                 let now = Instant::now();
@@ -559,13 +560,90 @@ fn number(response: &Map<String, Value>, key: &str) -> Option<f64> {
     response.get(key).and_then(Value::as_f64)
 }
 
-fn messages_json(messages: &[ChatMessage]) -> Value {
-    Value::Array(
-        messages
-            .iter()
-            .map(|m| json!({"role": m.role.as_str(), "content": m.content}))
-            .collect(),
-    )
+#[derive(Serialize)]
+struct WireMessage<'a> {
+    role: &'static str,
+    content: &'a str,
+}
+
+struct BorrowedMessages<'a>(&'a [ChatMessage]);
+
+impl Serialize for BorrowedMessages<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(|m| WireMessage {
+            role: m.role.as_str(),
+            content: &m.content,
+        }))
+    }
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum CancelTarget<'a> {
+    Id(u64),
+    Named(&'a str),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum RequestBody<'a> {
+    Cancel {
+        id: u64,
+        target: CancelTarget<'a>,
+    },
+    Load {
+        id: u64,
+        model: &'a str,
+        ctx: u32,
+    },
+    Warm {
+        id: u64,
+        messages: BorrowedMessages<'a>,
+    },
+    Generate {
+        id: u64,
+        messages: BorrowedMessages<'a>,
+        max_tokens: u32,
+    },
+}
+
+enum Request<'a> {
+    CancelStart,
+    Load {
+        model: &'a str,
+        ctx: u32,
+    },
+    Warm {
+        messages: &'a [ChatMessage],
+    },
+    Generate {
+        messages: &'a [ChatMessage],
+        max_tokens: u32,
+    },
+}
+
+impl<'a> Request<'a> {
+    fn into_body(self, id: u64) -> RequestBody<'a> {
+        match self {
+            Request::CancelStart => RequestBody::Cancel {
+                id,
+                target: CancelTarget::Named("start"),
+            },
+            Request::Load { model, ctx } => RequestBody::Load { id, model, ctx },
+            Request::Warm { messages } => RequestBody::Warm {
+                id,
+                messages: BorrowedMessages(messages),
+            },
+            Request::Generate {
+                messages,
+                max_tokens,
+            } => RequestBody::Generate {
+                id,
+                messages: BorrowedMessages(messages),
+                max_tokens,
+            },
+        }
+    }
 }
 
 // --- the service ---
@@ -600,6 +678,21 @@ impl Refiner {
             translate_error: error(RefineKind::Translate),
             clean_error: error(RefineKind::Clean),
         }
+    }
+
+    /// True when at least one sidecar slot has an idle process past `REFINER_IDLE_STOP_MS`.
+    /// Never blocks, so callers can skip spawning a blocking stop task when nothing is idle.
+    pub fn has_idle(&self) -> bool {
+        let cutoff = ms(refine::REFINER_IDLE_STOP_MS);
+        [RefineKind::Clean, RefineKind::Translate]
+            .into_iter()
+            .any(|step| {
+                self.inner
+                    .sidecar(step)
+                    .slot
+                    .try_lock()
+                    .is_ok_and(|slot| slot.process.is_some() && slot.last_used.elapsed() >= cutoff)
+            })
     }
 
     /// Stops the processes that have not been used for `REFINER_IDLE_STOP_MS` (D3). A busy
@@ -834,8 +927,7 @@ impl RefinerHandle {
         // No greeting in the protocol: a cancel with no target answers as soon as it runs.
         let handshake = process
             .call(
-                "cancel",
-                Map::from_iter([("target".to_owned(), json!("start"))]),
+                Request::CancelStart,
                 started + ms(refine::REFINER_START_TIMEOUT_MS),
                 session,
                 self.lifecycle(step),
@@ -845,16 +937,12 @@ impl RefinerHandle {
                 None => Ok(()),
             });
         let load = handshake.and_then(|()| {
-            let fields = Map::from_iter([
-                (
-                    "model".to_owned(),
-                    json!(model.to_string_lossy().into_owned()),
-                ),
-                ("ctx".to_owned(), json!(refine::context_tokens(step))),
-            ]);
+            let model_lossy = model.to_string_lossy();
             process.call(
-                "load",
-                fields,
+                Request::Load {
+                    model: &model_lossy,
+                    ctx: refine::context_tokens(step),
+                },
                 Instant::now() + ms(refine::REFINER_LOAD_TIMEOUT_MS),
                 session,
                 self.lifecycle(step),
@@ -907,9 +995,13 @@ impl TextRefiner for RefinerHandle {
         // The sidecar drops its old snapshot when a warm-up starts, whatever the outcome.
         slot.warmed = None;
         let deadline = Instant::now() + ms(refine::REFINER_WARM_TIMEOUT_MS);
-        let fields = Map::from_iter([("messages".to_owned(), messages_json(prefix))]);
         let result = match slot.process.as_mut() {
-            Some(process) => process.call("warm", fields, deadline, None, self.lifecycle(step)),
+            Some(process) => process.call(
+                Request::Warm { messages: prefix },
+                deadline,
+                None,
+                self.lifecycle(step),
+            ),
             None => Err(CallError::Exited),
         };
         slot.last_used = Instant::now();
@@ -943,14 +1035,12 @@ impl TextRefiner for RefinerHandle {
         self.ensure_running(step, &mut slot, Some(cancel))?;
         // The budget starts once the model is ready.
         let deadline = Instant::now() + ms(request.budget_ms);
-        let fields = Map::from_iter([
-            ("messages".to_owned(), messages_json(&request.messages)),
-            ("max_tokens".to_owned(), json!(request.max_tokens)),
-        ]);
         let result = match slot.process.as_mut() {
             Some(process) => process.call(
-                "generate",
-                fields,
+                Request::Generate {
+                    messages: &request.messages,
+                    max_tokens: request.max_tokens,
+                },
                 deadline,
                 Some(cancel),
                 self.lifecycle(step),
@@ -1012,6 +1102,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use murmur_core::refine::Glossary;
+    use serde_json::json;
 
     use super::*;
 

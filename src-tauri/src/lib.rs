@@ -241,7 +241,7 @@ fn on_tray(app: &AppHandle, services: &Arc<App>, action: TrayAction) {
         TrayAction::SetLanguage(language) => {
             let (app, services) = (app.clone(), services.clone());
             tauri::async_runtime::spawn_blocking(move || {
-                let mut settings = services.settings();
+                let mut settings = (*services.settings()).clone();
                 settings.language = language;
                 if let Err(error) = settings_apply::update(&app, &services, settings) {
                     tracing::warn!(%error, "language change from the tray failed");
@@ -310,8 +310,10 @@ fn spawn_idle_unload(services: Arc<App>) {
     tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(IDLE_CHECK).await;
-            let refiner = services.refiner().clone();
-            tauri::async_runtime::spawn_blocking(move || refiner.stop_idle());
+            if services.refiner().has_idle() {
+                let refiner = services.refiner().clone();
+                tauri::async_runtime::spawn_blocking(move || refiner.stop_idle());
+            }
             let busy = !matches!(
                 services.pill_state().view,
                 PillView::Hidden | PillView::Notice { .. }

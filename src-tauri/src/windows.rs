@@ -242,10 +242,10 @@ fn fit_glass_to_capsule(window: &NSWindow) {
     let Some(content) = window.contentView() else {
         return;
     };
-    let glass_classes: Vec<&AnyClass> = [c"NSGlassEffectView", c"NSVisualEffectView"]
-        .into_iter()
-        .filter_map(AnyClass::get)
-        .collect();
+    let glass_classes = [
+        AnyClass::get(c"NSGlassEffectView"),
+        AnyClass::get(c"NSVisualEffectView"),
+    ];
     let bounds = content.bounds();
     let (x, y, w, h) = capsule_rect(
         (0.0, 0.0, bounds.size.width, bounds.size.height),
@@ -256,7 +256,11 @@ fn fit_glass_to_capsule(window: &NSWindow) {
     // and its autoresizing constraints would widen the window to keep it.
     let hidden = w < PILL_MIN_WIDTH;
     for view in content.subviews().iter() {
-        if !glass_classes.iter().any(|class| view.isKindOfClass(class)) {
+        if !glass_classes
+            .into_iter()
+            .flatten()
+            .any(|class| view.isKindOfClass(class))
+        {
             continue;
         }
         let frame = view.frame();

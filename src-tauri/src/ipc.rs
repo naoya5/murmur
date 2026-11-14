@@ -138,7 +138,7 @@ pub fn app_info(services: Services<'_>) -> AppInfo {
 #[tauri::command]
 #[specta::specta]
 pub fn get_settings(services: Services<'_>) -> Settings {
-    services.settings()
+    (*services.settings()).clone()
 }
 
 #[tauri::command]
@@ -197,10 +197,9 @@ pub async fn list_history(
 ) -> Result<HistoryPage, IpcError> {
     let store = services.store().clone();
     blocking(move || {
-        let items = store
-            .list(&query, limit.min(500), offset)
+        let (items, total) = store
+            .list_page(&query, limit.min(500), offset)
             .map_err(store_err)?;
-        let total = store.count(&query).map_err(store_err)?;
         Ok(HistoryPage { items, total })
     })
     .await

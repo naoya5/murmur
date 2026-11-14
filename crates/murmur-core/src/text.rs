@@ -7,6 +7,7 @@
 //! Where: the controller calls `format` between the engine and the clipboard. Tests at the end.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use crate::Language;
 use crate::settings::DictionaryEntry;
@@ -152,7 +153,7 @@ fn phrase_core(text: &str) -> String {
 /// An empty text is not a hallucination; the caller reports it as an empty result.
 pub fn is_hallucination(text: &str) -> bool {
     let core = phrase_core(text);
-    !core.is_empty() && HALLUCINATIONS.iter().any(|h| phrase_core(h) == core)
+    !core.is_empty() && HALLUCINATIONS.contains(&core.as_str())
 }
 
 /// Formats raw model output. Pure and deterministic.
@@ -408,9 +409,17 @@ fn is_ja_boundary(c: char) -> bool {
     c.is_whitespace() || is_cjk_punct(c) || matches!(c, ',' | '.' | '!' | '?')
 }
 
+fn fillers_ja_chars() -> &'static [Vec<char>] {
+    static CACHE: OnceLock<Vec<Vec<char>>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut fillers: Vec<Vec<char>> = FILLERS_JA.iter().map(|f| f.chars().collect()).collect();
+        fillers.sort_by_key(|f| std::cmp::Reverse(f.len()));
+        fillers
+    })
+}
+
 fn remove_fillers_ja(chars: &[char]) -> Vec<char> {
-    let mut fillers: Vec<Vec<char>> = FILLERS_JA.iter().map(|f| f.chars().collect()).collect();
-    fillers.sort_by_key(|f| std::cmp::Reverse(f.len()));
+    let fillers = fillers_ja_chars();
 
     let mut out: Vec<char> = Vec::with_capacity(chars.len());
     let mut i = 0;
@@ -982,6 +991,13 @@ mod tests {
     /// A large user dictionary must not push the rules over their budget. The first-character
     /// index keeps the scan linear in the text, so 500 entries cost about the same as 4.
     /// Run with `cargo test -p murmur-core --release -- --ignored`.
+    #[test]
+    fn hallucination_constants_are_normalized() {
+        for &phrase in HALLUCINATIONS {
+            assert_eq!(phrase_core(phrase), phrase);
+        }
+    }
+
     #[test]
     #[ignore = "timing; run in release"]
     fn format_2000_chars_with_500_entries_under_2ms() {

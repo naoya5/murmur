@@ -192,7 +192,7 @@ pub async fn retry(
     let (model, vad) = services
         .model_specs(language)
         .ok_or(RetryError::ModelMissing)?;
-    let vocabulary = settings
+    let vocabulary: Arc<[murmur_core::settings::DictionaryEntry]> = settings
         .dictionary
         .iter()
         .filter(|e| e.scope.includes(language))

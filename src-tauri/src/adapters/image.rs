@@ -8,10 +8,11 @@ use std::ffi::c_void;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use objc2_core_foundation::{CFRetained, CFString, CFURL, CGPoint, CGRect, CGSize};
+use objc2_core_foundation::{CFData, CFRetained, CFString, CFURL, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
-    CGBitmapContextCreate, CGBitmapContextCreateImage, CGBitmapInfo, CGColorSpace, CGContext,
-    CGImage, CGImageAlphaInfo, CGImageByteOrderInfo, CGInterpolationQuality,
+    CGBitmapContextCreate, CGBitmapContextCreateImage, CGBitmapInfo, CGColorRenderingIntent,
+    CGColorSpace, CGContext, CGDataProvider, CGImage, CGImageAlphaInfo, CGImageByteOrderInfo,
+    CGInterpolationQuality,
 };
 use objc2_image_io::{CGImageDestination, CGImageSource};
 
@@ -46,21 +47,25 @@ impl std::fmt::Debug for Bitmap {
 
 impl Bitmap {
     /// A black, opaque bitmap.
-    pub fn new(width: usize, height: usize) -> Result<Bitmap, ImageError> {
+    fn zeroed(width: usize, height: usize) -> Result<Bitmap, ImageError> {
         let bytes = width
             .checked_mul(height)
             .and_then(|n| n.checked_mul(4))
             .filter(|n| *n > 0 && *n <= 512 * 1024 * 1024)
             .ok_or(ImageError::Size(width, height))?;
-        let mut bgra = vec![0u8; bytes];
-        for px in bgra.as_chunks_mut::<4>().0 {
-            px[3] = 255;
-        }
         Ok(Bitmap {
             width,
             height,
-            bgra,
+            bgra: vec![0u8; bytes],
         })
+    }
+
+    pub fn new(width: usize, height: usize) -> Result<Bitmap, ImageError> {
+        let mut bitmap = Bitmap::zeroed(width, height)?;
+        for px in bitmap.bgra.as_chunks_mut::<4>().0 {
+            px[3] = 255;
+        }
+        Ok(bitmap)
     }
 
     /// Copies rows of a BGRA buffer whose rows may be padded (`bytes_per_row >= width * 4`).
@@ -70,11 +75,16 @@ impl Bitmap {
         bytes_per_row: usize,
         data: &[u8],
     ) -> Result<Bitmap, ImageError> {
-        let mut bitmap = Bitmap::new(width, height)?;
-        let row = width * 4;
-        if bytes_per_row < row || data.len() < bytes_per_row * height {
+        let row = width
+            .checked_mul(4)
+            .ok_or(ImageError::Size(width, height))?;
+        let needed = bytes_per_row
+            .checked_mul(height)
+            .ok_or(ImageError::Size(width, height))?;
+        if bytes_per_row < row || data.len() < needed {
             return Err(ImageError::Size(width, height));
         }
+        let mut bitmap = Bitmap::zeroed(width, height)?;
         for (y, dst) in bitmap.bgra.chunks_exact_mut(row).enumerate() {
             let start = y * bytes_per_row;
             dst.copy_from_slice(&data[start..start + row]);
@@ -140,12 +150,52 @@ impl Canvas {
     fn image(&self) -> Result<CFRetained<CGImage>, ImageError> {
         CGBitmapContextCreateImage(Some(&self.ctx)).ok_or(ImageError::Context)
     }
+
+    /// Writes the drawn canvas directly as PNG with mode 0600, avoiding an extra bitmap clone.
+    pub fn write_png(&self, path: &Path) -> Result<(), ImageError> {
+        let image = self.image()?;
+        write_cg_image(&image, path)
+    }
 }
 
-/// A CoreGraphics image of the bitmap (copies the pixels).
+/// A CoreGraphics image of the bitmap, owned via CoreFoundation data without creating a canvas.
 pub fn cg_image(bitmap: &Bitmap) -> Result<CFRetained<CGImage>, ImageError> {
-    let canvas = Canvas::new(bitmap.clone())?;
-    canvas.image()
+    let bytes_per_row = bitmap
+        .width
+        .checked_mul(4)
+        .ok_or(ImageError::Size(bitmap.width, bitmap.height))?;
+    let expected = bytes_per_row
+        .checked_mul(bitmap.height)
+        .filter(|n| *n > 0 && *n <= 512 * 1024 * 1024)
+        .ok_or(ImageError::Size(bitmap.width, bitmap.height))?;
+    if bitmap.bgra.len() < expected {
+        return Err(ImageError::Size(bitmap.width, bitmap.height));
+    }
+    let space = CGColorSpace::new_device_rgb().ok_or(ImageError::Context)?;
+    let info = CGBitmapInfo(CGImageAlphaInfo::PremultipliedFirst.0)
+        | CGBitmapInfo(CGImageByteOrderInfo::Order32Little.0);
+    // CoreFoundation owns this single copy of the pixel bytes so `CGImage` stays valid even if
+    // `bitmap` is dropped before the image is encoded or drawn.
+    let data = CFData::from_bytes(&bitmap.bgra[..expected]);
+    let provider = CGDataProvider::with_cf_data(Some(&data)).ok_or(ImageError::Context)?;
+    // SAFETY: `provider` retains `data` (`expected == bytes_per_row * height` premultiplied BGRA
+    // bytes), and `decode` is NULL for default component mapping.
+    unsafe {
+        CGImage::new(
+            bitmap.width,
+            bitmap.height,
+            8,
+            32,
+            bytes_per_row,
+            Some(&space),
+            info,
+            Some(&provider),
+            std::ptr::null(),
+            true,
+            CGColorRenderingIntent::RenderingIntentDefault,
+        )
+    }
+    .ok_or(ImageError::Context)
 }
 
 /// Writes the bitmap as PNG with mode 0600. The parent folder must exist.
@@ -267,6 +317,101 @@ mod tests {
         assert_eq!(back.pixel(2, 2), Some((255, 0, 0, 255)));
         assert_eq!(back.pixel(2, 8), Some((255, 255, 255, 255)));
         assert!(read_png(&dir.join("missing.png")).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cg_image_and_png_preserve_bgra_order_alpha_and_lifetime() {
+        let mut bitmap = Bitmap::new(4, 2).unwrap();
+        // Row 0: pure red, green, blue, and mixed RGB (verifies BGRA byte order).
+        // Row 1: exact premultiplied multiples (gcd(alpha, 255) factors) so PNG unpremultiply ->
+        // re-premultiply round-trips without rounding drift, plus transparent black.
+        let pixels: [(u8, u8, u8, u8); 8] = [
+            (255, 0, 0, 255),
+            (0, 255, 0, 255),
+            (0, 0, 255, 255),
+            (12, 34, 56, 255),
+            (40, 80, 160, 200),
+            (34, 68, 136, 170),
+            (0, 0, 0, 0),
+            (240, 240, 240, 255),
+        ];
+        for (i, (r, g, b, a)) in pixels.iter().enumerate() {
+            let off = i * 4;
+            bitmap.bgra[off..off + 4].copy_from_slice(&[*b, *g, *r, *a]);
+        }
+
+        // Drop `bitmap` before encoding `CGImage` to prove CFData ownership is self-contained.
+        let dir = scratch();
+        let path = dir.join("bgra.png");
+        let image = {
+            let owned = bitmap.clone();
+            cg_image(&owned).unwrap()
+        };
+        assert_eq!(CGImage::width(Some(&image)), 4);
+        assert_eq!(CGImage::height(Some(&image)), 2);
+        assert_eq!(CGImage::bits_per_component(Some(&image)), 8);
+        assert_eq!(CGImage::bits_per_pixel(Some(&image)), 32);
+        assert_eq!(CGImage::bytes_per_row(Some(&image)), 16);
+
+        write_cg_image(&image, &path).unwrap();
+
+        // `read_png` composites onto an opaque black `Bitmap`, preserving opaque BGRA order.
+        let back = read_png(&path).unwrap();
+        assert_eq!((back.width, back.height), (4, 2));
+        for (i, &(r, g, b, a)) in pixels.iter().enumerate().take(4) {
+            assert_eq!(back.pixel(i, 0), Some((r, g, b, a)));
+        }
+
+        // Decode the written PNG onto a cleared transparent canvas to verify alpha survives PNG
+        // round-tripping too.
+        let url = CFURL::from_file_path(&path).unwrap();
+        let decoded = unsafe {
+            let src = CGImageSource::with_url(&url, None).unwrap();
+            CGImageSource::image_at_index(&src, 0, None).unwrap()
+        };
+        let canvas = Canvas::new(Bitmap {
+            width: 4,
+            height: 2,
+            bgra: vec![0; 4 * 2 * 4],
+        })
+        .unwrap();
+        let ctx = canvas.ctx();
+        CGContext::translate_ctm(Some(ctx), 0.0, 2.0);
+        CGContext::scale_ctm(Some(ctx), 1.0, -1.0);
+        CGContext::set_interpolation_quality(Some(ctx), CGInterpolationQuality::None);
+        CGContext::draw_image(
+            Some(ctx),
+            CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(4.0, 2.0)),
+            Some(&decoded),
+        );
+        let alpha_back = canvas.into_bitmap();
+        for (i, &(r, g, b, a)) in pixels.iter().enumerate() {
+            let (x, y) = (i % 4, i / 4);
+            assert_eq!(
+                alpha_back.pixel(x, y),
+                Some((r, g, b, a)),
+                "pixel mismatch at ({x}, {y})"
+            );
+        }
+
+        // Reject malformed dimensions or short buffers cleanly.
+        assert!(matches!(
+            cg_image(&Bitmap {
+                width: 0,
+                height: 2,
+                bgra: vec![],
+            }),
+            Err(ImageError::Size(0, 2))
+        ));
+        assert!(matches!(
+            cg_image(&Bitmap {
+                width: 2,
+                height: 2,
+                bgra: vec![0; 12],
+            }),
+            Err(ImageError::Size(2, 2))
+        ));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

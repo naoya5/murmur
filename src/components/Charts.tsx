@@ -1,5 +1,5 @@
 // Hand-drawn SVG; the app adds no chart library.
-import { useId, useLayoutEffect, useRef, useState } from "react";
+import { useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { Locale } from "../i18n";
 import type { DayPoint } from "../ipc";
 import { formatMonth, formatShortDay, parseDay } from "../lib/format";
@@ -113,11 +113,13 @@ type TrendProps = {
   measure?: (d: DayPoint) => number;
 };
 
+const DEFAULT_MEASURE = (d: DayPoint) => d.sessions;
+
 /**
  * A line of light over an amber haze. One point is lit: the hovered day, or today when the
  * pointer is away, with a dashed cursor and a glass tip that shows its value.
  */
-export function Trend({ days, locale, label, measure = (d) => d.sessions }: TrendProps) {
+export function Trend({ days, locale, label, measure = DEFAULT_MEASURE }: TrendProps) {
   // The host's size comes from the layout (it grows with the hero on a tall window); the SVG
   // is drawn to fill it.
   const [hostRef, size] = useMeasuredSize<HTMLDivElement>({ width: 480, height: 128 });
@@ -126,26 +128,53 @@ export function Trend({ days, locale, label, measure = (d) => d.sessions }: Tren
   const hazeId = `${useId().replace(/:/g, "")}-haze`;
   const glowId = `${hazeId}-glow`;
 
-  const labelH = 18;
-  const chartH = Math.max(64, size.height - labelH);
-  const padTop = 14;
-  const padX = 8;
-  const n = days.length;
-  if (n === 0) {
+  const geometry = useMemo(() => {
+    const labelH = 18;
+    const chartH = Math.max(64, size.height - labelH);
+    const padTop = 14;
+    const padX = 8;
+    const n = days.length;
+    if (n === 0) {
+      return null;
+    }
+    const values = days.map(measure);
+    const max = Math.max(1, ...values);
+    const span = Math.max(1, width - padX * 2);
+    const xAt = (i: number) => (n === 1 ? width / 2 : padX + (i / (n - 1)) * span);
+    const yAt = (v: number) => padTop + (1 - v / max) * (chartH - padTop - 3);
+    const xs = days.map((_, i) => xAt(i));
+    const ys = values.map(yAt);
+    const points = xs.map((x, i) => `${x.toFixed(1)},${ys[i].toFixed(1)}`).join(" ");
+    const area = `${xs[0].toFixed(1)},${chartH} ${points} ${xs[n - 1].toFixed(1)},${chartH}`;
+    const lastIndex = n - 1;
+    const midIndex = Math.floor(lastIndex / 2);
+    const labels: {
+      date: string;
+      x: number;
+      text: string;
+      anchor: "start" | "end" | "middle";
+    }[] = [];
+    for (let i = 0; i < n; i++) {
+      if (i === 0 || i === lastIndex || i === midIndex) {
+        labels.push({
+          date: days[i].date,
+          x: xs[i],
+          text: formatShortDay(parseDay(days[i].date), locale),
+          anchor: i === 0 ? "start" : i === lastIndex ? "end" : "middle",
+        });
+      }
+    }
+    return { labelH, chartH, padX, span, lastIndex, values, xs, ys, points, area, labels };
+  }, [days, locale, measure, size.height, width]);
+
+  if (!geometry) {
     return null;
   }
-  const values = days.map(measure);
-  const max = Math.max(1, ...values);
-  const span = Math.max(1, width - padX * 2);
-  const xAt = (i: number) => (n === 1 ? width / 2 : padX + (i / (n - 1)) * span);
-  const yAt = (v: number) => padTop + (1 - v / max) * (chartH - padTop - 3);
-  const points = values.map((v, i) => `${xAt(i).toFixed(1)},${yAt(v).toFixed(1)}`).join(" ");
-  const area = `${xAt(0).toFixed(1)},${chartH} ${points} ${xAt(n - 1).toFixed(1)},${chartH}`;
 
-  const lastIndex = n - 1;
+  const { labelH, chartH, padX, span, lastIndex, values, xs, ys, points, area, labels } = geometry;
   const active = hover ?? lastIndex;
-  const activeX = xAt(active);
-  const activeY = yAt(values[active] ?? 0);
+  const activeX = xs[active] ?? xs[lastIndex];
+  const activeY = ys[active] ?? ys[lastIndex];
   const activeDay = days[active];
   // The tip sits above the point, or below it when the point is near the top edge.
   const tipBelow = activeY < 48;
@@ -153,8 +182,9 @@ export function Trend({ days, locale, label, measure = (d) => d.sessions }: Tren
 
   const onPointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
     const box = e.currentTarget.getBoundingClientRect();
-    const index = Math.round(((e.clientX - box.left - padX) / span) * (n - 1));
-    setHover(Math.min(lastIndex, Math.max(0, index)));
+    const index = Math.round(((e.clientX - box.left - padX) / span) * lastIndex);
+    const next = Math.min(lastIndex, Math.max(0, index));
+    setHover((prev) => (prev === next ? prev : next));
   };
 
   return (
@@ -192,23 +222,17 @@ export function Trend({ days, locale, label, measure = (d) => d.sessions }: Tren
         />
         <circle className="trend__ring" cx={activeX} cy={activeY} r={7} />
         <circle className="trend__point" cx={activeX} cy={activeY} r={3.5} />
-        {days.map((d, i) => {
-          const showLabel = i === 0 || i === lastIndex || i === Math.floor(lastIndex / 2);
-          if (!showLabel) {
-            return null;
-          }
-          return (
-            <text
-              key={d.date}
-              className="trend__label"
-              x={xAt(i)}
-              y={chartH + labelH - 3}
-              textAnchor={i === 0 ? "start" : i === lastIndex ? "end" : "middle"}
-            >
-              {formatShortDay(parseDay(d.date), locale)}
-            </text>
-          );
-        })}
+        {labels.map((item) => (
+          <text
+            key={item.date}
+            className="trend__label"
+            x={item.x}
+            y={chartH + labelH - 3}
+            textAnchor={item.anchor}
+          >
+            {item.text}
+          </text>
+        ))}
       </svg>
       {activeDay && (
         <div

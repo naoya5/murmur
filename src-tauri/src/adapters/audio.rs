@@ -652,7 +652,7 @@ fn converter_main(
             if let Err(e) = converter.push(&raw[..popped], &mut converted) {
                 first_error.get_or_insert(e);
             }
-            append(
+            if !append(
                 &converted,
                 shared,
                 &mut spool,
@@ -661,7 +661,9 @@ fn converter_main(
                 tap,
                 &mut first_error,
                 &mut spool_bytes,
-            );
+            ) {
+                return Ok(());
+            }
         }
         if shared.failed.load(Ordering::Acquire)
             && !disconnected_sent
@@ -723,7 +725,7 @@ fn converter_main(
 }
 
 /// Appends converted 16 kHz samples to the PCM buffer and the spool, feeds the level meter and
-/// the tap.
+/// the tap. Returns `false` if the recording was already taken/aborted.
 #[allow(clippy::too_many_arguments)]
 fn append(
     converted: &[f32],
@@ -734,9 +736,9 @@ fn append(
     tap: TapRef<'_>,
     first_error: &mut Option<AudioError>,
     bytes: &mut Vec<u8>,
-) {
+) -> bool {
     if converted.is_empty() {
-        return;
+        return true;
     }
     {
         let mut captured = shared
@@ -744,7 +746,7 @@ fn append(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(pcm) = captured.as_mut() else {
-            return;
+            return false;
         };
         pcm.extend_from_slice(converted);
     }
@@ -759,6 +761,7 @@ fn append(
     if let Err(e) = spool.write_all(bytes) {
         first_error.get_or_insert(AudioError::Io(e.to_string()));
     }
+    // Re-check after writing the spool: a converter timeout fences late level events by taking `pcm`.
     if shared
         .pcm
         .lock()
@@ -766,6 +769,9 @@ fn append(
         .is_some()
     {
         meter.feed(converted, |level| on_event(AudioEvent::Level(level)));
+        true
+    } else {
+        false
     }
 }
 
@@ -799,6 +805,7 @@ struct Converter {
     /// Mono samples at the source rate waiting for a full resampler chunk.
     pending: Vec<f32>,
     out_buf: Vec<f32>,
+    tail_buf: Vec<f32>,
     /// Output frames still to drop (the resampler's start-up delay).
     delay_left: usize,
     in_frames: u64,
@@ -831,6 +838,7 @@ impl Converter {
             resampler,
             pending: Vec::new(),
             out_buf,
+            tail_buf: Vec::new(),
             delay_left,
             in_frames: 0,
             out_frames: 0,
@@ -885,9 +893,10 @@ impl Converter {
             }
             let need = rs.input_frames_next();
             let partial = self.pending.len().min(need);
-            let mut padded = vec![0.0_f32; need];
-            padded[..partial].copy_from_slice(&self.pending[..partial]);
-            let input = InterleavedSlice::new(&padded, 1, need)
+            self.tail_buf.clear();
+            self.tail_buf.resize(need, 0.0);
+            self.tail_buf[..partial].copy_from_slice(&self.pending[..partial]);
+            let input = InterleavedSlice::new(&self.tail_buf, 1, need)
                 .map_err(|e| AudioError::Device(e.to_string()))?;
             let cap = self.out_buf.len();
             let mut output = InterleavedSlice::new_mut(&mut self.out_buf, 1, cap)

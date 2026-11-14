@@ -53,14 +53,15 @@ function useWaveform(active: boolean, reducedMotion: boolean): number[] {
       return;
     }
     smoothed.current = smoothLevel(smoothed.current, level);
-    pending.current = [...pending.current.slice(1), smoothed.current];
+    pending.current.shift();
+    pending.current.push(smoothed.current);
     if (reducedMotion) {
       return;
     }
     if (!frame.current) {
       frame.current = window.requestAnimationFrame(() => {
         frame.current = 0;
-        setBars(pending.current);
+        setBars([...pending.current]);
       });
     }
   });
