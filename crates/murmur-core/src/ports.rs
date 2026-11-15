@@ -60,7 +60,7 @@ pub struct TranscribeOptions {
     pub language: Language,
     /// Dictionary entries for this language. Engines that cannot use them ignore them; the text
     /// rules still apply replacements for English.
-    pub vocabulary: Vec<DictionaryEntry>,
+    pub vocabulary: Arc<[DictionaryEntry]>,
     pub cancel: CancelToken,
 }
 

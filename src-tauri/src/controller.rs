@@ -24,6 +24,7 @@ use murmur_core::session::{
     DeliveryOutcome, Effect, Event, FailureKind, Machine, Notice, Paused, PillView, PlanCounts,
     RefineOutcome, SessionId, SessionKind, State, TranscribeOutcome, TranscriptText,
 };
+use murmur_core::settings::{DictionaryEntry, Settings};
 use murmur_core::text::{self, FormatOptions};
 use serde::Serialize;
 use specta::Type;
@@ -578,7 +579,7 @@ impl Controller {
     fn execute(&mut self, effect: Effect) {
         self.cue(&effect);
         match effect {
-            Effect::StartCapture { session } => self.start_capture(session),
+            Effect::StartCapture { session, kind } => self.start_capture(session, kind),
             Effect::PauseCapture { session } => self.set_paused(session, true),
             Effect::ResumeCapture { session } => self.set_paused(session, false),
             Effect::StopCapture { session } => {
@@ -685,13 +686,12 @@ impl Controller {
         let kind = plan.kind;
         let mut refiner = self.services.refiner().handle();
         let settings = self.services.settings();
-        let dictionary = settings.dictionary;
         let Some(ctx) = self.sessions.get_mut(&session) else {
             return;
         };
         let refine = ctx.refine.get_or_insert_with(|| RefineCtx {
             kind,
-            glossary: Glossary::new(&dictionary),
+            glossary: Glossary::new(&settings.dictionary),
             cancel: CancelToken::new(),
             pre_refine_text: None,
             steps: Vec::new(),
@@ -767,7 +767,7 @@ impl Controller {
         }
     }
 
-    fn start_capture(&mut self, session: SessionId) {
+    fn start_capture(&mut self, session: SessionId, kind: SessionKind) {
         let settings = self.services.settings();
         let language = self.language_override.take().unwrap_or(settings.language);
         self.last_language = language;
@@ -782,7 +782,7 @@ impl Controller {
         // The dictionary is read here, once per recording, so every chunk uses the same words.
         // An annotation session is transcribed per segment at stop instead; it only warms the
         // model here.
-        let annotation = self.machine.active_kind() == Some(SessionKind::Annotation);
+        let annotation = kind == SessionKind::Annotation;
         if annotation && let Some((model, vad)) = self.services.model_specs(language) {
             self.services.inference().warm(model, vad);
         }
@@ -793,12 +793,7 @@ impl Controller {
             // Warm before the stream starts, overlapping the cold engine work with the user's speech.
             self.services.inference().warm(model.clone(), vad.clone());
             let id = StreamId(session.0);
-            let vocabulary = settings
-                .dictionary
-                .iter()
-                .filter(|e| e.scope.includes(language))
-                .cloned()
-                .collect();
+            let vocabulary = scoped_vocabulary(&settings, language);
             self.services.inference().stream_start(
                 id,
                 StreamRequest {
@@ -959,12 +954,7 @@ impl Controller {
             let result = match pcm {
                 Some(pcm) => {
                     let settings = services.settings();
-                    let vocabulary = settings
-                        .dictionary
-                        .iter()
-                        .filter(|e| e.scope.includes(language))
-                        .cloned()
-                        .collect();
+                    let vocabulary = scoped_vocabulary(&settings, language);
                     match services.model_specs(language) {
                         Some((model, vad)) => {
                             let loading =
@@ -1475,12 +1465,7 @@ impl Controller {
                 return;
             }
             let settings = services.settings();
-            let vocabulary = settings
-                .dictionary
-                .iter()
-                .filter(|e| e.scope.includes(language))
-                .cloned()
-                .collect();
+            let vocabulary = scoped_vocabulary(&settings, language);
             let loading = services.inference().loaded_model() != Some(model.entry.id);
             if loading {
                 let _ = tx.send(Msg::Core(Event::ModelLoading { session }));
@@ -2004,6 +1989,16 @@ impl Controller {
             }
         }
     }
+}
+
+/// Filters the user's dictionary entries down to `language` as a shared slice.
+fn scoped_vocabulary(settings: &Settings, language: Language) -> Arc<[DictionaryEntry]> {
+    settings
+        .dictionary
+        .iter()
+        .filter(|e| e.scope.includes(language))
+        .cloned()
+        .collect()
 }
 
 /// What the plan sees when there was no screen capture at all.

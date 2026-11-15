@@ -179,7 +179,7 @@ pub fn install(
                 Some(()) = toggle.recv() => {
                     let (app, services) = (app.clone(), services.clone());
                     tauri::async_runtime::spawn_blocking(move || {
-                        let mut settings = services.settings();
+                        let mut settings = (*services.settings()).clone();
                         settings.annotations_enabled = !settings.annotations_enabled;
                         let enabled = settings.annotations_enabled;
                         match crate::settings_apply::update(&app, &services, settings) {

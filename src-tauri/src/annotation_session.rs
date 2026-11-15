@@ -45,6 +45,10 @@ pub struct AnnotationCtx {
     pub frame_of_sample: Vec<usize>,
     /// Frame indices written to `candidates/`.
     pub kept: BTreeSet<usize>,
+    /// Incrementally maintained ink groups matching `ann::ink_groups(&self.signals)`.
+    ink_groups: Vec<ann::InkGroup>,
+    ink_groups_dirty: bool,
+    last_group_has_sample: bool,
     pub shift_held: bool,
     pub screen_failed: bool,
     /// The app in front at the hotkey: where the bundle is pasted. Taken at delivery.
@@ -115,6 +119,9 @@ impl AnnotationCtx {
             signals: Signals::default(),
             frame_of_sample: Vec::new(),
             kept: BTreeSet::new(),
+            ink_groups: Vec::new(),
+            ink_groups_dirty: false,
+            last_group_has_sample: false,
             shift_held: false,
             screen_failed: false,
             front: None,
@@ -132,7 +139,8 @@ impl AnnotationCtx {
     pub fn images(&self) -> u32 {
         match &self.plan {
             Some(plan) => plan.selection.keyframes.len() as u32,
-            None => ann::ink_groups(&self.signals).len() as u32,
+            None if self.ink_groups_dirty => ann::ink_groups(&self.signals).len() as u32,
+            None => self.ink_groups.len() as u32,
         }
     }
 
@@ -141,6 +149,14 @@ impl AnnotationCtx {
         let Some(t_ms) = self.clock.recording_from_wall(frame.t_ms) else {
             return false;
         };
+        if self
+            .signals
+            .strokes
+            .last()
+            .is_some_and(|last| t_ms <= last.t1_ms)
+        {
+            self.ink_groups_dirty = true;
+        }
         self.signals.samples.push(ScreenSample {
             t_ms,
             cells: frame.cells,
@@ -176,18 +192,55 @@ impl AnnotationCtx {
         if points.is_empty() {
             return false;
         }
-        let groups_before = ann::ink_groups(&self.signals).len();
+        let t1_ms = t1_ms.max(t0_ms);
+        let out_of_order = self.ink_groups_dirty
+            || self
+                .signals
+                .strokes
+                .last()
+                .is_some_and(|last| t0_ms < last.t1_ms);
+        let groups_before = if self.ink_groups_dirty {
+            ann::ink_groups(&self.signals).len()
+        } else {
+            self.ink_groups.len()
+        };
+        let index = self.signals.strokes.len();
         self.signals.strokes.push(InkStroke {
             t0_ms,
-            t1_ms: t1_ms.max(t0_ms),
+            t1_ms,
             points: points.into_iter().map(|p| (p.x, p.y)).collect(),
         });
-        for sample in ann::ink_samples(&self.signals) {
-            if let Some(frame) = self.frame_of_sample.get(sample).copied() {
-                self.keep(frame);
+        if out_of_order {
+            self.ink_groups = ann::ink_groups(&self.signals);
+            self.ink_groups_dirty = false;
+            self.last_group_has_sample = self
+                .ink_groups
+                .last()
+                .is_some_and(|g| ann::sample_before(&self.signals.samples, g.t0_ms).is_some());
+            for i in 0..self.ink_groups.len() {
+                let t0_ms = self.ink_groups[i].t0_ms;
+                if let Some(sample) = ann::sample_before(&self.signals.samples, t0_ms)
+                    && let Some(frame) = self.frame_of_sample.get(sample).copied()
+                {
+                    self.keep(frame);
+                }
+            }
+        } else {
+            ann::push_ink_group(&mut self.ink_groups, &self.signals, index);
+            if self.ink_groups.len() > groups_before {
+                self.last_group_has_sample = false;
+            }
+            if !self.last_group_has_sample
+                && let Some(group) = self.ink_groups.last()
+                && let Some(sample) = ann::sample_before(&self.signals.samples, group.t0_ms)
+            {
+                self.last_group_has_sample = true;
+                if let Some(frame) = self.frame_of_sample.get(sample).copied() {
+                    self.keep(frame);
+                }
             }
         }
-        ann::ink_groups(&self.signals).len() != groups_before
+        self.ink_groups.len() != groups_before
     }
 
     /// Asks the screen adapter to keep a picture as a candidate PNG, once.
@@ -605,5 +658,180 @@ mod tests {
             total_samples: 0,
         };
         assert!(!planned.pictures_wanted());
+    }
+
+    struct ScratchDir(std::path::PathBuf);
+
+    impl ScratchDir {
+        fn new(name: &str) -> Self {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "murmur_ann_sess_test_{name}_{}_{id}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn sync_and_check_equivalence(ctx: &AnnotationCtx) {
+        let expected_groups = ann::ink_groups(&ctx.signals);
+        assert_eq!(ctx.ink_groups, expected_groups);
+        assert_eq!(ctx.images(), expected_groups.len() as u32);
+        let expected_last_sample = expected_groups
+            .last()
+            .is_some_and(|g| ann::sample_before(&ctx.signals.samples, g.t0_ms).is_some());
+        assert_eq!(ctx.last_group_has_sample, expected_last_sample);
+        assert!(!ctx.ink_groups_dirty);
+    }
+
+    #[test]
+    fn incremental_ink_groups_match_full_recompute_across_groups_changes_and_out_of_order() {
+        const EPOCH0: f64 = 1_000_000.0;
+        let dir = ScratchDir::new("equiv");
+        let mut ctx = AnnotationCtx::new(
+            &dir.0,
+            1_000,
+            1,
+            RecordingClock::new(std::time::Instant::now(), EPOCH0),
+        )
+        .unwrap();
+
+        // Stroke arrives before any screen frame: group 0 exists, unresolved sample.
+        assert!(ctx.on_stroke(
+            vec![InkPoint { x: 0.1, y: 0.1 }],
+            EPOCH0 + 200.0,
+            EPOCH0 + 300.0
+        ));
+        sync_and_check_equivalence(&ctx);
+
+        // Frame 0 arrives with t_ms before group 0 -> invalidates/resolves via dirty fallback on next stroke.
+        ctx.on_frame(Frame {
+            index: 0,
+            t_ms: 100,
+            cells: vec![0.0; 16],
+        });
+        assert!(ctx.ink_groups_dirty);
+
+        // Nearby stroke merges into group 0 and resolves dirty state.
+        ctx.on_stroke(
+            vec![InkPoint { x: 0.2, y: 0.2 }],
+            EPOCH0 + 350.0,
+            EPOCH0 + 420.0,
+        );
+        sync_and_check_equivalence(&ctx);
+
+        // Frame 1 with screen change and t_ms after current last group does not invalidate cache.
+        ctx.on_frame(Frame {
+            index: 1,
+            t_ms: 1_000,
+            cells: vec![0.5; 16],
+        });
+        assert!(!ctx.ink_groups_dirty);
+
+        // Frame 2 with large screen change after group 0 splits/creates a new group after gap.
+        ctx.on_frame(Frame {
+            index: 2,
+            t_ms: 5_000,
+            cells: vec![1.0; 16],
+        });
+        assert!(!ctx.ink_groups_dirty);
+
+        assert!(ctx.on_stroke(
+            vec![InkPoint { x: 0.5, y: 0.5 }],
+            EPOCH0 + 5_200.0,
+            EPOCH0 + 5_300.0
+        ));
+        sync_and_check_equivalence(&ctx);
+        assert_eq!(ctx.ink_groups.len(), 2);
+
+        // Same screen within short gap merges into group 1.
+        assert!(!ctx.on_stroke(
+            vec![InkPoint { x: 0.6, y: 0.6 }],
+            EPOCH0 + 5_350.0,
+            EPOCH0 + 5_400.0
+        ));
+        sync_and_check_equivalence(&ctx);
+        assert_eq!(ctx.ink_groups.len(), 2);
+
+        // Large screen change inside a short pause creates group 2.
+        ctx.on_frame(Frame {
+            index: 3,
+            t_ms: 5_500,
+            cells: vec![0.0; 16],
+        });
+        assert!(ctx.on_stroke(
+            vec![InkPoint { x: 0.7, y: 0.7 }],
+            EPOCH0 + 5_600.0,
+            EPOCH0 + 5_700.0
+        ));
+        sync_and_check_equivalence(&ctx);
+        assert_eq!(ctx.ink_groups.len(), 3);
+
+        // Out-of-order stroke falls back cleanly to full rebuild and still matches ann::ink_groups.
+        ctx.on_stroke(
+            vec![InkPoint { x: 0.3, y: 0.3 }],
+            EPOCH0 + 2_500.0,
+            EPOCH0 + 2_600.0,
+        );
+        sync_and_check_equivalence(&ctx);
+        assert_eq!(ctx.ink_groups.len(), 4);
+    }
+
+    #[test]
+    fn incremental_on_stroke_does_not_rekeep_earlier_groups() {
+        const EPOCH0: f64 = 1_000_000.0;
+        let dir = ScratchDir::new("no_rekeep");
+        let (capture, shared) =
+            crate::adapters::screen::test_capture_for_dir(dir.0.join("candidates"));
+        let mut ctx = AnnotationCtx::new(
+            &dir.0,
+            1_000,
+            2,
+            RecordingClock::new(std::time::Instant::now(), EPOCH0),
+        )
+        .unwrap();
+        ctx.screen = Some(capture);
+
+        let bmp = crate::adapters::image::Bitmap::new(4, 4).unwrap();
+        shared.push(vec![0.0; 16], bmp.clone());
+        ctx.on_frame(Frame {
+            index: 0,
+            t_ms: 100,
+            cells: vec![0.0; 16],
+        });
+
+        assert!(ctx.on_stroke(
+            vec![InkPoint { x: 0.1, y: 0.1 }],
+            EPOCH0 + 200.0,
+            EPOCH0 + 300.0
+        ));
+        assert_eq!(ctx.kept.len(), 1);
+
+        // Clear recorded kept list to detect any redundant `keep` calls on earlier groups.
+        ctx.kept.clear();
+
+        shared.push(vec![1.0; 16], bmp);
+        ctx.on_frame(Frame {
+            index: 1,
+            t_ms: 10_000,
+            cells: vec![1.0; 16],
+        });
+
+        assert!(ctx.on_stroke(
+            vec![InkPoint { x: 0.9, y: 0.9 }],
+            EPOCH0 + 10_200.0,
+            EPOCH0 + 10_300.0
+        ));
+        assert_eq!(ctx.ink_groups.len(), 2);
+        // Only the new group (index 1) should trigger a `keep`, never group 0 again.
+        assert_eq!(ctx.kept.len(), 1);
     }
 }

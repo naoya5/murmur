@@ -152,25 +152,33 @@ pub struct InkGroup {
     pub t1_ms: Millis,
 }
 
+/// Incrementally adds `signals.strokes[index]` to `groups` using the group-splitting rules.
+pub fn push_ink_group(groups: &mut Vec<InkGroup>, signals: &Signals, index: usize) {
+    let Some(stroke) = signals.strokes.get(index) else {
+        return;
+    };
+    let joins = groups.last().is_some_and(|g| {
+        stroke.t0_ms.saturating_sub(g.t1_ms) <= INK_GROUP_GAP_MS
+            && change_between(signals, g.t1_ms, stroke.t0_ms) < SAME_SCREEN_CHANGE_MAX
+    });
+    match groups.last_mut() {
+        Some(g) if joins => {
+            g.last = index;
+            g.t1_ms = g.t1_ms.max(stroke.t1_ms);
+        }
+        _ => groups.push(InkGroup {
+            first: index,
+            last: index,
+            t0_ms: stroke.t0_ms,
+            t1_ms: stroke.t1_ms,
+        }),
+    }
+}
+
 pub fn ink_groups(signals: &Signals) -> Vec<InkGroup> {
     let mut groups: Vec<InkGroup> = Vec::new();
-    for (i, stroke) in signals.strokes.iter().enumerate() {
-        let joins = groups.last().is_some_and(|g| {
-            stroke.t0_ms.saturating_sub(g.t1_ms) <= INK_GROUP_GAP_MS
-                && change_between(signals, g.t1_ms, stroke.t0_ms) < SAME_SCREEN_CHANGE_MAX
-        });
-        match groups.last_mut() {
-            Some(g) if joins => {
-                g.last = i;
-                g.t1_ms = g.t1_ms.max(stroke.t1_ms);
-            }
-            _ => groups.push(InkGroup {
-                first: i,
-                last: i,
-                t0_ms: stroke.t0_ms,
-                t1_ms: stroke.t1_ms,
-            }),
-        }
+    for i in 0..signals.strokes.len() {
+        push_ink_group(&mut groups, signals, i);
     }
     groups
 }

@@ -15,6 +15,7 @@ use std::time::Duration;
 use murmur_core::Language;
 use murmur_core::metrics::{Counts, DayTotals};
 use murmur_core::refine::{RefineKind, RefineStatus};
+use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
@@ -75,7 +76,12 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE transcripts ADD COLUMN refine_ms INTEGER;",
 ];
 
-const ANNOTATION_COLUMNS: &str = "id, created_at, status, folder, duration_ms, keyframes, marks,                                   language, model_id, latency_ms, asr_ms, compose_ms, error";
+macro_rules! annotation_columns {
+    () => {
+        "id, created_at, status, folder, duration_ms, keyframes, marks, \
+         language, model_id, latency_ms, asr_ms, compose_ms, error"
+    };
+}
 
 /// How an annotation bundle ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
@@ -132,9 +138,13 @@ pub struct AnnotationRow {
     pub error: Option<String>,
 }
 
-const COLUMNS: &str = "id, created_at, status, text, raw_text, language, duration_ms, latin_words, \
-                       cjk_chars, model_id, latency_ms, asr_ms, audio_path, error, refine_kind, \
-                       refine_status, pre_refine_text, refine_model_id, refine_ms";
+macro_rules! columns {
+    () => {
+        "id, created_at, status, text, raw_text, language, duration_ms, latin_words, \
+         cjk_chars, model_id, latency_ms, asr_ms, audio_path, error, refine_kind, \
+         refine_status, pre_refine_text, refine_model_id, refine_ms"
+    };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "snake_case")]
@@ -282,30 +292,32 @@ impl Store {
     }
 
     fn insert_on(conn: &Connection, row: &TranscriptRow) -> Result<(), StoreError> {
-        conn.execute(
-            &format!("INSERT INTO transcripts ({COLUMNS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)"),
-            params![
-                row.id,
-                row.created_at_ms,
-                row.status.as_str(),
-                row.text,
-                row.raw_text,
-                row.language.map(Language::code),
-                to_i64(row.duration_ms),
-                row.latin_words,
-                row.cjk_chars,
-                row.model_id,
-                row.latency_ms.map(to_i64),
-                row.asr_ms.map(to_i64),
-                row.audio_path,
-                row.error,
-                row.refine_kind.map(RefineKind::code),
-                row.refine_status.map(RefineStatus::code),
-                row.pre_refine_text,
-                row.refine_model_id,
-                row.refine_ms.map(to_i64),
-            ],
-        )?;
+        let mut stmt = conn.prepare_cached(concat!(
+            "INSERT INTO transcripts (",
+            columns!(),
+            ") VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)"
+        ))?;
+        stmt.execute(params![
+            row.id,
+            row.created_at_ms,
+            row.status.as_str(),
+            row.text,
+            row.raw_text,
+            row.language.map(Language::code),
+            to_i64(row.duration_ms),
+            row.latin_words,
+            row.cjk_chars,
+            row.model_id,
+            row.latency_ms.map(to_i64),
+            row.asr_ms.map(to_i64),
+            row.audio_path,
+            row.error,
+            row.refine_kind.map(RefineKind::code),
+            row.refine_status.map(RefineStatus::code),
+            row.pre_refine_text,
+            row.refine_model_id,
+            row.refine_ms.map(to_i64),
+        ])?;
         Ok(())
     }
 
@@ -395,8 +407,11 @@ impl Store {
 
     pub fn get(&self, id: &str) -> Result<Option<TranscriptRow>, StoreError> {
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare_cached(&format!("SELECT {COLUMNS} FROM transcripts WHERE id = ?1"))?;
+        let mut stmt = conn.prepare_cached(concat!(
+            "SELECT ",
+            columns!(),
+            " FROM transcripts WHERE id = ?1"
+        ))?;
         let row = stmt.query_row([id], read_row).optional()?;
         row.transpose()
     }
@@ -408,27 +423,71 @@ impl Store {
         limit: u32,
         offset: u32,
     ) -> Result<Vec<TranscriptRow>, StoreError> {
+        Self::list_on(&self.conn(), query, limit, offset)
+    }
+
+    pub fn count(&self, query: &str) -> Result<u32, StoreError> {
+        Self::count_on(&self.conn(), query)
+    }
+
+    /// Fetches one history page and total match count under a single connection lock.
+    pub fn list_page(
+        &self,
+        query: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<TranscriptRow>, u32), StoreError> {
         let conn = self.conn();
-        let mut stmt = conn.prepare_cached(&format!(
-            "SELECT {COLUMNS} FROM transcripts
-             WHERE (?1 IS NULL OR text LIKE ?1 ESCAPE '\\' OR pre_refine_text LIKE ?1 ESCAPE '\\')
-             ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3"
-        ))?;
-        let rows = stmt.query_map(params![like_pattern(query), limit, offset], read_row)?;
+        let items = Self::list_on(&conn, query, limit, offset)?;
+        let total = Self::count_on(&conn, query)?;
+        Ok((items, total))
+    }
+
+    fn list_on(
+        conn: &Connection,
+        query: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<TranscriptRow>, StoreError> {
         let mut out = Vec::new();
-        for row in rows {
-            out.push(row??);
+        if let Some(pattern) = like_pattern(query) {
+            let mut stmt = conn.prepare_cached(concat!(
+                "SELECT ",
+                columns!(),
+                " FROM transcripts
+                 WHERE (text LIKE ?1 ESCAPE '\\' OR pre_refine_text LIKE ?1 ESCAPE '\\')
+                 ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3"
+            ))?;
+            let rows = stmt.query_map(params![pattern, limit, offset], read_row)?;
+            for row in rows {
+                out.push(row??);
+            }
+        } else {
+            let mut stmt = conn.prepare_cached(concat!(
+                "SELECT ",
+                columns!(),
+                " FROM transcripts
+                 ORDER BY created_at DESC, id DESC LIMIT ?1 OFFSET ?2"
+            ))?;
+            let rows = stmt.query_map(params![limit, offset], read_row)?;
+            for row in rows {
+                out.push(row??);
+            }
         }
         Ok(out)
     }
 
-    pub fn count(&self, query: &str) -> Result<u32, StoreError> {
-        let n: i64 = self.conn().query_row(
-            "SELECT COUNT(*) FROM transcripts
-             WHERE (?1 IS NULL OR text LIKE ?1 ESCAPE '\\' OR pre_refine_text LIKE ?1 ESCAPE '\\')",
-            [like_pattern(query)],
-            |r| r.get(0),
-        )?;
+    fn count_on(conn: &Connection, query: &str) -> Result<u32, StoreError> {
+        let n: i64 = if let Some(pattern) = like_pattern(query) {
+            let mut stmt = conn.prepare_cached(
+                "SELECT COUNT(*) FROM transcripts
+                 WHERE (text LIKE ?1 ESCAPE '\\' OR pre_refine_text LIKE ?1 ESCAPE '\\')",
+            )?;
+            stmt.query_row([pattern], |r| r.get(0))?
+        } else {
+            let mut stmt = conn.prepare_cached("SELECT COUNT(*) FROM transcripts")?;
+            stmt.query_row([], |r| r.get(0))?
+        };
         Ok(u32::try_from(n).unwrap_or(u32::MAX))
     }
 
@@ -476,35 +535,37 @@ impl Store {
     // --- annotations ---
 
     pub fn insert_annotation(&self, row: &AnnotationRow) -> Result<(), StoreError> {
-        self.conn().execute(
-            &format!(
-                "INSERT INTO annotations ({ANNOTATION_COLUMNS}) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"
-            ),
-            params![
-                row.id,
-                row.created_at_ms,
-                row.status.as_str(),
-                row.folder,
-                to_i64(row.duration_ms),
-                row.keyframes,
-                row.marks,
-                row.language.map(Language::code),
-                row.model_id,
-                row.latency_ms.map(to_i64),
-                row.asr_ms.map(to_i64),
-                row.compose_ms.map(to_i64),
-                row.error,
-            ],
-        )?;
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(concat!(
+            "INSERT INTO annotations (",
+            annotation_columns!(),
+            ") VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"
+        ))?;
+        stmt.execute(params![
+            row.id,
+            row.created_at_ms,
+            row.status.as_str(),
+            row.folder,
+            to_i64(row.duration_ms),
+            row.keyframes,
+            row.marks,
+            row.language.map(Language::code),
+            row.model_id,
+            row.latency_ms.map(to_i64),
+            row.asr_ms.map(to_i64),
+            row.compose_ms.map(to_i64),
+            row.error,
+        ])?;
         Ok(())
     }
 
     /// Every bundle, oldest first (the size cap removes from the front).
     pub fn list_annotations_oldest_first(&self) -> Result<Vec<AnnotationRow>, StoreError> {
         let conn = self.conn();
-        let mut stmt = conn.prepare_cached(&format!(
-            "SELECT {ANNOTATION_COLUMNS} FROM annotations ORDER BY created_at ASC, id ASC"
+        let mut stmt = conn.prepare_cached(concat!(
+            "SELECT ",
+            annotation_columns!(),
+            " FROM annotations ORDER BY created_at ASC, id ASC"
         ))?;
         let rows = stmt.query_map([], annotation_row)?;
         let mut out = Vec::new();
@@ -590,27 +651,25 @@ impl Store {
              ORDER BY day, language",
         )?;
         let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i32>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, u32>(2)?,
-                r.get::<_, u32>(3)?,
-                r.get::<_, u32>(4)?,
-                r.get::<_, i64>(5)?,
-            ))
+            let lang = parse_language(ref_str(r, 1)?);
+            Ok(lang.map(|language| -> rusqlite::Result<DayTotals> {
+                Ok(DayTotals {
+                    day: r.get(0)?,
+                    language,
+                    sessions: r.get(2)?,
+                    latin_words: r.get(3)?,
+                    cjk_chars: r.get(4)?,
+                    speech_ms: to_u64(r.get::<_, i64>(5)?),
+                })
+            }))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (day, language, sessions, latin_words, cjk_chars, speech_ms) = row?;
-            out.push(DayTotals {
-                day,
-                language: parse_language(&language)
-                    .ok_or(StoreError::BadValue("daily_stats.language"))?,
-                sessions,
-                latin_words,
-                cjk_chars,
-                speech_ms: to_u64(speech_ms),
-            });
+            match row? {
+                Some(Ok(total)) => out.push(total),
+                Some(Err(err)) => return Err(err.into()),
+                None => return Err(StoreError::BadValue("daily_stats.language")),
+            }
         }
         Ok(out)
     }
@@ -684,25 +743,34 @@ fn like_pattern(query: &str) -> Option<String> {
     Some(out)
 }
 
+fn ref_str<'a>(r: &'a Row<'_>, idx: usize) -> rusqlite::Result<&'a str> {
+    Ok(r.get_ref(idx)?.as_str()?)
+}
+
+fn ref_opt_str<'a>(r: &'a Row<'_>, idx: usize) -> rusqlite::Result<Option<&'a str>> {
+    match r.get_ref(idx)? {
+        ValueRef::Null => Ok(None),
+        other => Ok(Some(other.as_str()?)),
+    }
+}
+
 fn annotation_row(r: &Row<'_>) -> rusqlite::Result<Result<AnnotationRow, StoreError>> {
-    let status: String = r.get(2)?;
-    let language: Option<String> = r.get(7)?;
+    let Some(status) = AnnotationStatus::parse(ref_str(r, 2)?) else {
+        return Ok(Err(StoreError::BadValue("status")));
+    };
+    let language = match ref_opt_str(r, 7)? {
+        None => None,
+        Some(code) => match Language::from_code(code) {
+            Some(l) => Some(l),
+            None => return Ok(Err(StoreError::BadValue("language"))),
+        },
+    };
     let duration: i64 = r.get(4)?;
     let keyframes: i64 = r.get(5)?;
     let marks: i64 = r.get(6)?;
     let latency: Option<i64> = r.get(9)?;
     let asr: Option<i64> = r.get(10)?;
     let compose: Option<i64> = r.get(11)?;
-    let Some(status) = AnnotationStatus::parse(&status) else {
-        return Ok(Err(StoreError::BadValue("status")));
-    };
-    let language = match language {
-        None => None,
-        Some(code) => match Language::from_code(&code) {
-            Some(l) => Some(l),
-            None => return Ok(Err(StoreError::BadValue("language"))),
-        },
-    };
     Ok(Ok(AnnotationRow {
         id: r.get(0)?,
         created_at_ms: r.get(1)?,
@@ -749,26 +817,24 @@ fn to_u64(v: i64) -> u64 {
 }
 
 fn read_row(r: &Row<'_>) -> rusqlite::Result<Result<TranscriptRow, StoreError>> {
-    let status: String = r.get(2)?;
-    let language: Option<String> = r.get(5)?;
-    let Some(status) = TranscriptStatus::parse(&status) else {
+    let Some(status) = TranscriptStatus::parse(ref_str(r, 2)?) else {
         return Ok(Err(StoreError::BadValue("transcripts.status")));
     };
-    let refine_kind = match r.get::<_, Option<String>>(14)?.as_deref() {
+    let refine_kind = match ref_opt_str(r, 14)? {
         None => None,
         Some(code) => match RefineKind::from_code(code) {
             Some(kind) => Some(kind),
             None => return Ok(Err(StoreError::BadValue("transcripts.refine_kind"))),
         },
     };
-    let refine_status = match r.get::<_, Option<String>>(15)?.as_deref() {
+    let refine_status = match ref_opt_str(r, 15)? {
         None => None,
         Some(code) => match RefineStatus::from_code(code) {
             Some(status) => Some(status),
             None => return Ok(Err(StoreError::BadValue("transcripts.refine_status"))),
         },
     };
-    let language = match language.as_deref() {
+    let language = match ref_opt_str(r, 5)? {
         None => None,
         Some(code) => match parse_language(code) {
             Some(l) => Some(l),

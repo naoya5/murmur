@@ -16,7 +16,7 @@ use objc2_core_foundation::{
 use objc2_core_graphics::{CGColor, CGContext, CGLineCap, CGLineJoin, CGPath};
 use objc2_core_text::{CTFont, CTLine, kCTFontAttributeName, kCTForegroundColorAttributeName};
 
-use super::image::{self, Bitmap, Canvas, ImageError};
+use super::image::{Bitmap, Canvas, ImageError};
 
 /// Height of the `#n` chip text (smaller was not readable to the models).
 pub const CHIP_PX: f64 = 24.0;
@@ -95,11 +95,10 @@ pub fn render(frames: &[FrameInput<'_>], out_dir: &Path) -> Result<Rendered, Dra
             CGPoint::new(CHIP_INSET_PX, CHIP_INSET_PX),
             CHIP_PAD_PX,
         );
-        let bitmap = canvas.into_bitmap();
         draw_ms += t.elapsed().as_millis() as u64;
         let t = Instant::now();
         let path = frames_dir.join(format!("{}.png", frame.n));
-        image::write_png(&bitmap, &path)?;
+        canvas.write_png(&path)?;
         encode_ms += t.elapsed().as_millis() as u64;
         frame_paths.push(path);
     }
@@ -286,6 +285,7 @@ fn draw_chip(ctx: &CGContext, text: &str, font: &CTFont, origin: CGPoint, pad: f
 
 #[cfg(test)]
 mod tests {
+    use super::super::image;
     use super::*;
 
     fn gray(width: usize, height: usize, level: u8) -> Bitmap {

@@ -414,6 +414,7 @@ pub enum Effect {
     /// Open the microphone and the spool file. Read language and device from settings now.
     StartCapture {
         session: SessionId,
+        kind: SessionKind,
     },
     /// Keep the stream open but drop incoming audio (cancel countdown).
     PauseCapture {
@@ -849,7 +850,7 @@ impl Machine {
     ) -> State {
         let session = SessionId(self.next_session);
         self.next_session += 1;
-        fx.push(Effect::StartCapture { session });
+        fx.push(Effect::StartCapture { session, kind });
         if kind == SessionKind::Annotation {
             fx.push(Effect::StartScreen { session });
             fx.push(Effect::ShowOverlay);
@@ -980,20 +981,38 @@ impl Machine {
         match tx.kind {
             SessionKind::Dictation => match outcome {
                 TranscribeOutcome::Text(text) => match tx.refine {
-                    None => self.deliver_text(session, text, None, None, fx),
+                    None => {
+                        self.deliver_text(session, text, None, Delivery::Text { refine: None }, fx)
+                    }
                     Some(plan) if tx.refine_off => {
                         self.deliver_unrefined(session, plan.kind, text, RefineStatus::Failed, fx)
                     }
-                    Some(RefinePlan {
-                        kind: RefineKind::Clean,
-                        ..
-                    }) if refine::clean_gate(&text.0) != CleanGate::Run => self.deliver_text(
-                        session,
-                        text,
-                        None,
-                        Some((RefineKind::Clean, RefineStatus::Skipped)),
-                        fx,
-                    ),
+                    Some(
+                        plan @ RefinePlan {
+                            kind: RefineKind::Clean,
+                            ..
+                        },
+                    ) => match refine::clean_gate(&text.0) {
+                        CleanGate::Run => self.start_refining(session, plan, text, fx),
+                        CleanGate::SkipShort => self.deliver_text(
+                            session,
+                            text,
+                            None,
+                            Delivery::Text {
+                                refine: Some((RefineKind::Clean, RefineStatus::Skipped)),
+                            },
+                            fx,
+                        ),
+                        CleanGate::SkipLong => self.deliver_text(
+                            session,
+                            text,
+                            None,
+                            Delivery::CleanFallback {
+                                status: RefineStatus::Skipped,
+                            },
+                            fx,
+                        ),
+                    },
                     Some(plan) => self.start_refining(session, plan, text, fx),
                 },
                 TranscribeOutcome::NoSpeech => {
@@ -1031,19 +1050,9 @@ impl Machine {
         session: SessionId,
         text: TranscriptText,
         copy_only: Option<CopyReason>,
-        refine: Option<(RefineKind, RefineStatus)>,
+        delivery: Delivery,
         fx: &mut Vec<Effect>,
     ) -> State {
-        let delivery = match refine {
-            Some((RefineKind::Clean, status))
-                if status != RefineStatus::Ok
-                    && (status != RefineStatus::Skipped
-                        || refine::clean_gate(&text.0) == CleanGate::SkipLong) =>
-            {
-                Delivery::CleanFallback { status }
-            }
-            _ => Delivery::Text { refine },
-        };
         fx.push(Effect::SetEscCapture(false));
         fx.push(Effect::Deliver {
             session,
@@ -1112,7 +1121,9 @@ impl Machine {
                     session,
                     text,
                     None,
-                    Some((refining.kind, RefineStatus::Ok)),
+                    Delivery::Text {
+                        refine: Some((refining.kind, RefineStatus::Ok)),
+                    },
                     fx,
                 );
             }
@@ -1132,11 +1143,16 @@ impl Machine {
         status: RefineStatus,
         fx: &mut Vec<Effect>,
     ) -> State {
-        let copy_only = match kind {
-            RefineKind::Clean => None,
-            RefineKind::Translate => Some(CopyReason::RefineFailed),
+        let (copy_only, delivery) = match kind {
+            RefineKind::Clean => (None, Delivery::CleanFallback { status }),
+            RefineKind::Translate => (
+                Some(CopyReason::RefineFailed),
+                Delivery::Text {
+                    refine: Some((kind, status)),
+                },
+            ),
         };
-        self.deliver_text(session, text, copy_only, Some((kind, status)), fx)
+        self.deliver_text(session, text, copy_only, delivery, fx)
     }
 
     fn compose(&mut self, session: SessionId, words: ComposeWords, fx: &mut Vec<Effect>) -> State {
@@ -2051,7 +2067,10 @@ mod tests {
         assert_eq!(
             fx,
             vec![
-                Effect::StartCapture { session: S1 },
+                Effect::StartCapture {
+                    session: S1,
+                    kind: SessionKind::Dictation,
+                },
                 Effect::SetEscCapture(true),
                 arm(max, MAX_RECORDING_MS),
             ]
@@ -2104,7 +2123,10 @@ mod tests {
         let fx = h.step(transcribed(S1, TranscribeOutcome::NoSpeech));
         assert!(fx.contains(&Effect::DropAudio { session: S1 }));
         let fx = h.step(TOGGLE);
-        assert!(fx.contains(&Effect::StartCapture { session: S2 }));
+        assert!(fx.contains(&Effect::StartCapture {
+            session: S2,
+            kind: SessionKind::Dictation,
+        }));
         assert_eq!(h.m.active_session(), Some(S2));
     }
 
@@ -2957,7 +2979,13 @@ mod tests {
         let mut h = idle_with_notice();
         let notice = h.timers.last().expect("notice timer").0;
         let fx = h.step(TOGGLE);
-        assert_eq!(fx[0], Effect::StartCapture { session: S2 });
+        assert_eq!(
+            fx[0],
+            Effect::StartCapture {
+                session: S2,
+                kind: SessionKind::Dictation,
+            }
+        );
         assert_eq!(
             h.view(),
             PillView::Recording {
@@ -3270,7 +3298,10 @@ mod tests {
         assert_eq!(
             fx,
             vec![
-                Effect::StartCapture { session: S1 },
+                Effect::StartCapture {
+                    session: S1,
+                    kind: SessionKind::Annotation,
+                },
                 Effect::StartScreen { session: S1 },
                 Effect::ShowOverlay,
                 Effect::SetEscCapture(true),
@@ -4255,7 +4286,10 @@ mod tests {
         assert_eq!(h.m.active_session(), None);
         // The next session is a fresh id, whatever its kind.
         let fx = h.step(TOGGLE);
-        assert!(fx.contains(&Effect::StartCapture { session: S2 }));
+        assert!(fx.contains(&Effect::StartCapture {
+            session: S2,
+            kind: SessionKind::Dictation,
+        }));
     }
 
     // --- refine (experimental) ---
@@ -4323,7 +4357,10 @@ mod tests {
         assert_eq!(
             fx,
             vec![
-                Effect::StartCapture { session: S1 },
+                Effect::StartCapture {
+                    session: S1,
+                    kind: SessionKind::Dictation,
+                },
                 Effect::SetEscCapture(true),
                 arm(max, MAX_RECORDING_MS),
                 Effect::WarmRefiner {
@@ -4441,6 +4478,66 @@ mod tests {
             assert!(matches!(h.view(), PillView::Notice { notice } if notice == expected));
             assert_eq!(expected.duration_ms(), NOTICE_OK_MS);
         }
+    }
+
+    #[test]
+    fn clean_gate_boundaries_preserve_refining_and_notice_kinds() {
+        let short_edge = "あ".repeat(refine::SHORT_MAX_CHARS);
+        let run_low = "あ".repeat(refine::SHORT_MAX_CHARS + 1);
+        let run_high = "あ".repeat(refine::CLEAN_MAX_CHARS);
+        let long_edge = format!("あの{}", "あ".repeat(refine::CLEAN_MAX_CHARS - 1));
+        assert_eq!(long_edge.chars().count(), refine::CLEAN_MAX_CHARS + 1);
+
+        // At SHORT_MAX_CHARS (20) without a marker: SkipShort -> Delivered notice.
+        let (mut h, fx) = transcribed_refine(RefineKind::Clean, &short_edge);
+        assert!(!fx.iter().any(|f| matches!(f, Effect::Refine { .. })));
+        assert!(matches!(
+            h.state(),
+            State::Delivering {
+                delivery: Delivery::Text {
+                    refine: Some((RefineKind::Clean, RefineStatus::Skipped)),
+                },
+                ..
+            }
+        ));
+        h.step(delivered(S1, DeliveryOutcome::Pasted));
+        assert_eq!(
+            h.view(),
+            PillView::Notice {
+                notice: Notice::Delivered {
+                    outcome: DeliveryOutcome::Pasted,
+                },
+            }
+        );
+
+        // At SHORT_MAX_CHARS + 1 (21) and CLEAN_MAX_CHARS (150): Run -> Refining.
+        for said in [run_low, run_high] {
+            let (h, fx) = transcribed_refine(RefineKind::Clean, &said);
+            assert!(fx.iter().any(|f| matches!(f, Effect::Refine { .. })));
+            assert!(matches!(h.state(), State::Refining(_)));
+        }
+
+        // At CLEAN_MAX_CHARS + 1 (151) even with a marker: SkipLong -> CleanupSkipped notice.
+        let (mut h, fx) = transcribed_refine(RefineKind::Clean, &long_edge);
+        assert!(!fx.iter().any(|f| matches!(f, Effect::Refine { .. })));
+        assert!(matches!(
+            h.state(),
+            State::Delivering {
+                delivery: Delivery::CleanFallback {
+                    status: RefineStatus::Skipped,
+                },
+                ..
+            }
+        ));
+        h.step(delivered(S1, DeliveryOutcome::Pasted));
+        assert_eq!(
+            h.view(),
+            PillView::Notice {
+                notice: Notice::CleanupSkipped {
+                    outcome: DeliveryOutcome::Pasted,
+                },
+            }
+        );
     }
 
     #[test]
@@ -5175,7 +5272,7 @@ mod tests {
         fn record(&mut self, fx: &[Effect]) {
             for f in fx {
                 match f {
-                    Effect::StartCapture { session } => {
+                    Effect::StartCapture { session, .. } => {
                         assert!(self.started.insert(session.0), "{session:?} started twice");
                     }
                     Effect::StartScreen { session } => {

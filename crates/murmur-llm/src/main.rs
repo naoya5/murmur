@@ -263,10 +263,84 @@ impl Job {
     }
 }
 
-struct Prefix {
+struct Prefix<S = SeqState> {
     messages: Vec<Message>,
     tokens: Vec<LlamaToken>,
-    state: SeqState,
+    state: S,
+}
+
+struct PrefixState<S = SeqState> {
+    prefix: Option<Prefix<S>>,
+    context_matches_prefix: bool,
+}
+
+impl<S> Default for PrefixState<S> {
+    fn default() -> Self {
+        Self {
+            prefix: None,
+            context_matches_prefix: false,
+        }
+    }
+}
+
+enum GeneratePrefix<'a, S> {
+    /// Context holds only the warm prefix tokens; caller can skip `clear_kv_cache` and `state_seq_set`.
+    ReuseLiveContext(usize),
+    /// Context holds older generation/mismatch tokens; caller must `clear_kv_cache` and restore `state`.
+    RestoreSnapshot { tokens_len: usize, state: &'a S },
+    /// No matching prefix; caller must `clear_kv_cache` and decode from position 0.
+    Miss,
+}
+
+impl<S> PrefixState<S> {
+    fn warm_hit(&self, messages: &[Message]) -> Option<usize> {
+        if !self.context_matches_prefix {
+            return None;
+        }
+        let saved = self.prefix.as_ref()?;
+        (saved.messages == messages).then_some(saved.tokens.len())
+    }
+
+    fn invalidate_for_warm(&mut self) {
+        self.prefix = None;
+        self.context_matches_prefix = false;
+    }
+
+    fn finish_warm(&mut self, messages: Vec<Message>, tokens: Vec<LlamaToken>, state: S) {
+        self.prefix = Some(Prefix {
+            messages,
+            tokens,
+            state,
+        });
+        self.context_matches_prefix = true;
+    }
+
+    fn begin_generate<'a>(
+        &'a mut self,
+        messages: &[Message],
+        tokens: &[LlamaToken],
+    ) -> GeneratePrefix<'a, S> {
+        // Reset before any KV mutation or decode so cancel, error, or subsequent calls always
+        // restore cleanly instead of assuming the context still holds only the warm prefix.
+        let context_was_hot = std::mem::replace(&mut self.context_matches_prefix, false);
+        let Some(saved) = self.prefix.as_ref() else {
+            return GeneratePrefix::Miss;
+        };
+        let Some((_, prefix_messages)) = messages.split_last() else {
+            return GeneratePrefix::Miss;
+        };
+        if saved.messages != prefix_messages || !tokens.starts_with(&saved.tokens) {
+            return GeneratePrefix::Miss;
+        }
+        if context_was_hot {
+            GeneratePrefix::ReuseLiveContext(saved.tokens.len())
+        } else {
+            GeneratePrefix::RestoreSnapshot {
+                tokens_len: saved.tokens.len(),
+                state: &saved.state,
+            }
+        }
+    }
 }
 
 fn emit(value: Value) {
@@ -414,6 +488,7 @@ fn worker(rx: mpsc::Receiver<Job>, active: Active) {
                 continue;
             }
         };
+        let architecture = model.meta_val_str("general.architecture").ok();
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(ctx_size))
             .with_n_batch(256)
@@ -433,7 +508,7 @@ fn worker(rx: mpsc::Receiver<Job>, active: Active) {
             "gpu_offload_supported":backend.supports_gpu_offload(),"ctx":ctx_size})
         });
         finish(&job, result, &active);
-        let mut prefix = None;
+        let mut prefix_state = PrefixState::default();
         loop {
             let next = match rx.recv_timeout(Duration::from_secs(300)) {
                 Ok(job) => job,
@@ -444,7 +519,13 @@ fn worker(rx: mpsc::Receiver<Job>, active: Active) {
                 pending = Some(next);
                 break;
             }
-            let result = handle(&model, &mut context, &mut prefix, &next);
+            let result = handle(
+                &model,
+                architecture.as_deref(),
+                &mut context,
+                &mut prefix_state,
+                &next,
+            );
             finish(&next, result, &active);
         }
     }
@@ -523,15 +604,18 @@ fn decode(
 fn warm(
     model: &LlamaModel,
     context: &mut LlamaContext<'_>,
-    prefix: &mut Option<Prefix>,
-    messages: &[Message],
+    prefix_state: &mut PrefixState,
+    messages: Vec<Message>,
     job: &Job,
 ) -> Result<usize> {
-    let tokens = render(model, messages, false, false)?;
+    if let Some(count) = prefix_state.warm_hit(&messages) {
+        return Ok(count);
+    }
+    let tokens = render(model, &messages, false, false)?;
     if tokens.is_empty() || tokens.len() >= context.n_ctx() as usize {
         return Err("invalid_prompt_length");
     }
-    *prefix = None;
+    prefix_state.invalidate_for_warm();
     context.clear_kv_cache();
     decode(context, &tokens, 0, job)?;
     // Save an in-memory snapshot, not only positions. Hybrid LFM2 recurrent state cannot be truncated.
@@ -539,18 +623,15 @@ fn warm(
         .state_seq_get(0, LlamaStateSeqFlags::empty())
         .map_err(|_| "cache_save_failed")?;
     let count = tokens.len();
-    *prefix = Some(Prefix {
-        messages: messages.to_vec(),
-        tokens,
-        state,
-    });
+    prefix_state.finish_warm(messages, tokens, state);
     Ok(count)
 }
 
 fn handle(
     model: &LlamaModel,
+    architecture: Option<&str>,
     context: &mut LlamaContext<'_>,
-    prefix: &mut Option<Prefix>,
+    prefix_state: &mut PrefixState,
     job: &Job,
 ) -> Result<Value> {
     job.check()?;
@@ -558,7 +639,7 @@ fn handle(
         Op::Warm { input } => {
             let started = Instant::now();
             let messages = input.resolve(false)?;
-            let count = warm(model, context, prefix, &messages, job)?;
+            let count = warm(model, context, prefix_state, messages, job)?;
             Ok(
                 json!({"ok":true,"error":null,"prompt_ms":started.elapsed().as_secs_f64()*1000.0,
                 "prompt_tokens":count,"cached_tokens":count,"generated_tokens":0}),
@@ -578,28 +659,26 @@ fn handle(
             }
             let started = Instant::now();
             let messages = input.resolve(true)?;
-            let architecture = model
-                .meta_val_str("general.architecture")
-                .map_err(|_| "missing_architecture")?;
-            let no_think = no_think_mode(&architecture, *no_think)?;
+            let architecture = architecture.ok_or("missing_architecture")?;
+            let no_think = no_think_mode(architecture, *no_think)?;
             let tokens = render(model, &messages, true, no_think)?;
             if tokens.is_empty() || tokens.len() + *max_tokens as usize > context.n_ctx() as usize {
                 return Err("context_overflow");
             }
-            let mut cached = 0;
-            if let Some(saved) = prefix.as_ref()
-                && saved.messages == messages[..messages.len() - 1]
-                && tokens.starts_with(&saved.tokens)
-            {
-                context.clear_kv_cache();
-                context
-                    .state_seq_set(&saved.state, 0)
-                    .map_err(|_| "cache_restore_failed")?;
-                cached = saved.tokens.len();
-            }
-            if cached == 0 {
-                context.clear_kv_cache();
-            }
+            let cached = match prefix_state.begin_generate(&messages, &tokens) {
+                GeneratePrefix::ReuseLiveContext(len) => len,
+                GeneratePrefix::RestoreSnapshot { tokens_len, state } => {
+                    context.clear_kv_cache();
+                    context
+                        .state_seq_set(state, 0)
+                        .map_err(|_| "cache_restore_failed")?;
+                    tokens_len
+                }
+                GeneratePrefix::Miss => {
+                    context.clear_kv_cache();
+                    0
+                }
+            };
             decode(context, &tokens[cached..], cached, job)?;
             let prompt_ms = started.elapsed().as_secs_f64() * 1000.0;
             let generation = Instant::now();
@@ -915,5 +994,62 @@ mod tests {
         flag.store(false, Ordering::Relaxed);
         job.started = Instant::now() - Duration::from_secs(61);
         assert_eq!(job.check(), Err("timeout"));
+    }
+
+    #[test]
+    fn prefix_state_reuses_hot_context_once_and_skips_redundant_warm() {
+        let mut state = PrefixState::<&'static str>::default();
+        let prefix = vec![message(Role::System, "sys")];
+        let other_prefix = vec![message(Role::System, "other")];
+        let prefix_tokens = vec![LlamaToken(1), LlamaToken(2)];
+        let full_msgs = vec![message(Role::System, "sys"), message(Role::User, "hi")];
+        let full_tokens = vec![LlamaToken(1), LlamaToken(2), LlamaToken(3)];
+
+        assert_eq!(state.warm_hit(&prefix), None);
+        assert!(matches!(
+            state.begin_generate(&full_msgs, &full_tokens),
+            GeneratePrefix::Miss
+        ));
+
+        // Warming populates snapshot and marks the live KV context hot.
+        state.finish_warm(prefix.clone(), prefix_tokens.clone(), "snap");
+        assert!(state.context_matches_prefix);
+        assert_eq!(state.warm_hit(&prefix), Some(2));
+        assert_eq!(state.warm_hit(&other_prefix), None);
+
+        // First generation consumes the hot-KV fast path and clears `context_matches_prefix`.
+        assert!(matches!(
+            state.begin_generate(&full_msgs, &full_tokens),
+            GeneratePrefix::ReuseLiveContext(2)
+        ));
+        assert!(!state.context_matches_prefix);
+        // Once KV was touched by generation, an identical Warm is no longer a no-op hit.
+        assert_eq!(state.warm_hit(&prefix), None);
+
+        // Second generation with the same warm prefix must restore from snapshot.
+        assert!(matches!(
+            state.begin_generate(&full_msgs, &full_tokens),
+            GeneratePrefix::RestoreSnapshot {
+                tokens_len: 2,
+                state: &"snap"
+            }
+        ));
+        assert!(!state.context_matches_prefix);
+
+        // Token-prefix mismatch misses without corrupting the stored snapshot for subsequent hits.
+        assert!(matches!(
+            state.begin_generate(&full_msgs, &[LlamaToken(9), LlamaToken(3)]),
+            GeneratePrefix::Miss
+        ));
+        assert!(matches!(
+            state.begin_generate(&full_msgs, &full_tokens),
+            GeneratePrefix::RestoreSnapshot { tokens_len: 2, .. }
+        ));
+
+        // `invalidate_for_warm` clears both snapshot and hot-KV flag before decode/snapshot errors.
+        state.finish_warm(prefix.clone(), prefix_tokens, "snap2");
+        state.invalidate_for_warm();
+        assert!(!state.context_matches_prefix);
+        assert_eq!(state.warm_hit(&prefix), None);
     }
 }

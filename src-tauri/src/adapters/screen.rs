@@ -140,10 +140,8 @@ struct State {
     paused: bool,
     next_index: usize,
     frames: Vec<Frame>,
-    ring: VecDeque<(usize, u64, Bitmap)>,
+    ring: VecDeque<(usize, u64, Arc<Bitmap>)>,
     kept: Vec<(usize, PathBuf)>,
-    /// Candidate writes in flight; each reports on `writes_done`.
-    pending_writes: usize,
 }
 
 struct Shared {
@@ -151,8 +149,75 @@ struct Shared {
     on_event: Callback,
     candidates_dir: PathBuf,
     state: Mutex<State>,
-    writes_done: Mutex<Option<mpsc::Receiver<()>>>,
-    writes_tx: mpsc::Sender<()>,
+}
+
+struct WriteJob {
+    index: usize,
+    bitmap: Arc<Bitmap>,
+}
+
+/// Single background thread that writes candidate PNGs in FIFO order for one capture session.
+struct CandidateWriter {
+    tx: Option<mpsc::Sender<WriteJob>>,
+    done_rx: mpsc::Receiver<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CandidateWriter {
+    fn start(shared: Arc<Shared>) -> Result<Self, ScreenError> {
+        let (tx, rx) = mpsc::channel::<WriteJob>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let thread = std::thread::Builder::new()
+            .name("screen-candidate".into())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    let result = ensure_folder(&shared.candidates_dir).and_then(|()| {
+                        image::write_png(
+                            &job.bitmap,
+                            &shared.candidates_dir.join(format!("{}.png", job.index)),
+                        )
+                        .map_err(|e| ScreenError::Write(e.to_string()))
+                    });
+                    if let Err(error) = result {
+                        tracing::warn!(%error, index = job.index, "candidate picture not written");
+                        shared.lock().kept.retain(|(i, _)| *i != job.index);
+                    }
+                }
+                let _ = done_tx.send(());
+            })
+            .map_err(|_| ScreenError::Write("no thread".into()))?;
+        Ok(Self {
+            tx: Some(tx),
+            done_rx,
+            thread: Some(thread),
+        })
+    }
+
+    fn send(&self, job: WriteJob) -> Result<(), ScreenError> {
+        let Some(tx) = self.tx.as_ref() else {
+            return Err(ScreenError::Write("writer closed".into()));
+        };
+        tx.send(job)
+            .map_err(|_| ScreenError::Write("writer stopped".into()))
+    }
+
+    fn finish(mut self, timeout: Duration) {
+        // Closing `tx` lets the worker drain queued writes and then exit cleanly.
+        drop(self.tx.take());
+        if self.done_rx.recv_timeout(timeout).is_ok() {
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        } else {
+            tracing::warn!("a candidate picture was still being written at stop");
+        }
+    }
+}
+
+impl Drop for CandidateWriter {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+    }
 }
 
 impl Shared {
@@ -207,7 +272,7 @@ impl Shared {
             state.next_index += 1;
             let frame = Frame { index, t_ms, cells };
             state.frames.push(frame.clone());
-            state.ring.push_back((index, t_ms, bitmap));
+            state.ring.push_back((index, t_ms, Arc::new(bitmap)));
             while state.ring.len() > RING_FRAMES {
                 state.ring.pop_front();
             }
@@ -231,25 +296,33 @@ pub fn cells_of(bgra: &[u8], width: usize, height: usize, bytes_per_row: usize) 
         let x1 = ((col + 1) * width / GRID_COLUMNS).max(x0 + 1);
         let y0 = row * height / GRID_ROWS;
         let y1 = ((row + 1) * height / GRID_ROWS).max(y0 + 1);
-        let mut sum = 0.0f64;
+        let mut sum = 0u64;
         let mut count = 0u32;
         let mut y = y0;
         while y < y1 {
             let row_start = y * bytes_per_row;
-            let mut x = x0;
-            while x < x1 {
-                let i = row_start + x * 4;
-                if let Some(px) = bgra.get(i..i + 3) {
-                    let (b, g, r) = (f64::from(px[0]), f64::from(px[1]), f64::from(px[2]));
-                    sum += (0.114 * b + 0.587 * g + 0.299 * r) / 255.0;
-                    count += 1;
+            if let Some(row_slice) = bgra.get(row_start + x0 * 4..row_start + x1 * 4) {
+                for px in row_slice.chunks(step * 4) {
+                    if let [b, g, r, ..] = px {
+                        sum += 114 * u64::from(*b) + 587 * u64::from(*g) + 299 * u64::from(*r);
+                        count += 1;
+                    }
                 }
-                x += step;
+            } else {
+                let mut x = x0;
+                while x < x1 {
+                    let i = row_start + x * 4;
+                    if let Some(&[b, g, r]) = bgra.get(i..i + 3) {
+                        sum += 114 * u64::from(b) + 587 * u64::from(g) + 299 * u64::from(r);
+                        count += 1;
+                    }
+                    x += step;
+                }
             }
             y += step;
         }
         if count > 0 {
-            *cell = (sum / f64::from(count)) as f32;
+            *cell = (sum as f64 / (255_000.0 * f64::from(count))) as f32;
         }
     }
     cells
@@ -334,6 +407,7 @@ enum Backend {
 pub struct ScreenCapture {
     backend: Backend,
     shared: Arc<Shared>,
+    writer: Mutex<Option<CandidateWriter>>,
 }
 
 /// Starts capturing. Blocking for up to `START_TIMEOUT` (call it off the controller loop). The
@@ -349,7 +423,6 @@ pub fn start(
 }
 
 fn new_shared(config: &ScreenConfig, on_event: Callback) -> Arc<Shared> {
-    let (writes_tx, writes_rx) = mpsc::channel();
     Arc::new(Shared {
         origin: config.origin,
         on_event,
@@ -360,10 +433,7 @@ fn new_shared(config: &ScreenConfig, on_event: Callback) -> Arc<Shared> {
             frames: Vec::new(),
             ring: VecDeque::with_capacity(RING_FRAMES + 1),
             kept: Vec::new(),
-            pending_writes: 0,
         }),
-        writes_done: Mutex::new(Some(writes_rx)),
-        writes_tx,
     })
 }
 
@@ -438,6 +508,7 @@ fn start_pictures(
                 thread: Some(thread),
             },
             shared,
+            writer: Mutex::new(None),
         },
         info,
     ))
@@ -526,6 +597,7 @@ fn start_display(
                 queue: SharedQueue(queue),
             },
             shared,
+            writer: Mutex::new(None),
         },
         info,
     ))
@@ -549,33 +621,32 @@ impl ScreenCapture {
                 .ring
                 .iter()
                 .find(|(i, _, _)| *i == index)
-                .map(|(_, _, b)| b.clone())
+                .map(|(_, _, b)| Arc::clone(b))
                 .ok_or(ScreenError::FrameGone(index))?;
             let path = self.shared.candidates_dir.join(format!("{index}.png"));
             state.kept.push((index, path));
-            state.pending_writes += 1;
             bitmap
         };
-        let shared = self.shared.clone();
-        let done = self.shared.writes_tx.clone();
-        let spawned = std::thread::Builder::new()
-            .name("screen-candidate".into())
-            .spawn(move || {
-                let result = ensure_folder(&shared.candidates_dir).and_then(|()| {
-                    image::write_png(&bitmap, &shared.candidates_dir.join(format!("{index}.png")))
-                        .map_err(|e| ScreenError::Write(e.to_string()))
-                });
-                if let Err(error) = result {
-                    tracing::warn!(%error, index, "candidate picture not written");
-                    shared.lock().kept.retain(|(i, _)| *i != index);
+        let send_result = {
+            let mut writer_guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+            if writer_guard.is_none() {
+                match CandidateWriter::start(self.shared.clone()) {
+                    Ok(writer) => *writer_guard = Some(writer),
+                    Err(error) => {
+                        drop(writer_guard);
+                        self.shared.lock().kept.retain(|(i, _)| *i != index);
+                        return Err(error);
+                    }
                 }
-                let _ = done.send(());
-            });
-        if spawned.is_err() {
-            let mut state = self.shared.lock();
-            state.kept.retain(|(i, _)| *i != index);
-            state.pending_writes -= 1;
-            return Err(ScreenError::Write("no thread".into()));
+            }
+            match writer_guard.as_ref() {
+                Some(writer) => writer.send(WriteJob { index, bitmap }),
+                None => Err(ScreenError::Write("writer missing".into())),
+            }
+        };
+        if let Err(error) = send_result {
+            self.shared.lock().kept.retain(|(i, _)| *i != index);
+            return Err(error);
         }
         Ok(())
     }
@@ -587,7 +658,12 @@ impl ScreenCapture {
 
     /// Stops the capture and waits (with timeouts) for the stream and the candidate writes.
     pub fn stop(self) -> Result<Stopped, ScreenError> {
-        match self.backend {
+        let ScreenCapture {
+            backend,
+            shared,
+            writer,
+        } = self;
+        match backend {
             Backend::Sck { stream, .. } => {
                 let (tx, rx) = mpsc::channel::<()>();
                 let tx = Mutex::new(Some(tx));
@@ -611,31 +687,16 @@ impl ScreenCapture {
                 }
             }
         }
-        // Candidate writes in flight.
-        let pending = self.shared.lock().pending_writes;
-        let receiver = self
-            .shared
-            .writes_done
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take());
-        if let Some(receiver) = receiver {
-            let deadline = Instant::now() + WRITE_TIMEOUT;
-            for _ in 0..pending {
-                let left = deadline.saturating_duration_since(Instant::now());
-                if receiver.recv_timeout(left).is_err() {
-                    tracing::warn!("a candidate picture was still being written at stop");
-                    break;
-                }
-            }
+        if let Some(writer) = writer.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            writer.finish(WRITE_TIMEOUT);
         }
-        let mut state = self.shared.lock();
+        let mut state = shared.lock();
         let frames = std::mem::take(&mut state.frames);
         let kept = std::mem::take(&mut state.kept);
         let recent = state
             .ring
             .drain(..)
-            .map(|(index, _, bitmap)| (index, bitmap))
+            .map(|(index, _, bitmap)| (index, Arc::unwrap_or_clone(bitmap)))
             .collect();
         drop(state);
         tracing::info!(
@@ -784,6 +845,37 @@ fn excluded_apps(
 }
 
 #[cfg(test)]
+pub(crate) struct TestPictureSink(Arc<Shared>);
+
+#[cfg(test)]
+impl TestPictureSink {
+    pub(crate) fn push(&self, cells: Vec<f32>, bitmap: Bitmap) {
+        self.0.push_picture(cells, bitmap);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_capture_for_dir(candidates_dir: PathBuf) -> (ScreenCapture, TestPictureSink) {
+    let config = ScreenConfig {
+        source: ScreenSource::PngDir(candidates_dir.clone()),
+        exclude_bundle_id: None,
+        cursor: (0.0, 0.0),
+        candidates_dir,
+        origin: Instant::now(),
+    };
+    let shared = new_shared(&config, Arc::new(|_| {}));
+    let capture = ScreenCapture {
+        backend: Backend::Pictures {
+            stop: Arc::new(AtomicBool::new(false)),
+            thread: None,
+        },
+        shared: Arc::clone(&shared),
+        writer: Mutex::new(None),
+    };
+    (capture, TestPictureSink(shared))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -835,5 +927,92 @@ mod tests {
         // Degenerate input gives a dark grid, never a panic.
         assert_eq!(cells_of(&[], 0, 0, 0), vec![0.0; GRID_CELLS]);
         assert_eq!(cells_of(&data[..10], 64, 36, 100), vec![0.0; GRID_CELLS]);
+    }
+
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(name: &str) -> Self {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "murmur_screen_test_{name}_{}_{id}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn solid_bitmap(width: usize, height: usize, b: u8, g: u8, r: u8) -> Bitmap {
+        let mut bmp = Bitmap::new(width, height).unwrap();
+        for px in bmp.bgra.as_chunks_mut::<4>().0 {
+            px[0] = b;
+            px[1] = g;
+            px[2] = r;
+            px[3] = 255;
+        }
+        bmp
+    }
+
+    #[test]
+    fn candidate_writer_writes_multiple_kept_frames_dedups_and_reports_gone() {
+        let dir = ScratchDir::new("writer");
+        let candidates_dir = dir.0.join("candidates");
+        let (capture, shared) = test_capture_for_dir(candidates_dir.clone());
+
+        shared.push(vec![0.1; GRID_CELLS], solid_bitmap(8, 8, 10, 20, 30));
+        shared.push(vec![0.2; GRID_CELLS], solid_bitmap(8, 8, 40, 50, 60));
+        shared.push(vec![0.3; GRID_CELLS], solid_bitmap(8, 8, 70, 80, 90));
+
+        capture.keep_frame(0).unwrap();
+        capture.keep_frame(0).unwrap();
+        capture.keep_frame(1).unwrap();
+
+        // Push enough new frames to evict frame 2 from the ring without keeping it.
+        for i in 0..RING_FRAMES {
+            shared.push(vec![0.4; GRID_CELLS], solid_bitmap(8, 8, i as u8, 100, 110));
+        }
+        assert!(matches!(
+            capture.keep_frame(2),
+            Err(ScreenError::FrameGone(2))
+        ));
+
+        let stopped = capture.stop().unwrap();
+        assert_eq!(stopped.frames.len(), 3 + RING_FRAMES);
+        assert_eq!(stopped.kept.len(), 2);
+        assert_eq!(stopped.kept[0].0, 0);
+        assert_eq!(stopped.kept[1].0, 1);
+        assert_eq!(stopped.recent.len(), RING_FRAMES);
+
+        let decoded0 = crate::adapters::image::read_png(&stopped.kept[0].1).unwrap();
+        assert_eq!((decoded0.width, decoded0.height), (8, 8));
+        assert_eq!(&decoded0.bgra[..4], &[10, 20, 30, 255]);
+
+        let decoded1 = crate::adapters::image::read_png(&stopped.kept[1].1).unwrap();
+        assert_eq!((decoded1.width, decoded1.height), (8, 8));
+        assert_eq!(&decoded1.bgra[..4], &[40, 50, 60, 255]);
+    }
+
+    #[test]
+    fn stop_without_keep_frame_writes_nothing_and_returns_recent_bitmaps() {
+        let dir = ScratchDir::new("no_keep");
+        let candidates_dir = dir.0.join("candidates");
+        let (capture, shared) = test_capture_for_dir(candidates_dir.clone());
+
+        shared.push(vec![0.1; GRID_CELLS], solid_bitmap(4, 4, 1, 2, 3));
+        shared.push(vec![0.2; GRID_CELLS], solid_bitmap(4, 4, 4, 5, 6));
+
+        let stopped = capture.stop().unwrap();
+        assert_eq!(stopped.frames.len(), 2);
+        assert!(stopped.kept.is_empty());
+        assert_eq!(stopped.recent.len(), 2);
+        assert!(!candidates_dir.exists());
     }
 }

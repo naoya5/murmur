@@ -42,7 +42,7 @@ pub struct TranscribeRequest {
     pub language: Language,
     pub model: ModelSpec,
     pub vad: ModelSpec,
-    pub vocabulary: Vec<DictionaryEntry>,
+    pub vocabulary: Arc<[DictionaryEntry]>,
     pub cancel: CancelToken,
 }
 
@@ -59,7 +59,7 @@ pub struct RangesRequest {
     pub ranges: Vec<Range<usize>>,
     pub language: Language,
     pub model: ModelSpec,
-    pub vocabulary: Vec<DictionaryEntry>,
+    pub vocabulary: Arc<[DictionaryEntry]>,
     pub cancel: CancelToken,
 }
 
@@ -82,7 +82,7 @@ pub struct StreamRequest {
     pub language: Language,
     pub model: ModelSpec,
     pub vad: ModelSpec,
-    pub vocabulary: Vec<DictionaryEntry>,
+    pub vocabulary: Arc<[DictionaryEntry]>,
     pub cancel: CancelToken,
 }
 
@@ -224,18 +224,20 @@ impl Inference {
                     warm_pending: worker_warm_pending,
                 };
                 loop {
-                    let poll = if worker.stream.as_ref().is_some_and(|s| !s.dead) {
-                        Duration::from_millis(10)
-                    } else {
-                        Duration::from_secs(1)
-                    };
-                    let job = match rx.recv_timeout(poll) {
-                        Ok(job) => job,
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            worker.poll_stream();
-                            continue;
+                    let job = if worker.stream.as_ref().is_some_and(|s| !s.dead) {
+                        match rx.recv_timeout(Duration::from_millis(10)) {
+                            Ok(job) => job,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                worker.poll_stream();
+                                continue;
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                         }
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    } else {
+                        match rx.recv() {
+                            Ok(job) => job,
+                            Err(_) => break,
+                        }
                     };
                     if let Job::Shutdown(ack) = job {
                         worker.unload_all();
@@ -401,6 +403,7 @@ struct LoadedEngine {
     id: &'static str,
     engine: Box<dyn SpeechEngine>,
     custom_vocabulary: bool,
+    warmed: bool,
 }
 
 struct LoadedVad {
@@ -503,6 +506,9 @@ impl Worker {
         let Some(engine) = self.engine.as_mut() else {
             return;
         };
+        if engine.warmed {
+            return;
+        }
         // Bypass VAD so silence reaches every encoder layer without touching S1's detector
         // state. Half a second also exceeds FastConformer's 20 ms minimum input length.
         let silence = [0.0; murmur_core::SAMPLE_RATE_HZ as usize / 2];
@@ -513,11 +519,14 @@ impl Worker {
                 .first()
                 .copied()
                 .unwrap_or(Language::Ja),
-            vocabulary: Vec::new(),
+            vocabulary: Arc::from([]),
             cancel: CancelToken::new(),
         };
-        if let Err(error) = engine.engine.transcribe(&silence, &opts) {
-            tracing::warn!(%error, model = model.entry.id, "engine warm-up failed");
+        match engine.engine.transcribe(&silence, &opts) {
+            Ok(_) => engine.warmed = true,
+            Err(error) => {
+                tracing::warn!(%error, model = model.entry.id, "engine warm-up failed");
+            }
         }
     }
 
@@ -558,6 +567,7 @@ impl Worker {
             id: spec.entry.id,
             engine,
             custom_vocabulary,
+            warmed: false,
         });
         self.set_loaded(Some(spec.entry.id));
         Ok(())
@@ -599,6 +609,7 @@ impl Worker {
             };
             match engine.engine.transcribe(slice, opts) {
                 Ok(raw) => {
+                    engine.warmed = true;
                     texts.push(raw.text);
                     for lang in raw.languages {
                         if !languages.contains(&lang) {
@@ -754,6 +765,7 @@ impl Worker {
                             EngineError::Cancelled => InferenceError::Cancelled,
                             other => InferenceError::Engine(other),
                         })?;
+                    engine.warmed = true;
                     if text::is_hallucination(&raw.text) {
                         RawTranscript {
                             text: String::new(),
@@ -1174,7 +1186,7 @@ mod tests {
             language: Language::Ja,
             model: spec(model),
             vad: spec(catalog::VAD_MODEL),
-            vocabulary: vec![],
+            vocabulary: Arc::from([]),
             cancel: CancelToken::new(),
         }
     }
@@ -1184,7 +1196,7 @@ mod tests {
             language: Language::Ja,
             model: spec(model),
             vad: spec(catalog::VAD_MODEL),
-            vocabulary: vec![],
+            vocabulary: Arc::from([]),
             cancel,
         }
     }
@@ -1234,14 +1246,94 @@ mod tests {
             assert_eq!(CALLS.load(Ordering::SeqCst) - calls, 1);
             assert_eq!(SILENT_CALLS.load(Ordering::SeqCst) - silent, 1);
             assert_eq!(SILENT_SAMPLES.load(Ordering::SeqCst), 8_000);
-            // A later recording warms the resident model without reloading either model.
+            // A later recording skips the redundant silent inference once the resident model is warmed.
             inference.warm(spec(model), spec(catalog::VAD_MODEL));
             assert!(inference.wait_idle(Duration::from_secs(10)));
             assert_eq!(LOADS.load(Ordering::SeqCst) - loads, 1);
             assert_eq!(VAD_LOADS.load(Ordering::SeqCst) - vads, 1);
-            assert_eq!(CALLS.load(Ordering::SeqCst) - calls, 2);
+            assert_eq!(CALLS.load(Ordering::SeqCst) - calls, 1);
+            assert_eq!(SILENT_CALLS.load(Ordering::SeqCst) - silent, 1);
             inference.shutdown(Duration::from_secs(10));
         }
+    }
+
+    #[test]
+    fn warm_resets_after_model_switch_and_unload() {
+        let _serial = serial();
+        let inference = Inference::spawn(engines, vads);
+        let loads = LOADS.load(Ordering::SeqCst);
+        let silent = SILENT_CALLS.load(Ordering::SeqCst);
+
+        inference.warm(spec(catalog::DEFAULT_JA_MODEL), spec(catalog::VAD_MODEL));
+        assert!(inference.wait_idle(Duration::from_secs(10)));
+        assert_eq!(LOADS.load(Ordering::SeqCst) - loads, 1);
+        assert_eq!(SILENT_CALLS.load(Ordering::SeqCst) - silent, 1);
+
+        // Same resident model stays warmed.
+        inference.warm(spec(catalog::DEFAULT_JA_MODEL), spec(catalog::VAD_MODEL));
+        assert!(inference.wait_idle(Duration::from_secs(10)));
+        assert_eq!(LOADS.load(Ordering::SeqCst) - loads, 1);
+        assert_eq!(SILENT_CALLS.load(Ordering::SeqCst) - silent, 1);
+
+        // Switching to another model resets warmed so the new model warms once.
+        inference.warm(spec(catalog::DEFAULT_EN_MODEL), spec(catalog::VAD_MODEL));
+        assert!(inference.wait_idle(Duration::from_secs(10)));
+        assert_eq!(LOADS.load(Ordering::SeqCst) - loads, 2);
+        assert_eq!(SILENT_CALLS.load(Ordering::SeqCst) - silent, 2);
+
+        inference.warm(spec(catalog::DEFAULT_EN_MODEL), spec(catalog::VAD_MODEL));
+        assert!(inference.wait_idle(Duration::from_secs(10)));
+        assert_eq!(SILENT_CALLS.load(Ordering::SeqCst) - silent, 2);
+
+        // Unloading also resets warmed.
+        inference.unload();
+        assert!(inference.wait_idle(Duration::from_secs(10)));
+        assert_eq!(inference.loaded_model(), None);
+        inference.warm(spec(catalog::DEFAULT_EN_MODEL), spec(catalog::VAD_MODEL));
+        assert!(inference.wait_idle(Duration::from_secs(10)));
+        assert_eq!(LOADS.load(Ordering::SeqCst) - loads, 3);
+        assert_eq!(SILENT_CALLS.load(Ordering::SeqCst) - silent, 3);
+        inference.shutdown(Duration::from_secs(10));
+    }
+
+    #[test]
+    fn real_inference_marks_engine_warmed_and_skips_later_warm() {
+        let _serial = serial();
+        let inference = Inference::spawn(engines, vads);
+        let rt = rt();
+        let calls = CALLS.load(Ordering::SeqCst);
+        let silent = SILENT_CALLS.load(Ordering::SeqCst);
+
+        // Real transcription warms the loaded engine without needing a silent pass afterward.
+        rt.block_on(inference.transcribe(request(vec![0.5; 16_000], catalog::DEFAULT_JA_MODEL)))
+            .unwrap();
+        assert_eq!(CALLS.load(Ordering::SeqCst) - calls, 1);
+        assert_eq!(SILENT_CALLS.load(Ordering::SeqCst) - silent, 0);
+
+        inference.warm(spec(catalog::DEFAULT_JA_MODEL), spec(catalog::VAD_MODEL));
+        assert!(inference.wait_idle(Duration::from_secs(10)));
+        assert_eq!(CALLS.load(Ordering::SeqCst) - calls, 1);
+        assert_eq!(SILENT_CALLS.load(Ordering::SeqCst) - silent, 0);
+
+        // Range transcription also marks the engine warmed after unload.
+        inference.unload();
+        assert!(inference.wait_idle(Duration::from_secs(10)));
+        let ranges = RangesRequest {
+            pcm: Arc::new(vec![0.5; 16_000]),
+            ranges: std::iter::once(0..16_000).collect(),
+            language: Language::Ja,
+            model: spec(catalog::DEFAULT_JA_MODEL),
+            vocabulary: Arc::from([]),
+            cancel: CancelToken::new(),
+        };
+        rt.block_on(inference.transcribe_ranges(ranges)).unwrap();
+        assert_eq!(CALLS.load(Ordering::SeqCst) - calls, 2);
+
+        inference.warm(spec(catalog::DEFAULT_JA_MODEL), spec(catalog::VAD_MODEL));
+        assert!(inference.wait_idle(Duration::from_secs(10)));
+        assert_eq!(CALLS.load(Ordering::SeqCst) - calls, 2);
+        assert_eq!(SILENT_CALLS.load(Ordering::SeqCst) - silent, 0);
+        inference.shutdown(Duration::from_secs(10));
     }
 
     #[test]
@@ -1277,14 +1369,20 @@ mod tests {
             .unwrap();
         entered.recv_timeout(Duration::from_secs(10)).unwrap();
         let calls = CALLS.load(Ordering::SeqCst);
-        for _ in 0..20 {
+        for i in 0..20 {
+            let model = if i == 0 {
+                catalog::DEFAULT_EN_MODEL
+            } else {
+                catalog::DEFAULT_JA_MODEL
+            };
             inference
                 .clone()
-                .warm(spec(catalog::DEFAULT_JA_MODEL), spec(catalog::VAD_MODEL));
+                .warm(spec(model), spec(catalog::VAD_MODEL));
         }
         release_tx.send(()).unwrap();
         assert!(inference.wait_idle(Duration::from_secs(10)));
         assert_eq!(CALLS.load(Ordering::SeqCst) - calls, 2);
+        assert_eq!(inference.loaded_model(), Some(catalog::DEFAULT_EN_MODEL));
         assert!(done.try_recv().unwrap().is_ok());
         inference.shutdown(Duration::from_secs(10));
     }
@@ -1343,6 +1441,8 @@ mod tests {
             .unwrap()
             .text;
         for warm_first in [true, false] {
+            inference.unload();
+            assert!(inference.wait_idle(Duration::from_secs(10)));
             let id = StreamId(80);
             let calls = CALLS.load(Ordering::SeqCst);
             if warm_first {
