@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useT } from "../i18n";
 import {
   type Combo,
@@ -50,39 +50,26 @@ export function KeyRecorder({
   const [listening, setListening] = useState(false);
   const [pending, setPending] = useState<Combo | null>(null);
   const [hint, setHint] = useState<string | null>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
   const startRef = useRef(onListenStart);
   startRef.current = onListenStart;
   const endRef = useRef(onListenEnd);
   endRef.current = onListenEnd;
 
-  useEffect(() => {
-    if (!listening) {
-      return;
-    }
-    startRef.current?.();
-    return () => {
-      endRef.current?.();
-    };
-  }, [listening]);
-
-  const stop = () => {
+  const stop = useCallback(() => {
     setListening(false);
     setPending(null);
     setHint(null);
-  };
+  }, []);
 
-  const onKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
-    if (!listening) {
-      if (e.key === "Enter" || e.key === " ") {
-        e.preventDefault();
-        setListening(true);
-      }
-      return;
-    }
+  const onListenKeyDown = (e: KeyboardEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    if (e.code === "Escape") {
+    if (e.code === "Escape" || e.key === "Escape") {
       stop();
+      return;
+    }
+    if (e.repeat) {
       return;
     }
     if (e.code === "Backspace" && clearable && !hasModifier(comboFromEvent(e))) {
@@ -105,13 +92,54 @@ export function KeyRecorder({
     stop();
   };
 
-  const onKeyUp = (e: React.KeyboardEvent<HTMLButtonElement>) => {
-    if (listening && pending && !pending.key) {
+  const onListenKeyUp = (e: KeyboardEvent) => {
+    if (pending && !pending.key) {
       // All modifiers released without a key: keep listening, show the hint.
       if (!e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey) {
         setPending(null);
         setHint(t.hotkey.modifiersOnly);
       }
+    }
+  };
+
+  const keyDownRef = useRef(onListenKeyDown);
+  keyDownRef.current = onListenKeyDown;
+  const keyUpRef = useRef(onListenKeyUp);
+  keyUpRef.current = onListenKeyUp;
+
+  useEffect(() => {
+    if (!listening) {
+      return;
+    }
+    // macOS WKWebView does not move focus to <button> on click; focus explicitly and capture on
+    // window while listening so combos, Esc and outside clicks work even without button focus.
+    buttonRef.current?.focus();
+    startRef.current?.();
+    const onKeyDown = (e: KeyboardEvent) => keyDownRef.current(e);
+    const onKeyUp = (e: KeyboardEvent) => keyUpRef.current(e);
+    const onPointerDown = (e: PointerEvent) => {
+      if (!(e.target instanceof Node) || !buttonRef.current?.contains(e.target)) {
+        stop();
+      }
+    };
+    const onWindowBlur = () => stop();
+    window.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("keyup", onKeyUp, true);
+    window.addEventListener("pointerdown", onPointerDown, true);
+    window.addEventListener("blur", onWindowBlur);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("keyup", onKeyUp, true);
+      window.removeEventListener("pointerdown", onPointerDown, true);
+      window.removeEventListener("blur", onWindowBlur);
+      endRef.current?.();
+    };
+  }, [listening, stop]);
+
+  const onButtonKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (!listening && (e.key === "Enter" || e.key === " ")) {
+      e.preventDefault();
+      setListening(true);
     }
   };
 
@@ -128,6 +156,7 @@ export function KeyRecorder({
       style={{ display: "inline-flex", flexDirection: "column", alignItems: "flex-end", gap: 3 }}
     >
       <button
+        ref={buttonRef}
         type="button"
         className={`keyrec${listening ? " keyrec--listening" : ""}`}
         aria-label={label}
@@ -135,10 +164,11 @@ export function KeyRecorder({
         onClick={() => {
           if (!listening) {
             setListening(true);
+          } else {
+            buttonRef.current?.focus();
           }
         }}
-        onKeyDown={onKeyDown}
-        onKeyUp={onKeyUp}
+        onKeyDown={onButtonKeyDown}
         onBlur={() => {
           if (listening) {
             stop();

@@ -88,4 +88,45 @@ describe("KeyRecorder", () => {
     unmount();
     expect(onListenEnd).toHaveBeenCalledTimes(1);
   });
+
+  it("focuses the button on click and captures combos even if another element has focus", () => {
+    const { button, onChange, onListenEnd } = setup();
+    fireEvent.click(button);
+    expect(document.activeElement).toBe(button);
+
+    fireEvent.keyDown(document.body, { code: "KeyD", metaKey: true, shiftKey: true });
+    expect(onChange).toHaveBeenCalledWith("Cmd+Shift+D");
+    expect(onListenEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels with Escape even when dispatched outside the button", () => {
+    const { button, onChange, onListenEnd } = setup();
+    fireEvent.click(button);
+    fireEvent.keyDown(document.body, { code: "Escape", key: "Escape" });
+    expect(onChange).not.toHaveBeenCalled();
+    expect(onListenEnd).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("Space")).toBeTruthy();
+  });
+
+  it("cancels on outside pointerdown and window blur", () => {
+    const first = setup();
+    fireEvent.click(first.button);
+    fireEvent.pointerDown(document.body);
+    expect(first.onListenEnd).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("Space")).toBeTruthy();
+    cleanup();
+
+    const second = setup();
+    fireEvent.click(second.button);
+    fireEvent(window, new Event("blur"));
+    expect(second.onListenEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores repeated keydown events while listening", () => {
+    const { button, onChange } = setup();
+    fireEvent.click(button);
+    fireEvent.keyDown(button, { code: "Space", repeat: true });
+    expect(onChange).not.toHaveBeenCalled();
+    expect(screen.getByText("Press keys")).toBeTruthy();
+  });
 });
