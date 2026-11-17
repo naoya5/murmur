@@ -1,3 +1,4 @@
+import { ChevronRight } from "lucide-react";
 import type { HTMLAttributes, ReactNode } from "react";
 
 type CardProps = HTMLAttributes<HTMLDivElement> & { tight?: boolean };
@@ -28,6 +29,7 @@ export function Group({ title, badge, children, id }: GroupProps) {
 }
 
 type RowProps = {
+  icon?: ReactNode;
   label: ReactNode;
   hint?: ReactNode;
   error?: string | null;
@@ -36,9 +38,14 @@ type RowProps = {
   stack?: boolean;
 };
 
-export function Row({ label, hint, error, children, stack }: RowProps) {
+export function Row({ icon, label, hint, error, children, stack }: RowProps) {
   return (
     <div className={stack ? "row row--stack" : "row"}>
+      {icon && (
+        <span className="row__icon" aria-hidden="true">
+          {icon}
+        </span>
+      )}
       <div className="row__body">
         <span className="row__label">{label}</span>
         {hint && <span className="row__hint">{hint}</span>}
@@ -54,20 +61,29 @@ export function Row({ label, hint, error, children, stack }: RowProps) {
 }
 
 type LinkRowProps = {
+  icon?: ReactNode;
   label: ReactNode;
   hint?: ReactNode;
   onClick: () => void;
   trailing?: ReactNode;
 };
 
-export function LinkRow({ label, hint, onClick, trailing }: LinkRowProps) {
+export function LinkRow({ icon, label, hint, onClick, trailing }: LinkRowProps) {
   return (
     <button type="button" className="row row--link" onClick={onClick}>
+      {icon && (
+        <span className="row__icon" aria-hidden="true">
+          {icon}
+        </span>
+      )}
       <div className="row__body">
         <span className="row__label">{label}</span>
         {hint && <span className="row__hint">{hint}</span>}
       </div>
-      {trailing && <div className="row__control">{trailing}</div>}
+      <div className="row__control row__control--link">
+        {trailing}
+        <ChevronRight className="row__chevron" aria-hidden="true" />
+      </div>
     </button>
   );
 }

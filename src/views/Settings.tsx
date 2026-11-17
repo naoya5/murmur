@@ -1,11 +1,38 @@
-import { Check, ExternalLink, LoaderCircle } from "lucide-react";
+import {
+  BookA,
+  Camera,
+  Check,
+  ClipboardCheck,
+  Clock,
+  Cpu,
+  Eraser,
+  ExternalLink,
+  Folder,
+  Gauge,
+  Globe,
+  HardDrive,
+  History as HistoryIcon,
+  Keyboard,
+  Languages,
+  Layers,
+  LoaderCircle,
+  Lock,
+  Mic,
+  Power,
+  RefreshCw,
+  Shield,
+  Sparkles,
+  Tag,
+  Trash2,
+  Volume2,
+} from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigation } from "../app/navigation";
 import { useSettings } from "../app/settings";
 import { useUpdates } from "../app/updates";
 import { Badge, Dot } from "../components/Badge";
 import { Button } from "../components/Button";
-import { Group, LinkRow, Row } from "../components/Glass";
+import { Card, Group, LinkRow, Row } from "../components/Glass";
 import { KeyRecorder } from "../components/KeyRecorder";
 import { Segmented } from "../components/Segmented";
 import { Select } from "../components/Select";
@@ -14,7 +41,7 @@ import { Tabs, tabId, tabPanelId, useTabsId } from "../components/Tabs";
 import { NumberField } from "../components/TextField";
 import { useToast } from "../components/Toast";
 import { Toggle } from "../components/Toggle";
-import { type Strings, useT } from "../i18n";
+import { languageName, type Strings, useT } from "../i18n";
 import {
   type AppInfo,
   type ApplyError,
@@ -29,7 +56,8 @@ import {
   type UiLanguage,
   useEvent,
 } from "../ipc";
-import { formatBytes } from "../lib/format";
+import { formatAttribution, formatBytes } from "../lib/format";
+import { displayAccelerator } from "../lib/hotkey";
 
 type Field = keyof SettingsType | "permissions" | "stats";
 
@@ -195,10 +223,27 @@ export function Settings() {
     setFolderNote(result === null || result.status === "error");
   };
 
+  const previewBase = settings.refine_enabled
+    ? t.settings.outputPreview.withRefine
+    : settings.remove_fillers
+      ? t.settings.outputPreview.withoutFillers
+      : t.settings.outputPreview.withFillers;
+  const previewResult = settings.add_final_punctuation
+    ? `${previewBase}${t.locale === "ja" ? "。" : "."}`
+    : previewBase;
+
   return (
     <>
       <header ref={headerRef} className="view__header">
         <h1 className="view__title">{t.settings.title}</h1>
+        <span className="status-pill">
+          <span className="status-pill__dot" aria-hidden="true" />
+          <span className="tnum">{displayAccelerator(settings.hotkey)}</span>
+          <span className="status-pill__sep" aria-hidden="true">
+            ·
+          </span>
+          <span>{languageName(t, settings.language)}</span>
+        </span>
       </header>
 
       <Tabs
@@ -225,6 +270,7 @@ export function Settings() {
         {tab === "general" && (
           <Group title={t.settings.general}>
             <Row
+              icon={<Globe />}
               label={t.settings.uiLanguage}
               hint={t.settings.uiLanguageHint}
               error={errors.ui_language}
@@ -240,7 +286,7 @@ export function Settings() {
                 ]}
               />
             </Row>
-            <Row label={t.settings.launchAtLogin} error={errors.launch_at_login}>
+            <Row icon={<Power />} label={t.settings.launchAtLogin} error={errors.launch_at_login}>
               <Toggle
                 label={t.settings.launchAtLogin}
                 checked={settings.launch_at_login}
@@ -248,6 +294,7 @@ export function Settings() {
               />
             </Row>
             <Row
+              icon={<RefreshCw />}
               label={t.settings.autoCheckUpdates}
               hint={t.settings.autoCheckUpdatesHint}
               error={errors.auto_check_updates}
@@ -258,7 +305,7 @@ export function Settings() {
                 onChange={(auto_check_updates) => set("auto_check_updates", { auto_check_updates })}
               />
             </Row>
-            <Row label={t.settings.sounds} error={errors.sounds}>
+            <Row icon={<Volume2 />} label={t.settings.sounds} error={errors.sounds}>
               <Toggle
                 label={t.settings.sounds}
                 checked={settings.sounds}
@@ -270,7 +317,12 @@ export function Settings() {
 
         {tab === "recording" && (
           <Group>
-            <Row label={t.settings.hotkey} hint={t.settings.hotkeyHint} error={errors.hotkey}>
+            <Row
+              icon={<Keyboard />}
+              label={t.settings.hotkey}
+              hint={t.settings.hotkeyHint}
+              error={errors.hotkey}
+            >
               <KeyRecorder
                 label={t.settings.hotkey}
                 value={settings.hotkey}
@@ -284,6 +336,7 @@ export function Settings() {
               />
             </Row>
             <Row
+              icon={<Keyboard />}
               label={t.settings.alternateHotkey}
               hint={t.settings.alternateHotkeyHint}
               error={errors.alternate_language_hotkey}
@@ -299,7 +352,7 @@ export function Settings() {
                 }
               />
             </Row>
-            <Row label={t.settings.recordMode} error={errors.record_mode}>
+            <Row icon={<Mic />} label={t.settings.recordMode} error={errors.record_mode}>
               <Segmented<RecordMode>
                 label={t.settings.recordMode}
                 value={settings.record_mode}
@@ -310,7 +363,7 @@ export function Settings() {
                 ]}
               />
             </Row>
-            <Row label={t.settings.microphone} error={errors.microphone}>
+            <Row icon={<Mic />} label={t.settings.microphone} error={errors.microphone}>
               <Select
                 label={t.settings.microphone}
                 value={settings.microphone ?? SYSTEM_DEFAULT}
@@ -326,7 +379,12 @@ export function Settings() {
                 ]}
               />
             </Row>
-            <Row label={t.settings.language} hint={t.settings.languageHint} error={errors.language}>
+            <Row
+              icon={<Globe />}
+              label={t.settings.language}
+              hint={t.settings.languageHint}
+              error={errors.language}
+            >
               <Segmented<Language>
                 label={t.settings.language}
                 value={settings.language}
@@ -338,12 +396,14 @@ export function Settings() {
               />
             </Row>
             <LinkRow
+              icon={<Layers />}
               label={t.settings.model}
               hint={`${t.common.japanese}: ${modelName("ja")}, ${t.common.english}: ${modelName("en")}`}
               onClick={() => navigate("models")}
               trailing={<span className="muted small">{t.settings.manageModels}</span>}
             />
             <Row
+              icon={<HardDrive />}
               label={t.settings.unloadModel}
               hint={t.settings.unloadModelHint}
               error={errors.unload_model_after_min}
@@ -387,6 +447,7 @@ export function Settings() {
             badge={<Badge tone="accent">{t.settings.experimental.badge}</Badge>}
           >
             <Row
+              icon={<Camera />}
               label={t.settings.experimental.toggle}
               hint={t.settings.experimental.toggleHint}
               error={errors.annotations_enabled}
@@ -403,6 +464,7 @@ export function Settings() {
             {settings.annotations_enabled && (
               <>
                 <Row
+                  icon={<Keyboard />}
                   label={t.settings.experimental.hotkey}
                   hint={t.settings.experimental.hotkeyHint}
                   error={errors.annotations_hotkey}
@@ -420,6 +482,7 @@ export function Settings() {
                   />
                 </Row>
                 <Row
+                  icon={<Shield />}
                   label={
                     <span className="perm">
                       <Dot tone={permissions?.screen_recording ? "ok" : "warn"} />
@@ -438,6 +501,7 @@ export function Settings() {
                   )}
                 </Row>
                 <Row
+                  icon={<Clock />}
                   label={t.settings.experimental.retention}
                   hint={t.settings.experimental.retentionHint}
                   error={errors.annotations_retention_days}
@@ -454,6 +518,7 @@ export function Settings() {
                   />
                 </Row>
                 <Row
+                  icon={<Folder />}
                   label={t.settings.experimental.folderLabel}
                   hint={
                     folderNote
@@ -474,6 +539,7 @@ export function Settings() {
         {tab === "recording" && (
           <Group>
             <Row
+              icon={<Sparkles />}
               label={t.settings.experimental.refine}
               hint={t.settings.experimental.refineHint}
               error={errors.refine_enabled}
@@ -540,6 +606,7 @@ export function Settings() {
         {tab === "recording" && (
           <Group>
             <Row
+              icon={<Languages />}
               label={t.settings.experimental.translate}
               hint={t.settings.experimental.translateHint}
               error={errors.translate_enabled}
@@ -603,8 +670,30 @@ export function Settings() {
         )}
 
         {tab === "output" && (
+          <Card className="preview-card" aria-hidden="true">
+            <div className="preview-card__head">
+              <span className="preview-card__badge">{t.settings.outputPreview.badge}</span>
+              <span className="caption muted">
+                {`${settings.remove_fillers ? t.settings.removeFillers : ""} ${settings.refine_enabled ? `· ${t.settings.experimental.refine}` : ""}`.trim()}
+              </span>
+            </div>
+            <div className="preview-card__line">
+              <span className="preview-card__tag">{t.settings.outputPreview.spokenLabel}</span>
+              <span className="preview-card__raw">{t.settings.outputPreview.spokenSample}</span>
+            </div>
+            <div className="preview-card__line">
+              <span className="preview-card__tag preview-card__tag--accent">
+                {t.settings.outputPreview.outputLabel}
+              </span>
+              <span className="preview-card__out">{previewResult}</span>
+            </div>
+          </Card>
+        )}
+
+        {tab === "output" && (
           <Group title={t.settings.output}>
             <Row
+              icon={<ClipboardCheck />}
               label={t.settings.autoPaste}
               hint={t.settings.autoPasteHint}
               error={errors.auto_paste}
@@ -616,6 +705,7 @@ export function Settings() {
               />
             </Row>
             <Row
+              icon={<HistoryIcon />}
               label={t.settings.restoreClipboard}
               hint={t.settings.restoreClipboardHint}
               error={errors.restore_clipboard}
@@ -632,6 +722,7 @@ export function Settings() {
         {tab === "output" && (
           <Group title={t.settings.text}>
             <Row
+              icon={<Eraser />}
               label={t.settings.removeFillers}
               hint={t.settings.removeFillersHint}
               error={errors.remove_fillers}
@@ -642,7 +733,11 @@ export function Settings() {
                 onChange={(remove_fillers) => set("remove_fillers", { remove_fillers })}
               />
             </Row>
-            <Row label={t.settings.finalPunctuation} error={errors.add_final_punctuation}>
+            <Row
+              icon={<Check />}
+              label={t.settings.finalPunctuation}
+              error={errors.add_final_punctuation}
+            >
               <Toggle
                 label={t.settings.finalPunctuation}
                 checked={settings.add_final_punctuation}
@@ -652,6 +747,7 @@ export function Settings() {
               />
             </Row>
             <LinkRow
+              icon={<BookA />}
               label={t.settings.dictionary}
               hint={t.settings.dictionaryHint(settings.dictionary.length)}
               onClick={() => navigate("dictionary")}
@@ -663,6 +759,7 @@ export function Settings() {
         {tab === "general" && (
           <Group title={t.settings.stats}>
             <Row
+              icon={<Gauge />}
               label={t.settings.typingWpm}
               hint={t.settings.typingHint}
               error={errors.typing_wpm_en}
@@ -676,7 +773,7 @@ export function Settings() {
                 onCommit={(typing_wpm_en) => set("typing_wpm_en", { typing_wpm_en })}
               />
             </Row>
-            <Row label={t.settings.typingCpm} error={errors.typing_cpm_ja}>
+            <Row icon={<Gauge />} label={t.settings.typingCpm} error={errors.typing_cpm_ja}>
               <NumberField
                 label={t.settings.typingCpm}
                 value={settings.typing_cpm_ja}
@@ -686,7 +783,12 @@ export function Settings() {
                 onCommit={(typing_cpm_ja) => set("typing_cpm_ja", { typing_cpm_ja })}
               />
             </Row>
-            <Row label={t.settings.resetStats} hint={t.settings.resetBody} error={errors.stats}>
+            <Row
+              icon={<Trash2 />}
+              label={t.settings.resetStats}
+              hint={t.settings.resetBody}
+              error={errors.stats}
+            >
               <Button variant="danger" onClick={() => setConfirmReset(true)}>
                 {t.settings.resetStats}
               </Button>
@@ -696,7 +798,7 @@ export function Settings() {
 
         {tab === "privacy" && (
           <Group>
-            <Row label={t.settings.retention} error={errors.history_retention}>
+            <Row icon={<Clock />} label={t.settings.retention} error={errors.history_retention}>
               {settings.history_retention.kind === "days" && (
                 <NumberField
                   label={t.settings.days}
@@ -725,6 +827,7 @@ export function Settings() {
               />
             </Row>
             <Row
+              icon={<Mic />}
               label={
                 <span className="perm">
                   <Dot
@@ -739,8 +842,15 @@ export function Settings() {
                   {t.settings.micPermission}
                 </span>
               }
-              hint={permissions ? permissionLabel(permissions.microphone) : undefined}
+              hint={
+                permissions && permissions.microphone !== "Granted"
+                  ? permissionLabel(permissions.microphone)
+                  : undefined
+              }
             >
+              {permissions?.microphone === "Granted" && (
+                <span className="muted small">{t.settings.granted}</span>
+              )}
               {permissions?.microphone === "NotDetermined" && (
                 <Button
                   size="sm"
@@ -761,6 +871,7 @@ export function Settings() {
               )}
             </Row>
             <Row
+              icon={<Shield />}
               label={
                 <span className="perm">
                   <Dot tone={permissions?.accessibility ? "ok" : "warn"} />
@@ -796,6 +907,7 @@ export function Settings() {
               )}
             </Row>
             <Row
+              icon={<Folder />}
               label={t.settings.dataDir}
               hint={<span className="datadir selectable">{info?.data_dir ?? ""}</span>}
             />
@@ -805,16 +917,14 @@ export function Settings() {
 
         {tab === "about" && (
           <Group>
-            <Row label={t.settings.version} hint={t.app.name}>
+            <Row icon={<Tag />} label={t.settings.version} hint={t.app.name}>
               <span className="tnum">{info?.version ?? ""}</span>
             </Row>
-            <Row label={t.settings.updates} stack>
-              <UpdateRow updates={updates} />
-            </Row>
-            <Row label={t.settings.engine}>
+            <UpdateRow updates={updates} />
+            <Row icon={<Cpu />} label={t.settings.engine}>
               <span>{info?.speech_engine ?? ""}</span>
             </Row>
-            <Row label={t.settings.schema}>
+            <Row icon={<Lock />} label={t.settings.schema}>
               <span className="tnum">{settings.schema_version}</span>
             </Row>
             <Row label={t.settings.licenses} stack>
@@ -823,29 +933,32 @@ export function Settings() {
                   <span className="license__name">speech.cpp</span>
                   <span className="license__text">MIT</span>
                 </div>
-                {models.map((m) => (
-                  <div key={m.entry.id} className="license">
-                    <span className="license__name">{m.entry.display_name}</span>
-                    <span className="license__text">
-                      {m.entry.license}
-                      {m.entry.attribution ? `. ${m.entry.attribution}` : ""}
-                    </span>
-                    <span>
-                      <button
-                        type="button"
-                        className="btn btn--quiet btn--sm"
-                        onClick={() =>
-                          commands
-                            .openUrl(`https://huggingface.co/${m.entry.repository}`)
-                            .catch(() => undefined)
-                        }
-                      >
-                        <ExternalLink aria-hidden="true" />
-                        {m.entry.repository}
-                      </button>
-                    </span>
-                  </div>
-                ))}
+                {models.map((m) => {
+                  const attr = formatAttribution(m.entry.attribution, m.entry.license);
+                  return (
+                    <div key={m.entry.id} className="license">
+                      <span className="license__name">{m.entry.display_name}</span>
+                      <span className="license__text">
+                        {m.entry.license}
+                        {attr ? `. ${attr}` : ""}
+                      </span>
+                      <span>
+                        <button
+                          type="button"
+                          className="btn btn--quiet btn--sm"
+                          onClick={() =>
+                            commands
+                              .openUrl(`https://huggingface.co/${m.entry.repository}`)
+                              .catch(() => undefined)
+                          }
+                        >
+                          <ExternalLink aria-hidden="true" />
+                          {m.entry.repository}
+                        </button>
+                      </span>
+                    </div>
+                  );
+                })}
                 <div className="license">
                   <span className="license__name">lucide-react</span>
                   <span className="license__text">ISC</span>
@@ -853,6 +966,7 @@ export function Settings() {
               </div>
             </Row>
             <Row
+              icon={<Sparkles />}
               label={t.settings.showOnboarding}
               hint={settings.onboarding_completed ? t.settings.onboardingDone : undefined}
               error={errors.onboarding_completed}
@@ -915,30 +1029,38 @@ function UpdateRow({ updates }: { updates: ReturnType<typeof useUpdates> }) {
   }
 
   return (
-    <div className="update">
-      <div className="row__control">
-        <Button size="sm" onClick={check} disabled={busy}>
-          {t.settings.checkForUpdates}
-        </Button>
-        {info && (
-          <Button size="sm" variant="primary" onClick={install} disabled={busy}>
-            {state.kind === "installing" ? t.settings.installing : t.settings.installAndRestart}
-          </Button>
-        )}
-      </div>
-      {status && (
-        <div
-          className={`update__status${status.tone === "ok" ? " update__status--ok" : status.tone === "error" ? " update__status--error" : ""}`}
-          role="status"
-        >
-          {status.spin ? (
-            <LoaderCircle className="spin" aria-hidden="true" />
-          ) : status.tone === "ok" ? (
-            <Check aria-hidden="true" />
-          ) : null}
-          <span>{status.text}</span>
+    <div className="row row--stack">
+      <div className="row__top">
+        <span className="row__icon" aria-hidden="true">
+          <RefreshCw />
+        </span>
+        <div className="row__body">
+          <span className="row__label">{t.settings.updates}</span>
+          {status && (
+            <div
+              className={`update__status${status.tone === "ok" ? " update__status--ok" : status.tone === "error" ? " update__status--error" : ""}`}
+              role="status"
+            >
+              {status.spin ? (
+                <LoaderCircle className="spin" aria-hidden="true" />
+              ) : status.tone === "ok" ? (
+                <Check aria-hidden="true" />
+              ) : null}
+              <span>{status.text}</span>
+            </div>
+          )}
         </div>
-      )}
+        <div className="row__control">
+          <Button size="sm" onClick={check} disabled={busy}>
+            {t.settings.checkForUpdates}
+          </Button>
+          {info && (
+            <Button size="sm" variant="primary" onClick={install} disabled={busy}>
+              {state.kind === "installing" ? t.settings.installing : t.settings.installAndRestart}
+            </Button>
+          )}
+        </div>
+      </div>
       {info?.notes && <div className="update__notes selectable">{info.notes}</div>}
     </div>
   );

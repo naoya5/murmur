@@ -10,7 +10,7 @@ import { ConfirmSheet } from "../components/Sheet";
 import { useToast } from "../components/Toast";
 import { languageName, type Strings, useT } from "../i18n";
 import { commands, type Language, type ModelInfo, useEvent } from "../ipc";
-import { formatBytes, formatPercent } from "../lib/format";
+import { formatAttribution, formatBytes, formatPercent } from "../lib/format";
 
 export function downloadErrorText(message: string, t: Strings): string {
   const m = message.toLowerCase();
@@ -52,9 +52,11 @@ function ModelRow({
   // A refine model is named by its task, not by a tier.
   const tier =
     entry.tier === "internal" || entry.role === "refinement" ? null : t.models.tier[entry.tier];
+  const activeRow = inUse && entry.tier !== "internal";
+  const attribution = formatAttribution(entry.attribution, entry.license);
 
   return (
-    <div className="model">
+    <div className={activeRow ? "model model--active" : "model"}>
       <div className="model__head">
         <div style={{ minWidth: 0 }}>
           <div className="model__name">
@@ -136,7 +138,7 @@ function ModelRow({
           {downloadErrorText(error, t)}
         </p>
       )}
-      {entry.attribution && <p className="model__attr">{entry.attribution}</p>}
+      {attribution && <p className="model__attr">{attribution}</p>}
     </div>
   );
 }

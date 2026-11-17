@@ -35,3 +35,6 @@ dist-ssr
 # Sidecar binaries staged by scripts/build-sidecar.sh for Tauri externalBin
 /src-tauri/binaries/
 /crates/murmur-llm/target/
+
+# Local Pencil design canvas
+/design/
