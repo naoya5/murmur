@@ -77,6 +77,10 @@ export function Home() {
     return (
       <header className="view__header">
         <h1 className="view__title">{t.home.title}</h1>
+        <span className="status-pill">
+          <span className="status-pill__dot" aria-hidden="true" />
+          <span className="tnum">{hotkey}</span>
+        </span>
       </header>
     );
   }
@@ -87,7 +91,7 @@ export function Home() {
         <header className="view__header">
           <h1 className="view__title">{t.home.title}</h1>
         </header>
-        <Card>
+        <Card className="home__empty">
           <EmptyState icon={<Mic />} title={t.home.emptyTitle} body={t.home.emptyBody(hotkey)} />
         </Card>
       </>
@@ -102,11 +106,18 @@ export function Home() {
     <>
       <header className="view__header">
         <h1 className="view__title">{t.home.title}</h1>
+        <span className="status-pill">
+          <span className="status-pill__dot" aria-hidden="true" />
+          <span className="tnum">{hotkey}</span>
+        </span>
       </header>
 
       <Card className="hero" tight>
         <div className="hero__summary">
-          <span className="hero__label">{t.home.timeSaved}</span>
+          <div className="hero__head">
+            <span className="hero__label">{t.home.timeSaved}</span>
+            <Badge tone="accent">{t.home.today(data.today_sessions)}</Badge>
+          </div>
           <span className="hero__value">
             {saved.map((part) => (
               <span key={part.unit} className="hero__part">
@@ -115,9 +126,6 @@ export function Home() {
               </span>
             ))}
           </span>
-          <span className="hero__chips">
-            <Badge tone="accent">{t.home.today(data.today_sessions)}</Badge>
-          </span>
           <span className="hero__sub">
             {t.home.timeSavedSub(
               formatDuration(data.total_speech_ms, t),
@@ -125,7 +133,7 @@ export function Home() {
             )}
           </span>
         </div>
-        <div className="hero__chart">
+        <div className="hero__chart hero__chart--well">
           <div className="chart-card__head">
             <span className="chart-card__title">{t.home.last14}</span>
             <span className="chart-card__meta">{t.home.perDay}</span>

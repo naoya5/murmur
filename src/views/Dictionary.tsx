@@ -264,7 +264,7 @@ export function Dictionary() {
         entries.length > 0 && (
           <Card tight>
             {entries.map((entry) => (
-              <div key={entry.id} className="row">
+              <div key={entry.id} className="row dict__row">
                 <div className="row__body">
                   <span className="row__label dict__written">{entry.written}</span>
                   {entry.readings.length > 0 && (

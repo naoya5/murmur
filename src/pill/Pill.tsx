@@ -450,7 +450,14 @@ export default function Pill() {
                 </span>
                 <span className="pill__text">
                   <span>{notice.text}</span>
-                  {notice.sub && <span className="pill__sub">{notice.sub}</span>}
+                  {notice.sub && (
+                    <>
+                      <span className="pill__sep" aria-hidden="true">
+                        ·
+                      </span>
+                      <span className="pill__sub">{notice.sub}</span>
+                    </>
+                  )}
                 </span>
               </>
             )}

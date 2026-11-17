@@ -136,3 +136,16 @@ export function formatPercent(fraction: number, locale: Locale): string {
     Math.min(1, Math.max(0, fraction)),
   );
 }
+
+/** Strip a redundant trailing ", <license>" when rendered next to the license badge/prefix. */
+export function formatAttribution(
+  attribution: string | null | undefined,
+  license: string,
+): string | null {
+  if (!attribution) {
+    return null;
+  }
+  const escaped = license.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const trimmed = attribution.replace(new RegExp(`,\\s*${escaped}$`), "").trim();
+  return trimmed || null;
+}

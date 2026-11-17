@@ -113,6 +113,7 @@ export function Onboarding() {
   return (
     <div className="onboard">
       <div className="onboard__panel">
+        <div className="content__rim" aria-hidden="true" />
         <Steps current={step} />
         <div className="onboard__body">
           {step === 0 && (

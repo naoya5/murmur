@@ -115,6 +115,36 @@ type TrendProps = {
 
 const DEFAULT_MEASURE = (d: DayPoint) => d.sessions;
 
+/** Smooth monotone-ish cubic path through points, clamped vertically so curves never dip below baseline. */
+function smoothLinePath(xs: number[], ys: number[], minY: number, maxY: number): string {
+  const n = xs.length;
+  if (n === 0) {
+    return "";
+  }
+  if (n === 1) {
+    return `M${xs[0].toFixed(1)},${ys[0].toFixed(1)}`;
+  }
+  const clampY = (y: number) => Math.min(maxY, Math.max(minY, y));
+  let d = `M${xs[0].toFixed(1)},${ys[0].toFixed(1)}`;
+  for (let i = 0; i < n - 1; i++) {
+    const x0 = xs[Math.max(0, i - 1)];
+    const y0 = ys[Math.max(0, i - 1)];
+    const x1 = xs[i];
+    const y1 = ys[i];
+    const x2 = xs[i + 1];
+    const y2 = ys[i + 1];
+    const x3 = xs[Math.min(n - 1, i + 2)];
+    const y3 = ys[Math.min(n - 1, i + 2)];
+    const tension = 0.22;
+    const cp1x = x1 + (x2 - x0) * tension;
+    const cp1y = clampY(y1 + (y2 - y0) * tension);
+    const cp2x = x2 - (x3 - x1) * tension;
+    const cp2y = clampY(y2 - (y3 - y1) * tension);
+    d += ` C${cp1x.toFixed(1)},${cp1y.toFixed(1)} ${cp2x.toFixed(1)},${cp2y.toFixed(1)} ${x2.toFixed(1)},${y2.toFixed(1)}`;
+  }
+  return d;
+}
+
 /**
  * A line of light over an amber haze. One point is lit: the hovered day, or today when the
  * pointer is away, with a dashed cursor and a glass tip that shows its value.
@@ -122,7 +152,7 @@ const DEFAULT_MEASURE = (d: DayPoint) => d.sessions;
 export function Trend({ days, locale, label, measure = DEFAULT_MEASURE }: TrendProps) {
   // The host's size comes from the layout (it grows with the hero on a tall window); the SVG
   // is drawn to fill it.
-  const [hostRef, size] = useMeasuredSize<HTMLDivElement>({ width: 480, height: 128 });
+  const [hostRef, size] = useMeasuredSize<HTMLDivElement>({ width: 480, height: 100 });
   const width = size.width;
   const [hover, setHover] = useState<number | null>(null);
   const hazeId = `${useId().replace(/:/g, "")}-haze`;
@@ -130,8 +160,9 @@ export function Trend({ days, locale, label, measure = DEFAULT_MEASURE }: TrendP
 
   const geometry = useMemo(() => {
     const labelH = 18;
-    const chartH = Math.max(64, size.height - labelH);
-    const padTop = 14;
+    const chartH = Math.max(56, size.height - labelH);
+    const padTop = 12;
+    const padBottom = 3;
     const padX = 8;
     const n = days.length;
     if (n === 0) {
@@ -141,11 +172,12 @@ export function Trend({ days, locale, label, measure = DEFAULT_MEASURE }: TrendP
     const max = Math.max(1, ...values);
     const span = Math.max(1, width - padX * 2);
     const xAt = (i: number) => (n === 1 ? width / 2 : padX + (i / (n - 1)) * span);
-    const yAt = (v: number) => padTop + (1 - v / max) * (chartH - padTop - 3);
+    const yAt = (v: number) => padTop + (1 - v / max) * (chartH - padTop - padBottom);
     const xs = days.map((_, i) => xAt(i));
     const ys = values.map(yAt);
-    const points = xs.map((x, i) => `${x.toFixed(1)},${ys[i].toFixed(1)}`).join(" ");
-    const area = `${xs[0].toFixed(1)},${chartH} ${points} ${xs[n - 1].toFixed(1)},${chartH}`;
+    const linePath = smoothLinePath(xs, ys, padTop, chartH - padBottom);
+    const areaPath = `${linePath} L${xs[n - 1].toFixed(1)},${chartH} L${xs[0].toFixed(1)},${chartH} Z`;
+    const midY = (padTop + chartH - padBottom) / 2;
     const lastIndex = n - 1;
     const midIndex = Math.floor(lastIndex / 2);
     const labels: {
@@ -164,21 +196,48 @@ export function Trend({ days, locale, label, measure = DEFAULT_MEASURE }: TrendP
         });
       }
     }
-    return { labelH, chartH, padX, span, lastIndex, values, xs, ys, points, area, labels };
+    return {
+      labelH,
+      chartH,
+      midY,
+      padX,
+      span,
+      lastIndex,
+      values,
+      xs,
+      ys,
+      linePath,
+      areaPath,
+      labels,
+    };
   }, [days, locale, measure, size.height, width]);
 
   if (!geometry) {
     return null;
   }
 
-  const { labelH, chartH, padX, span, lastIndex, values, xs, ys, points, area, labels } = geometry;
+  const {
+    labelH,
+    chartH,
+    midY,
+    padX,
+    span,
+    lastIndex,
+    values,
+    xs,
+    ys,
+    linePath,
+    areaPath,
+    labels,
+  } = geometry;
   const active = hover ?? lastIndex;
   const activeX = xs[active] ?? xs[lastIndex];
   const activeY = ys[active] ?? ys[lastIndex];
   const activeDay = days[active];
-  // The tip sits above the point, or below it when the point is near the top edge.
-  const tipBelow = activeY < 48;
-  const tipX = Math.min(Math.max(activeX, 34), width - 34);
+  // Place the tip vertically unless mid-height dots at the right edge would collide with axis/meta labels.
+  const tipSideLeft = activeX > width - 76 && activeY >= 24 && activeY <= chartH - 20;
+  const tipBelow = !tipSideLeft && activeY < 28;
+  const tipX = tipSideLeft ? activeX : Math.min(Math.max(activeX, 40), width - 40);
 
   const onPointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
     const box = e.currentTarget.getBoundingClientRect();
@@ -202,16 +261,17 @@ export function Trend({ days, locale, label, measure = DEFAULT_MEASURE }: TrendP
         <title>{label}</title>
         <defs>
           <linearGradient id={hazeId} x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0" stopColor="#ff9d4d" stopOpacity="0.2" />
+            <stop offset="0" stopColor="#ff9d4d" stopOpacity="0.24" />
             <stop offset="1" stopColor="#ff9d4d" stopOpacity="0" />
           </linearGradient>
           <filter id={glowId} x="-100%" y="-100%" width="300%" height="300%">
             <feGaussianBlur stdDeviation="3.5" />
           </filter>
         </defs>
+        <line className="trend__grid trend__grid--mid" x1={0} x2={width} y1={midY} y2={midY} />
         <line className="trend__grid" x1={0} x2={width} y1={chartH + 0.5} y2={chartH + 0.5} />
-        <polygon points={area} fill={`url(#${hazeId})`} />
-        <polyline className="trend__line" points={points} />
+        <path d={areaPath} fill={`url(#${hazeId})`} />
+        <path className="trend__line" d={linePath} />
         <line className="trend__cursor" x1={activeX} x2={activeX} y1={4} y2={chartH} />
         <circle
           className="trend__halo"
@@ -236,7 +296,7 @@ export function Trend({ days, locale, label, measure = DEFAULT_MEASURE }: TrendP
       </svg>
       {activeDay && (
         <div
-          className={`trend__tip${tipBelow ? " trend__tip--below" : ""}`}
+          className={`trend__tip${tipSideLeft ? " trend__tip--left" : tipBelow ? " trend__tip--below" : ""}`}
           style={{ left: tipX, top: activeY }}
           aria-hidden="true"
         >
